@@ -1,15 +1,10 @@
-# basicmeta
+# mhlver
 
-A lightweight metadata utility designed for Digital Imaging Technicians (DITs) to perform quick checks on original camera files (OCF).
+Another MHL tool to verify them all
 
 #### 📋 Description
 
-`basicmeta` provides a quick overview of essential technical metadata (frame rate, resolution, and encoded date) without the overhead of opening a heavy GUI or a full NLE. It is specifically optimized for DIT workflows to verify clip consistency during data offloading, ingest, or backup verification.
-
-It supports common professional acquisition formats:
-* Video: MXF, MOV, MP4, R3D
-* Audio: WAV
-* Other non-camera containers: MKV, AVI, M4V, MTS, FLV, WebM
+`mhlver` is a streamlined CLI utility designed to find and verify Media Hash List files (MHL), it support both legacy MHL 1.1 and ASC-MHL 2.0.
 
 #### 💻 Compatibility
 
@@ -18,10 +13,10 @@ It supports common professional acquisition formats:
 
 #### 🛠️ Dependencies
 
-`basicmeta` relies on the following metadata engines:
+`mhlver` relies on the following metadata engines:
 
-* [MediaInfo](https://github.com/mediaarea/mediainfo) © 2002-2025 MediaArea.net SARL (BSD 2-Clause)
-* [ExifTool](https://github.com/exiftool/exiftool) © 2003-2026 Phil Harvey (GPL-3.0)
+* [MHL Tool](https://mediahashlist.org/mhl-tool/) v1.31 © 2022-2026 MediaArea.net SARL (MIT)
+* [ASC-MHL](https://pypi.org/project/ascmhl/) v1.2 © 2020-2026 Academy of Motion Picture Arts and Sciences (MIT)
 
 #### 🚀 Installation
 
@@ -33,21 +28,18 @@ It supports common professional acquisition formats:
 2. Tap and install:
 ```
 brew tap lucuma13/homebrew-dit
-brew install basicmeta
+brew install mhlver
 ```
 
 #### 📖 Usage
 
-`basicmeta [options] <path>`
+`mhlver [options] <path>`
 
 | Option | Description |
 | :---: | :--- |
-| `-f` | Force analysis of non-camera video containers (MKV, AVI, M4V, MTS, FLV, WebM) |
+| `-d` | Prepends a datestamp for reporting |
+| `-v` | Increase verbosity |
 | `-h` | Show help message |
 | `--version` | Print version |
 
 The `<path>` can be a single file or a directory, or the current directory if left blank.
-
-#### 🧪 Feedback & Contributing
-
-If this tool fails to parse metadata from your specific camera files, or if you have ideas for improvement, please fork the repository and submit a pull request, or message me directly with a sample of the problematic metadata output. Help me make this tool more robust for the DIT community!

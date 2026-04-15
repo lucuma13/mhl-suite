@@ -16,8 +16,8 @@ function show_help() {
 	echo 
 	echo "Options:"
 	echo "  -d : Add datestamp for report"
-	echo "  -h : Print this help message"
 	echo "  -v : Increase verbosity"
+    echo "  -h : Show this help message"
 	echo "  --version  : Print version"
 	exit 0
 }
