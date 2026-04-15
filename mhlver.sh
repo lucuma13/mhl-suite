@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# mhlver - Another MHL tool to verify them all
+# mhlver - An MHL tool to verify them all
 readonly BASICMETA_VERSION="1.0"
 
 # Colours used
