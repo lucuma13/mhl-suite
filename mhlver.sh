@@ -10,8 +10,6 @@ readonly MHLVER_VERSION="1.0"
 readonly RED='\033[0;31m'
 readonly RESET='\033[0m'
 
-#TODO: MHL 1.0 repeats errors twice --> filter out repeated lines (with 2>&1 | sort -u) while printing the right verification message ($? won't work)
-
 function show_help() {
 	echo "mhlver v$MHLVER_VERSION. Find and verify source MHL files or directories"
 	echo
@@ -19,7 +17,7 @@ function show_help() {
 	echo 
 	echo "Options:"
 	echo "  -d : Add datestamp for report"
-	echo "  -v : Increase verbosity"
+	echo "  -v : Verbose"
     echo "  -h : Show this help message"
 	echo "  --version  : Print version"
 	exit 0
@@ -87,7 +85,7 @@ function verify_item() {
 datestamp=false
 verbose_flag=""
 
-while getopts "dhv" option
+while getopts "dvh" option
 do
 	case $option in
 		d) datestamp=true ;;
