@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# mhlver - An MHL tool to verify them all
+# mhlver - One MHL tool to verify them all
 readonly MHLVER_VERSION="1.0"
 
 # Copyright (c) 2026 Luis Gómez Gutiérrez

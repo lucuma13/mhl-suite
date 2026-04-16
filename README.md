@@ -1,10 +1,6 @@
 # mhlver
 
-An MHL tool to verify them all.
-
-#### 📋 Description
-
-`mhlver` is a streamlined CLI utility to find and verify Media Hash List files (MHL). It supports both legacy MHL 1.1 and ASC-MHL 2.0.
+`mhlver` is a streamlined CLI utility to find and verify Media Hash List files (MHL). It supports both traditional MHL and ASC-MHL 2.0.
 
 #### 💻 Compatibility
 
@@ -42,4 +38,4 @@ brew install mhlver
 | `-h` | Show help message |
 | `--version` | Print version |
 
-The `<path>` can be a single file or a directory, or the current directory if left blank.
+Note: `<path>` can be a single file or a directory, or the current directory if left blank.
