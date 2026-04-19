@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mhl-suite"
+version = "1.1.0"
+description = "Simple MHL verification and sealing tools"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Luis Gómez Gutiérrez"}
+]
+dependencies = [
+    "click>=8.0",
+    "lxml>=4.9.0",
+    "xxhash>=3.0.0",
+]
+
+[project.scripts]
+simple-mhl = "simple_mhl:cli"
+mhlver = "mhlver:main"
