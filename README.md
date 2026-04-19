@@ -2,7 +2,7 @@
 
 `mhl-suite` is an essential toolkit for sealing and verifying MHL files. It consists of two primary executables:
 * `mhlver`: one tool to verify them all. This is a wrapper that automatically detects MHL versions (legacy and ASC-MHL) and manages recursive directory verification and reporting. It delegates verification to `simple-mhl` for legacy files and [ascmhl](https://github.com/ascmitc/mhl) for modern manifests.
-* `simple-mhl`: a modern verification and sealing tool, for legacy MHL files. A successor of the discontinued [mhl-tool](https://github.com/pomfort/mhl-tool), it additionally features a compliance validator for XML Schema Definition (XSD), and it supports modern algorithms traditionally only available on MHL 2.0 (xxh3-64 and xxh128).
+* `simple-mhl`: a modern verification and sealing tool, for legacy MHL files. A successor of the discontinued [mhl-tool](https://github.com/pomfort/mhl-tool), it additionally features a compliance validator for XML Schema Definition (XSD), and supports modern algorithms traditionally only available on MHL 2.0 (xxh3-64 and xxh128).
 
 ### 🛠️ Dependencies
 
