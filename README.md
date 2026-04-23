@@ -16,7 +16,7 @@
 
 #### macOS / Linux / Windows
 
-1. Download and install [Python 3.10+](https://www.python.org/downloads), or or `brew install python@3.10` if you're on macOS / Linux.
+1. Download and install [Python 3.10+](https://www.python.org/downloads), or `brew install python@3.10` if you're on macOS / Linux.
 
 2. Follow instructions to install [uv](https://github.com/astral-sh/uv) package manager, or `brew install uv` if you're on macOS / Linux.
 
