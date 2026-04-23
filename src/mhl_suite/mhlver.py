@@ -7,10 +7,11 @@
 import sys
 import argparse
 import subprocess
+import shutil
 from datetime import datetime
 from pathlib import Path
 
-MHLVER_VERSION = "1.1.1"
+MHLVER_VERSION = "1.1.2"
 
 # Colours used
 RED = '\033[0;31m'
@@ -45,14 +46,15 @@ def log_error(msg: str, datestamp: bool):
 
 # Find commands in the same venv as the script, falling back to the system PATH
 def get_command_path(cmd_name):
-    venv_bin_dir = Path(sys.executable).parent
-    local_cmd = venv_bin_dir / cmd_name
-    if local_cmd.exists():
-        return str(local_cmd)
-    system_cmd = shutil.which(cmd_name)
-    if system_cmd:
-        return system_cmd
-    return None
+    # Search the bin directory of the current virtual environment/prefix
+    venv_bin = Path(sys.prefix) / ("Scripts" if sys.platform == "win32" else "bin")
+    cmd_path = venv_bin / cmd_name
+    
+    if cmd_path.exists():
+        return str(cmd_path)
+    
+    # Fallback to system PATH (e.g. if direnv is active or tool is global)
+    return shutil.which(cmd_name)
 
 # Verify single MHL or ASC-MHL target
 def verify_item(target: Path, datestamp: bool, verbose: bool, schema: bool) -> int:
@@ -91,18 +93,20 @@ def verify_item(target: Path, datestamp: bool, verbose: bool, schema: bool) -> i
     else:
         # Resolve the mhl-suite directory containing the XSD folder
         suite_dir = Path(__file__).resolve().parent
+
+        # Look for ascmhl-debug specifically as it contains the verification logic
         cmd_path = get_command_path("ascmhl-debug")
     
         if not cmd_path:
-            print(f"🚨 System error: '{cmd}' command not found. Ensure it is in your PATH.")
-            sys.exit(1)
+            print("🚨 System error: 'ascmhl-debug' command not found. Ensure it is in your PATH.")
+            return 127
 
 
         if schema:
-            cmd = ["ascmhl-debug", "xsd-schema-check", target_str]
+            cmd = [cmd_path, "xsd-schema-check", target_str]
         else:
             grandparent = target.parent.parent
-            cmd = ["ascmhl-debug", "verify"]
+            cmd = [cmd_path, "verify"]
             if verbose:
                 cmd.append("-v")
             cmd.append(str(grandparent))
@@ -126,6 +130,9 @@ def find_mhl_files(root: Path):
             yield p
 
 def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    # ... (rest of your existing argparse code)
+    # -----------------------------
     parser = argparse.ArgumentParser(add_help=False)
     
     # Flag definitions
