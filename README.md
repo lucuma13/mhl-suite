@@ -14,8 +14,9 @@
 
 ### 🚀 Installation
 
-#### Cross-platform (Recommended)
-1. Download and install [Python 3.10+](https://www.python.org/downloads).
+#### macOS / Linux / Windows
+
+1. Download and install [Python 3.10+](https://www.python.org/downloads), or or `brew install python@3.10` if you're on macOS / Linux.
 
 2. Follow instructions to install [uv](https://github.com/astral-sh/uv) package manager, or `brew install uv` if you're on macOS / Linux.
 
@@ -24,20 +25,6 @@
 ```
 uv tool install mhl-suite
 ```
-
-#### macOS and Linux (Homebrew)
-
-1. Install [Homebrew](https://brew.sh/) (if not already installed):
-```
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-```
-
-2. Tap and install:
-```
-brew tap lucuma13/dit
-brew install mhl-suite
-```
-
 
 ### 📖 Usage
 

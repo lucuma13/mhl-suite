@@ -10,7 +10,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-MHLVER_VERSION = "1.1.0"
+MHLVER_VERSION = "1.1.1"
 
 # Colours used
 RED = '\033[0;31m'
@@ -42,6 +42,17 @@ def log_error(msg: str, datestamp: bool):
         print(f"{RED}[{datetime.now().strftime('%Y.%m.%d-%H:%M:%S')}] ❌ {msg}{RESET}", file=sys.stderr)
     else:
         print(f"{RED}❌ {msg}{RESET}", file=sys.stderr)
+
+# Find commands in the same venv as the script, falling back to the system PATH
+def get_command_path(cmd_name):
+    venv_bin_dir = Path(sys.executable).parent
+    local_cmd = venv_bin_dir / cmd_name
+    if local_cmd.exists():
+        return str(local_cmd)
+    system_cmd = shutil.which(cmd_name)
+    if system_cmd:
+        return system_cmd
+    return None
 
 # Verify single MHL or ASC-MHL target
 def verify_item(target: Path, datestamp: bool, verbose: bool, schema: bool) -> int:
@@ -80,6 +91,12 @@ def verify_item(target: Path, datestamp: bool, verbose: bool, schema: bool) -> i
     else:
         # Resolve the mhl-suite directory containing the XSD folder
         suite_dir = Path(__file__).resolve().parent
+        cmd_path = get_command_path("ascmhl-debug")
+    
+        if not cmd_path:
+            print(f"🚨 System error: '{cmd}' command not found. Ensure it is in your PATH.")
+            sys.exit(1)
+
 
         if schema:
             cmd = ["ascmhl-debug", "xsd-schema-check", target_str]

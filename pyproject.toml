@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mhl-suite"
-version = "1.1.0"
+version = "1.1.1"
 description = "Simple MHL verification and sealing tools"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,15 +23,13 @@ dependencies = [
 simple-mhl = "mhl_suite.simple_mhl:main"
 mhlver = "mhl_suite.mhlver:main"
 
-# This ensures only the source code and XSDs are bundled
+# This ensures the source code and XSDs are bundled
 [tool.hatch.build.targets.wheel]
 packages = ["src/mhl_suite"]
 
-# This ensures the XSD is included in the source distribution
+# This ensures the source code and XSD are included in the source distribution
 [tool.hatch.build.targets.sdist]
-include = [
-    "src/mhl_suite/xsd/*.xsd",
-]
+include = ["src/mhl_suite/"]
 
 [tool.uv]
 managed = true
