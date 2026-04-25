@@ -47,62 +47,41 @@ def get_xsd_path():
     return None
 
 
-class MHLParser(argparse.ArgumentParser):
-    def format_help(self):
-        return (
-            f"simple-mhl v{VERSION}. Modern verification and sealing tool for legacy MHL files\n"
-            "\nUsage: simple-mhl <command> [options] <path>\n"
-            "\nCommands:\n"
-            "  seal              : Seal directory (MHL file generated at the root)\n"
-            "    -a, --algorithm : Hash algorithm: xxhash64 (default), md5, sha1\n"
-            "    --dont-reseal   : Abort operation if an MHL file already exists at root\n"
-            "  verify            : Verify an MHL file\n"
-            "  xsd-schema-check  : Validation of XML Schema Definition (XSD)\n"
-            "\nGlobal options:\n"
-            "  -h, --help        : Show this help message\n"
-            "  --version         : Print version\n"
-        )
-
-
 def main():
-    parser = MHLParser(add_help=False)
-    parser.add_argument("command", choices=["seal", "verify", "xsd-schema-check"], nargs="?")
-    parser.add_argument("path", nargs="?")
-    parser.add_argument("-a", "--algorithm", default="xxhash")
-    parser.add_argument("--dont-reseal", action="store_true")
+    parser = argparse.ArgumentParser(
+        prog="simple-mhl",
+        description="Modern verification and sealing tool for legacy MHL files",
+    )
+    subparsers = parser.add_subparsers(dest="command")
     parser.add_argument("--version", action="version", version=VERSION)
-    parser.add_argument("-h", "--help", action="store_true")
+
+    seal_p = subparsers.add_parser("seal", help="seal directory (MHL file generated at the root)")
+    seal_p.add_argument("path", help="path to directory to seal")
+    seal_p.add_argument("-a", "--algorithm", default="xxhash", help="hash algorithm: xxhash64 (default), md5, sha1")
+    seal_p.add_argument("--dont-reseal", action="store_true", help="abort if an MHL file already exists at root")
+    seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal))
+
+    verify_p = subparsers.add_parser("verify", help="verify an MHL file")
+    verify_p.add_argument("path", help="path to MHL file")
+    verify_p.set_defaults(func=lambda a: verify(a.path))
+
+    xsd_p = subparsers.add_parser("xsd-schema-check", help="validation of XML Schema Definition (XSD)")
+    xsd_p.add_argument("path", help="path to MHL file")
+    xsd_p.set_defaults(func=lambda a: validate_schema(a.path))
 
     args = parser.parse_args()
-
-    if args.help:
-        print(parser.format_help())
-        sys.exit(0)
-
-    if not args.command or not args.path:
-        sys.stderr.write("Error: Missing required arguments.\n\n")
-        print(parser.format_help())
-        sys.exit(1)
-
-    match args.command:
-        case "seal":
-            seal(args.path, args.algorithm, args.dont_reseal)
-        case "verify":
-            verify(args.path)
-        case "xsd-schema-check":
-            validate_schema(args.path)
-        case _:
-            sys.exit(1)
+    args.func(args)
 
 
 def get_hash(filepath, algo_key):
-    """Hash a file using the specified algorithm key, reading in 64 KB chunks."""
+    """Hash a file using the specified algorithm key."""
     if algo_key not in ALGO_MAP:
         raise ValueError(f"Unsupported hash algorithm: {algo_key}")
     hasher_func = ALGO_MAP[algo_key][0]
     hasher = hasher_func()
     with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
+        # Read in 8 MB chunks for large-file efficiency
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
 

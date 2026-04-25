@@ -1,7 +1,7 @@
 # mhl-suite
 
 `mhl-suite` is an essential toolkit for sealing and verifying MHL files. It consists of two primary executables:
-* `mhlver`: one tool to verify them all. This is a wrapper that automatically detects MHL versions (legacy and ASC-MHL) and manages recursive directory verification and reporting. It delegates verification to `simple-mhl` for legacy files and [ascmhl](https://github.com/ascmitc/mhl) for modern manifests.
+* `mhlver`: one tool to verify them all. This is a wrapper that automatically detects MHL versions (legacy and ASC-MHL) and manages recursive directory verification, XSD schema validation and reporting. It delegates verification to `simple-mhl` for legacy files and [ascmhl](https://github.com/ascmitc/mhl) for modern manifests.
 * `simple-mhl`: a modern verification and sealing tool, for legacy MHL files. A successor of the discontinued [mhl-tool](https://github.com/pomfort/mhl-tool), it fully supports xxhash64 (both seal and verify), and it features a compliance validator for the XML Schema Definition (XSD) as well as cleaner logs.
 
 ### 🛠️ Dependencies
@@ -16,9 +16,13 @@
 
 #### macOS / Linux / Windows
 
-1. Download and install [Python 3.10+](https://www.python.org/downloads), or `brew install python@3.10` if you're on macOS / Linux.
+1. Install [uv](https://github.com/astral-sh/uv) package manager, or `brew install uv` if you're on macOS / Linux.
 
-2. Follow instructions to install [uv](https://github.com/astral-sh/uv) package manager, or `brew install uv` if you're on macOS / Linux.
+2. Install latest version of Python (if not already installed)
+
+```
+uv python install
+```
 
 3. Install toolkit:
 

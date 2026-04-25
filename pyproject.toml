@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mhl-suite"
-version = "1.1.3"
+version = "1.1.4"
 description = "Simple MHL verification and sealing tools"
 readme = "README.md"
 requires-python = ">=3.10"
