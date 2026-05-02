@@ -1,30 +1,17 @@
 # mhl-suite
 
-`mhl-suite` is an essential toolkit for sealing and verifying MHL files. It consists of two primary executables:
-* `mhlver`: one tool to verify them all. This is a wrapper that automatically detects MHL versions (legacy and ASC-MHL) and manages recursive directory verification, XSD schema validation and reporting. It delegates verification to `simple-mhl` for legacy files and [ascmhl](https://github.com/ascmitc/mhl) for modern manifests.
-* `simple-mhl`: a modern verification and sealing tool, for legacy MHL files. A successor of the discontinued [mhl-tool](https://github.com/pomfort/mhl-tool), it fully supports xxhash64 (both seal and verify), and it features a compliance validator for the XML Schema Definition (XSD) as well as cleaner logs.
+`mhl-suite` is a toolkit for sealing and verifying MHL files. It consists of two primary executables:
 
-### 🛠️ Dependencies
+* `mhlver`: one tool to verify them all. A wrapper that automatically detects MHL versions (legacy and ASC-MHL) and runs verification recursively across a directory, with optional XSD schema validation and reporting. It delegates to `simple-mhl` for legacy files and to [ascmhl](https://github.com/ascmitc/mhl) for modern manifests.
+* `simple-mhl`: a modern sealing and verification tool, for legacy MHL files. A successor of the discontinued [mhl-tool](https://github.com/pomfort/mhl-tool) and backwards compatible with its manifests: it's 2 to 5 times faster, it fully supports standard `xxhash64be` hashes, and it features XSD schema validation, as well as cleaner output and structured exit codes.
 
-`mhlver` integrates the following open-source components:
-* [Python](https://docs.python.org/3/license.html) 3.9+ © 2001-2026 Python Software Foundation (PSF)
-* [python-xxhash](https://github.com/ifduyue/python-xxhash) © 2014-2026 Yue Du (BSD-2-Clause)
-* [lxml](https://lxml.de/) © 2004-2026 Stefan Behnel, et al. (BSD-3-Clause)
-* [ASC-MHL](https://pypi.org/project/ascmhl/) 1.2 © 2022-2026 Academy of Motion Picture Arts and Sciences (MIT)
+`mhl-suite` is written in [Python](https://www.python.org/) and it integrates [xxhash](https://github.com/ifduyue/python-xxhash), [lxml](https://lxml.de/) and [ascmhl](https://pypi.org/project/ascmhl/).
 
 ### 🚀 Installation
 
-#### macOS / Linux / Windows
+1. Install the `uv` package manager with the [official installer](https://docs.astral.sh/uv/getting-started/installation/) (or `brew install uv` on macOS / Linux).
 
-1. Install [uv](https://github.com/astral-sh/uv) package manager, or `brew install uv` if you're on macOS / Linux.
-
-2. Install latest version of Python (if not already installed)
-
-```
-uv python install
-```
-
-3. Install toolkit:
+2. Install the toolkit:
 
 ```
 uv tool install mhl-suite
@@ -34,31 +21,46 @@ uv tool install mhl-suite
 
 ##### `mhlver`
 
-```
-mhlver [options] <path>
+Verify an MHL file or recursively verify all MHL files under a directory:
 
-Options:
-  -d, --datestamp        : Prepend datestamp for reporting
-  -s, --xsd-schema-check : Validate XML Schema Definition
-  -v, --verbose          : Verbose
-  -h, --help             : Show this help message
-  --version              : Print version
+```bash
+mhlver path/to/file.mhl
+mhlver path/to/directory/
+mhlver                            # verifies the current directory
 ```
 
-Note: `<path>` can be a single file or a directory, or the current directory if left blank.
+  ```
+  options:
+    -r, --report           : export a timestamped report log to the target directory
+    -s, --xsd-schema-check : validate XML Schema Definition
+  ```
 
 
 ##### `simple-mhl`
 
-```
-simple-mhl <command> [options] <path>
+Seal a directory or verify an existing MHL file:
 
-Commands / Options:
-  seal              : Seal directory (MHL file will be generated at the root)
-    -a, --algorithm : Algorithm: xxhash (default), md5, sha1, xxh128, xxh3_64
-    --dont-reseal   : Abort operation if an MHL file already exists at root
-  verify            : Verify an MHL file and hash values
-  xsd-schema-check  : Validate XML Schema Definition
-  -h, --help        : Show this help message
-  --version         : Print version
+```bash
+simple-mhl seal path/to/directory/
+simple-mhl seal -a md5 path/to/directory/
+simple-mhl verify path/to/file.mhl
 ```
+
+  ```
+  commands:
+    seal              : seal directory (MHL file generated at the root)
+      -a, --algorithm : hash algorithm: xxhash (default), md5, sha1
+      --dont-reseal   : abort silently if an MHL with the same timestamp already exists
+    verify            : verify an MHL file
+    xsd-schema-check  : validate XML Schema Definition
+  ```
+
+### 📊 Benchmark
+
+`simple-mhl` has been tested against real-world media workloads. Sample throughput on a 2 TB workload:
+
+| Algorithm | Seal       | Verify     |
+|-----------|-----------:|-----------:|
+| xxhash    | 2480 MB/s  | 2680 MB/s  |
+| md5       |  560 MB/s  |  560 MB/s  |
+| sha1      |  680 MB/s  |  690 MB/s  |
