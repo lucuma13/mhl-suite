@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mhl-suite"
-version = "1.1.4"
+version = "1.2.0"
 description = "Simple MHL verification and sealing tools"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
     {name = "Luis Gómez Gutiérrez"}
@@ -16,6 +16,16 @@ dependencies = [
     "ascmhl>=1.2.0",
     "lxml>=4.9.0",
     "xxhash>=3.0.0",
+]
+
+# Optional extras for development / benchmarking. Install with:
+#   pip install -e ".[dev]"
+# psutil enables accurate RAM detection in bench.py for cache-warming
+# decisions; without it bench falls back to a 32 GB RAM assumption.
+[project.optional-dependencies]
+dev = [
+    "psutil>=5.9.0",
+    "pytest>=7.4.0",
 ]
 
 # Format: command-name = "package.module:function"
@@ -29,7 +39,14 @@ packages = ["src/mhl_suite"]
 
 # This ensures the source code and XSD are included in the source distribution
 [tool.hatch.build.targets.sdist]
-include = ["src/mhl_suite/"]
+include = [
+    "src/mhl_suite/",
+    "tests/",
+    "benchmarks/"
+]
 
 [tool.uv]
 managed = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
