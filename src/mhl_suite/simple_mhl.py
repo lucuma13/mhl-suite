@@ -34,7 +34,7 @@ from lxml import etree
 # Constants and lookups
 # -----------------------------------------------------------------------------
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 # 4 MiB chunk size for streaming hashing.
 #
@@ -344,6 +344,33 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
     """
     if not os.path.exists(mhl_file):
         sys.stderr.write(f"Verification Error: {mhl_file} not found\n")
+        sys.exit(1)
+
+    # Reject directories and non-.mhl files before lxml ever sees the path.
+    # Two cases get distinct messages:
+    #   - A directory named 'ascmhl' is an ASC-MHL v2 package; simple-mhl only
+    #     handles MHL v1 manifests, so point the user at mhlver.
+    #   - Any other directory or file without a .mhl extension is just wrong
+    #     input for this subcommand.
+    if os.path.isdir(mhl_file):
+        if os.path.basename(os.path.normpath(mhl_file)) == "ascmhl":
+            sys.stderr.write(
+                f"Verification Error: '{mhl_file}' is an ASC-MHL v2 package directory.\n"
+                "simple-mhl only handles MHL v1 (.mhl) files. "
+                "Use mhlver to verify ASC-MHL packages.\n"
+            )
+        else:
+            sys.stderr.write(
+                f"Verification Error: '{mhl_file}' is a directory.\n"
+                "The verify command requires a path to an MHL file (e.g. manifest.mhl).\n"
+            )
+        sys.exit(1)
+
+    if not mhl_file.lower().endswith(".mhl"):
+        sys.stderr.write(
+            f"Verification Error: '{mhl_file}' does not have a .mhl extension.\n"
+            "The verify command requires a path to an MHL file (e.g. manifest.mhl).\n"
+        )
         sys.exit(1)
 
     # Optional symlink-escape protection. Enabled by setting the env var
