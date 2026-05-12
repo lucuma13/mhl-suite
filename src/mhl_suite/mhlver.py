@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Callable, Iterator, TextIO
 
 
-MHLVER_VERSION = "1.2.0"
+MHLVER_VERSION = "1.2.1"
 
 
 # -----------------------------------------------------------------------------
@@ -191,6 +191,7 @@ def _emit_step_output(
 # exit code itself still encodes the precise failure category for tooling.
 _LEGACY_RESULTS: dict[int, tuple[str, str]] = {
       0: ("✅ MHL verified: {target}",                                                              "success"),
+      1: ("🚨 Verification Error: {target} — file not found or invalid argument (not an MHL file).", "warning"),
      10: ("⚠️  Schema non-compliant: {target}",                                                     "error"),
      20: ("🚨 Malformed XML: {target} cannot be parsed.",                                           "warning"),
      30: ("❌ Verification failed: {target}",                                                       "error"),
