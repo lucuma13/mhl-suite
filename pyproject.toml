@@ -4,7 +4,7 @@ requires = [ "hatchling" ]
 
 [project]
 name = "mhl-suite"
-version = "1.2.0a1"
+version = "1.2.0a2"
 description = "Simple MHL verification and sealing tools"
 readme = "README.md"
 license = { text = "MIT" }
