@@ -24,24 +24,20 @@ jobs:
 
       - name: Extract metadata from pyproject.toml
         id: meta
-        shell: bash
+        shell: python3 {0}
         run: |
-          # Package name
-          NAME=$(grep -m1 '^name\s*=\s*' pyproject.toml | sed -E 's/name\s*=\s*"([^"]+)".*/\1/')
-          echo "package-name=$NAME" >> "$GITHUB_OUTPUT"
+          import tomllib, os
 
-          # CLI entry points: handles both [project.scripts] section style
-          # and pyproject-fmt inline style (scripts.key = "...")
-          CMDS=$(awk '
-            /^\[project\.scripts\]/ { in_scripts=1; next }
-            /^\[project\]/           { in_project=1; next }
-            /^\[/                    { in_scripts=0; in_project=0 }
-            in_scripts && /^[^#].*=/ { split($0, a, /[ \t]*=/); print a[1] }
-            in_project && /^scripts\./ {
-                sub(/^scripts\./, ""); split($0, a, /[ \t]*=/); print a[1]
-            }
-          ' pyproject.toml | tr '\n' ' ')
-          echo "smoke-test-cmds=$CMDS" >> "$GITHUB_OUTPUT"
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+
+          project = data["project"]
+          name = project["name"]
+          cmds = " ".join(project.get("scripts", {}).keys())
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              print(f"package-name={name}", file=out)
+              print(f"smoke-test-cmds={cmds}", file=out)
 
   # JOB 1: Pre-Deployment Validation (Safety Gate)
   run-unit-tests:
