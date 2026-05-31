@@ -9,6 +9,7 @@ Covers:
   - Stress: large files, thousands of files, pathological naming conventions
 """
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -860,6 +861,10 @@ class TestVerifyEdgeCases:
 # =============================================================================
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="chmod-based permission tests are not applicable on Windows"
+)
 class TestWalkEdgeCases:
     """Exercises the two OSError-swallowing branches in _iter_files_for_seal."""
 
