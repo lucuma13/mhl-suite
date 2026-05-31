@@ -399,7 +399,7 @@ wheels = [
 
 [[package]]
 name = "mhl-suite"
-version = "1.2.0a0"
+version = "1.2.0a1"
 source = { editable = "." }
 dependencies = [
     { name = "ascmhl" },
