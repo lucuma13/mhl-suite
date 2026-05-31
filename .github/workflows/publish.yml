@@ -9,9 +9,65 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # JOB 0: Read project metadata from pyproject.toml
+  read-metadata:
+    name: Read pyproject.toml metadata
+    runs-on: ubuntu-latest
+    outputs:
+      package-name: ${{ steps.meta.outputs.package-name }}
+      smoke-test-cmds: ${{ steps.meta.outputs.smoke-test-cmds }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Extract metadata from pyproject.toml
+        id: meta
+        shell: python3 {0}
+        run: |
+          import tomllib, os, re, sys
+
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+
+          project = data["project"]
+          name = project["name"]
+          cmds = " ".join(project.get("scripts", {}).keys())
+
+          # If version is dynamic (e.g. flit reads it from __version__),
+          # locate the module file and extract it from there.
+          if "version" not in project:
+              module = data.get("tool", {}).get("flit", {}).get("module", {}).get("name", name)
+              candidates = [
+                  f"src/{module}.py",
+                  f"src/{module}/__init__.py",
+                  f"{module}.py",
+              ]
+              version = None
+              for path in candidates:
+                  try:
+                      src = open(path).read()
+                      m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', src, re.M)
+                      if m:
+                          version = m.group(1)
+                          break
+                  except FileNotFoundError:
+                      continue
+              if version is None:
+                  print("Could not determine version from source files")
+                  sys.exit(1)
+          else:
+              version = project["version"]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              print(f"package-name={name}", file=out)
+              print(f"smoke-test-cmds={cmds}", file=out)
+              print(f"version={version}", file=out)
+
   # JOB 1: Pre-Deployment Validation (Safety Gate)
   run-unit-tests:
     name: Unit Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    needs: read-metadata
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
@@ -23,17 +79,18 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0 # Fetches all history and tags so dynamic versioning works
+          fetch-depth: 0  # Fetches all history and tags so dynamic versioning works
 
-      - name: Verify version tag matches __version__
-        shell: bash
+      - name: Verify release tag matches declared version
+        shell: python3 {0}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          SOURCE=$(grep -m1 '__version__' src/triplecheck.py | sed 's/.*"\(.*\)".*/\1/')
-          if [ "$TAG" != "$SOURCE" ]; then
-            echo "Version mismatch: tag=$TAG, __version__=$SOURCE"
-            exit 1
-          fi
+          import os, sys
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = "${{ needs.read-metadata.outputs.version }}"
+          if tag != version:
+              print(f"Version mismatch: tag={tag}, declared={version}")
+              sys.exit(1)
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -54,22 +111,22 @@ jobs:
   # JOB 2: Deployment (Only runs if Job 1 passes)
   build-n-publish:
     name: Build and publish Python distro to PyPI
-    needs: run-unit-tests
+    needs: [read-metadata, run-unit-tests]
     runs-on: ubuntu-latest
 
     permissions:
-      id-token: write
+      id-token: write  # Required for OIDC trusted publishing
       contents: read
 
     environment:
       name: pypi
-      url: https://pypi.org/p/triplecheck
+      url: https://pypi.org/p/${{ needs.read-metadata.outputs.package-name }}
 
     steps:
       - name: Checkout source code
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0 # CRITICAL: Allows flit to calculate the dynamic version from the Git tag
+          fetch-depth: 0  # Required for flit dynamic versioning from git tag
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
@@ -80,7 +137,7 @@ jobs:
           python-version-file: "pyproject.toml"
 
       - name: Build binary wheels and source tarball
-        run: uv build
+        run: uv build  # Delegates to the build backend in pyproject.toml (hatchling, flit, etc.)
 
       - name: Publish to PyPI via uv
         run: uv publish
@@ -88,7 +145,7 @@ jobs:
   # JOB 3: Post-Deployment Smoke Test (Verifies index installation and packaging)
   verify-deployment:
     name: Verify Live Package (${{ matrix.os }})
-    needs: build-n-publish
+    needs: [read-metadata, build-n-publish]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -105,15 +162,17 @@ jobs:
           python-version: "3.14"
 
       - name: Delay execution for index propagation
-        if: runner.os != 'Windows'
+        shell: bash
         run: sleep 30
 
-      - name: Delay execution for index propagation (Windows)
-        if: runner.os == 'Windows'
-        run: Start-Sleep -Seconds 30
+      - name: Install deployed package from PyPI
+        shell: bash
+        run: uv pip install --system ${{ needs.read-metadata.outputs.package-name }}
 
-      - name: Install deployed package
-        run: uv pip install --system triplecheck
-
-      - name: Smoke test
-        run: triplecheck --version
+      - name: Smoke test CLI entry points
+        shell: bash
+        run: |
+          for cmd in ${{ needs.read-metadata.outputs.smoke-test-cmds }}; do
+            echo "→ $cmd --version"
+            "$cmd" --version
+          done
