@@ -1,0 +1,164 @@
+name: Publish to TestPyPI
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+a[0-9]+'  # alpha releases only (e.g. 2.0.0a1)
+
+concurrency:
+  group: testpypi-publish
+  cancel-in-progress: true
+
+jobs:
+  # JOB 0: Read project metadata from pyproject.toml
+  read-metadata:
+    name: Read pyproject.toml metadata
+    runs-on: ubuntu-latest
+    outputs:
+      package-name: ${{ steps.meta.outputs.package-name }}
+      smoke-test-cmds: ${{ steps.meta.outputs.smoke-test-cmds }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Extract metadata from pyproject.toml
+        id: meta
+        shell: bash
+        run: |
+          # Package name
+          NAME=$(grep -m1 '^name\s*=\s*' pyproject.toml | sed -E 's/name\s*=\s*"([^"]+)".*/\1/')
+          echo "package-name=$NAME" >> "$GITHUB_OUTPUT"
+
+          # CLI entry points: handles both [project.scripts] section style
+          # and pyproject-fmt inline style (scripts.key = "...")
+          CMDS=$(awk '
+            /^\[project\.scripts\]/ { in_scripts=1; next }
+            /^\[project\]/           { in_project=1; next }
+            /^\[/                    { in_scripts=0; in_project=0 }
+            in_scripts && /^[^#].*=/ { split($0, a, /[ \t]*=/); print a[1] }
+            in_project && /^scripts\./ {
+                sub(/^scripts\./, ""); split($0, a, /[ \t]*=/); print a[1]
+            }
+          ' pyproject.toml | tr '\n' ' ')
+          echo "smoke-test-cmds=$CMDS" >> "$GITHUB_OUTPUT"
+
+  # JOB 1: Pre-Deployment Validation (Safety Gate)
+  run-unit-tests:
+    name: Unit Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    needs: read-metadata
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # Fetches all history and tags so dynamic versioning works
+
+      - name: Verify version tag matches TOML declaration
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          SOURCE=$(grep -m1 '^version\s*=\s*' pyproject.toml | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
+          if [ "$TAG" != "$SOURCE" ]; then
+            echo "Version mismatch: tag=$TAG, pyproject.toml=$SOURCE"
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install local package and testing tools
+        run: |
+          uv pip install --system pytest pytest-cov
+          uv pip install --system -e .
+
+      - name: Run test suite
+        run: pytest
+
+  # JOB 2: Deployment (Only runs if Job 1 passes)
+  build-n-publish:
+    name: Build and publish Python distro to TestPyPI
+    needs: [read-metadata, run-unit-tests]
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/${{ needs.read-metadata.outputs.package-name }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Build binary wheels and source tarball
+        run: uv build  # Delegates to the build backend in pyproject.toml (hatchling, flit, etc.)
+
+      - name: Publish to TestPyPI via uv
+        run: uv publish --publish-url https://test.pypi.org/legacy/
+
+  # JOB 3: Post-Deployment Smoke Test (Verifies index installation and packaging)
+  verify-deployment:
+    name: Verify Live Package (${{ matrix.os }})
+    needs: [read-metadata, build-n-publish]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Delay execution for index propagation
+        if: runner.os != 'Windows'
+        run: sleep 30
+
+      - name: Delay execution for index propagation (Windows)
+        if: runner.os == 'Windows'
+        run: Start-Sleep -Seconds 30
+
+      - name: Install deployed package from TestPyPI
+        run: |
+          uv pip install --system \
+            --index-url https://test.pypi.org/simple/ \
+            --extra-index-url https://pypi.org/simple/ \
+            --prerelease allow \
+            ${{ needs.read-metadata.outputs.package-name }}
+
+      - name: Smoke test CLI entry points
+        shell: bash
+        run: |
+          for cmd in ${{ needs.read-metadata.outputs.smoke-test-cmds }}; do
+            echo "→ $cmd --version"
+            "$cmd" --version
+          done

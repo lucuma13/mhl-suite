@@ -1,0 +1,119 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: pypi-publish
+  cancel-in-progress: true
+
+jobs:
+  # JOB 1: Pre-Deployment Validation (Safety Gate)
+  run-unit-tests:
+    name: Unit Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # Fetches all history and tags so dynamic versioning works
+
+      - name: Verify version tag matches __version__
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          SOURCE=$(grep -m1 '__version__' src/triplecheck.py | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG" != "$SOURCE" ]; then
+            echo "Version mismatch: tag=$TAG, __version__=$SOURCE"
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install local package and testing tools
+        run: |
+          uv pip install --system pytest pytest-cov
+          uv pip install --system -e .
+
+      - name: Run test suite
+        run: pytest
+
+  # JOB 2: Deployment (Only runs if Job 1 passes)
+  build-n-publish:
+    name: Build and publish Python distro to PyPI
+    needs: run-unit-tests
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/triplecheck
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # CRITICAL: Allows flit to calculate the dynamic version from the Git tag
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Build binary wheels and source tarball
+        run: uv build
+
+      - name: Publish to PyPI via uv
+        run: uv publish
+
+  # JOB 3: Post-Deployment Smoke Test (Verifies index installation and packaging)
+  verify-deployment:
+    name: Verify Live Package (${{ matrix.os }})
+    needs: build-n-publish
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Delay execution for index propagation
+        if: runner.os != 'Windows'
+        run: sleep 30
+
+      - name: Delay execution for index propagation (Windows)
+        if: runner.os == 'Windows'
+        run: Start-Sleep -Seconds 30
+
+      - name: Install deployed package
+        run: uv pip install --system triplecheck
+
+      - name: Smoke test
+        run: triplecheck --version

@@ -19,22 +19,39 @@
 import argparse
 import getpass
 import hashlib
+import importlib.metadata
 import importlib.resources
 import os
 import platform
 import sys
 from datetime import datetime, timezone
-from typing import Iterator
+from collections.abc import Callable
+from typing import Iterator, Protocol, cast, runtime_checkable
 
 import xxhash
 from lxml import etree
 
 
 # -----------------------------------------------------------------------------
+# Hasher protocol
+# -----------------------------------------------------------------------------
+# Both xxhash and hashlib hashers expose .update() and .hexdigest() but share
+# no common ABC. We define a structural Protocol so the type checker understands
+# what ALGO_MAP factories return without depending on private hashlib internals.
+
+
+@runtime_checkable
+class _Hasher(Protocol):
+    def update(self, data: bytes) -> None: ...
+    def hexdigest(self) -> str: ...
+
+
+# -----------------------------------------------------------------------------
 # Constants and lookups
 # -----------------------------------------------------------------------------
 
-VERSION = "1.0.5"
+# Version is imported from mhl-suite
+__version__ = importlib.metadata.version("mhl-suite")
 
 # 4 MiB chunk size for streaming hashing.
 #
@@ -51,14 +68,17 @@ HASH_CHUNK_SIZE = 4 * 1024 * 1024
 # Map of CLI-accepted algorithm names to (factory, manifest-tag) pairs.
 # Multiple aliases point to xxhash so callers can use whatever spelling they
 # like; the manifest always records "xxhash64be" for consistency.
-ALGO_MAP: dict[str, tuple[callable, str]] = {
-    "xxhash":     (xxhash.xxh64, "xxhash64be"),
-    "xxh64":      (xxhash.xxh64, "xxhash64be"),
-    "xxhash64":   (xxhash.xxh64, "xxhash64be"),
-    "xxhash64be": (xxhash.xxh64, "xxhash64be"),
-    "md5":        (hashlib.md5,  "md5"),
-    "sha1":       (hashlib.sha1, "sha1"),
-}
+ALGO_MAP: dict[str, tuple[Callable[[], _Hasher], str]] = cast(
+    dict[str, tuple[Callable[[], _Hasher], str]],
+    {
+        "xxhash": (xxhash.xxh64, "xxhash64be"),
+        "xxh64": (xxhash.xxh64, "xxhash64be"),
+        "xxhash64": (xxhash.xxh64, "xxhash64be"),
+        "xxhash64be": (xxhash.xxh64, "xxhash64be"),
+        "md5": (hashlib.md5, "md5"),
+        "sha1": (hashlib.sha1, "sha1"),
+    },
+)
 
 # Tags recognised when reading a manifest — superset of the algorithms we can
 # *write*. We can verify an old manifest that uses xxhash128 or xxhash3_64
@@ -71,9 +91,13 @@ SUPPORTED_HASH_TAGS = frozenset(ALGO_MAP) | {"xxhash128", "xxhash3_64", "null"}
 # XSD location
 # -----------------------------------------------------------------------------
 
-def get_xsd_path() -> str | None:
+
+def get_xsd_path() -> str:
     """
-    Locate the bundled MediaHashList_v1_1.xsd. Returns the path or None.
+    Locate the bundled MediaHashList_v1_1.xsd. Returns the path.
+
+    Raises FileNotFoundError if the XSD cannot be found in either the
+    installed-package location or the source-checkout fallback.
 
     Looks first at the importlib.resources location used when this package
     is installed normally, then at a sibling 'xsd/' folder for the case
@@ -99,13 +123,15 @@ def get_xsd_path() -> str | None:
     if os.path.exists(local):
         return local
 
-    sys.stderr.write(f"Error: Could not locate MediaHashList_v1_1.xsd (tried {local})\n")
-    return None
+    raise FileNotFoundError(
+        f"Could not locate MediaHashList_v1_1.xsd (tried {local})"
+    )
 
 
 # -----------------------------------------------------------------------------
 # Hashing
 # -----------------------------------------------------------------------------
+
 
 def get_hash(filepath: str, algo_key: str) -> str:
     """
@@ -122,7 +148,7 @@ def get_hash(filepath: str, algo_key: str) -> str:
     if algo_key not in ALGO_MAP:
         raise ValueError(f"Unsupported hash algorithm: {algo_key}")
 
-    hasher = ALGO_MAP[algo_key][0]()
+    hasher: _Hasher = ALGO_MAP[algo_key][0]()
     with open(filepath, "rb") as f:
         # iter() with a sentinel of b"" is the canonical "read until EOF"
         # idiom and compiles to tight bytecode. The lambda captures the
@@ -136,7 +162,10 @@ def get_hash(filepath: str, algo_key: str) -> str:
 # Filesystem walking
 # -----------------------------------------------------------------------------
 
-def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.stat_result]]:
+
+def _iter_files_for_seal(
+    root: str, mhl_path: str
+) -> Iterator[tuple[str, os.stat_result]]:
     """
     Walk `root` recursively and yield (absolute_path, stat_result) for every
     file that should appear in the manifest, in deterministic sorted order.
@@ -153,7 +182,12 @@ def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.sta
     avoid Python's recursion limit on deeply nested shoots.
     """
     # Stack of directories yet to descend. We push/pop in a way that yields
-    # files in lexicographic order overall by sorting at each level.
+    # files in deterministic order: within each directory entries are sorted
+    # lexicographically, and subdirectories are explored depth-first in that
+    # same order. The overall manifest is NOT globally sorted by full path —
+    # a deeply nested a/b/c.mov appears before a sibling d.mov at the parent
+    # level. This is fine; the manifest only needs to be deterministic, not
+    # follow any specific canonical global order.
     pending = [root]
 
     while pending:
@@ -199,6 +233,7 @@ def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.sta
 # Seal command
 # -----------------------------------------------------------------------------
 
+
 def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
     """
     Walk `root`, hash every non-hidden file, and write a dated MHL manifest
@@ -234,21 +269,34 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
     timestamp_for_filename = now_dt.strftime("%Y-%m-%d_%H%M%S")
     iso_now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Find a non-colliding manifest filename. The original tool exited 0
-    # with --dont-reseal regardless of whether a same-second collision was
-    # the user's existing manifest or a brand-new one being written; we
-    # preserve that behaviour because automated callers depend on it.
+    # Find a non-colliding manifest filename and claim it atomically.
+    #
+    # We use O_CREAT | O_EXCL so the existence check and file creation are
+    # a single syscall — eliminating the TOCTOU race that would exist if we
+    # checked os.path.exists() and then separately opened the file for
+    # writing.  Two parallel seal invocations (e.g. from concurrent post-
+    # transfer scripts on a shared NAS) will now always land on distinct
+    # paths; the second process to attempt any given path gets FileExistsError
+    # and moves on to the next suffix.
+    #
+    # The original tool exited 0 with --dont-reseal regardless of whether a
+    # same-second collision was the user's existing manifest or a brand-new
+    # one being written; we preserve that behaviour because automated callers
+    # depend on it.
     mhl_name = f"{base_name}_{timestamp_for_filename}.mhl"
     mhl_path = os.path.join(root, mhl_name)
-    if os.path.exists(mhl_path):
-        if dont_reseal:
-            sys.exit(0)
-        suffix = 1
-        while True:
-            mhl_path = os.path.join(root, f"{base_name}_{timestamp_for_filename}_{suffix}.mhl")
-            if not os.path.exists(mhl_path):
-                break
+    suffix = 0
+    fd: int | None = None
+    while fd is None:
+        try:
+            fd = os.open(mhl_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        except FileExistsError:
+            if dont_reseal:
+                sys.exit(0)
             suffix += 1
+            mhl_path = os.path.join(
+                root, f"{base_name}_{timestamp_for_filename}_{suffix}.mhl"
+            )
 
     # Build the manifest skeleton. We construct in memory and write at the
     # end; for typical shoots (≤5000 files) the in-memory tree is a few MB
@@ -260,10 +308,10 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
 
     info = etree.SubElement(doc, "creatorinfo")
     for tag, value in (
-        ("username",   getpass.getuser()),
-        ("hostname",   platform.node()),
-        ("tool",       f"simple-mhl v{VERSION}"),
-        ("startdate",  iso_now),
+        ("username", getpass.getuser()),
+        ("hostname", platform.node()),
+        ("tool", f"simple-mhl {__version__}"),
+        ("startdate", iso_now),
         ("finishdate", iso_now),  # placeholder, updated below
     ):
         etree.SubElement(info, tag).text = value
@@ -282,7 +330,9 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
         etree.SubElement(h, "file").text = rel_path_posix
         etree.SubElement(h, "size").text = str(stat_result.st_size)
         mtime = datetime.fromtimestamp(stat_result.st_mtime, timezone.utc)
-        etree.SubElement(h, "lastmodificationdate").text = mtime.strftime("%Y-%m-%dT%H:%M:%SZ")
+        etree.SubElement(h, "lastmodificationdate").text = mtime.strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         etree.SubElement(h, xml_tag).text = get_hash(filepath, algorithm)
         etree.SubElement(h, "hashdate").text = iso_now
 
@@ -294,14 +344,18 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
 
     # Pretty-print so a human can read the manifest in a text editor; lxml
     # adds the XML declaration and UTF-8 encoding header.
-    etree.ElementTree(doc).write(
-        mhl_path, xml_declaration=True, encoding="UTF-8", pretty_print=True
-    )
+    # We write via the fd we already hold from the O_EXCL open above so
+    # we never re-open the file by path (which would be another race window).
+    with os.fdopen(fd, "wb") as fh:
+        etree.ElementTree(doc).write(
+            fh, xml_declaration=True, encoding="UTF-8", pretty_print=True
+        )
 
 
 # -----------------------------------------------------------------------------
 # Verify command
 # -----------------------------------------------------------------------------
+
 
 def _localname(tag: str) -> str:
     """
@@ -327,7 +381,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
         manifest's directory) are blocked and reported as mismatches.
       * Malformed XML exits 20 with no further output.
 
-    Output format (stable contract for tooling and mhlver):
+    Output format:
       OK: <path>                                  (verbose only, success)
       ERROR: hash mismatch: <path>                (verify failure)
       ERROR: missing file: <path>                 (file not on disk)
@@ -335,7 +389,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
       ERROR: no supported hash found: <path>      (manifest malformed)
       ERROR: cannot verify <path>: <reason>       (algorithm not available)
 
-    Exit codes (stable contract used by mhlver):
+    Exit codes:
        0 = clean
       20 = malformed XML
       30 = missing files only
@@ -348,7 +402,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
 
     # Reject directories and non-.mhl files before lxml ever sees the path.
     # Two cases get distinct messages:
-    #   - A directory named 'ascmhl' is an ASC-MHL v2 package; simple-mhl only
+    #   - A directory named 'ascmhl' contains ASC-MHL manifests; simple-mhl only
     #     handles MHL v1 manifests, so point the user at mhlver.
     #   - Any other directory or file without a .mhl extension is just wrong
     #     input for this subcommand.
@@ -357,7 +411,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
             sys.stderr.write(
                 f"Verification Error: '{mhl_file}' is an ASC-MHL v2 package directory.\n"
                 "simple-mhl only handles MHL v1 (.mhl) files. "
-                "Use mhlver to verify ASC-MHL packages.\n"
+                "You may want to use mhlver to verify ASC-MHL packages.\n"
             )
         else:
             sys.stderr.write(
@@ -523,14 +577,18 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
 # XSD schema validation
 # -----------------------------------------------------------------------------
 
+
 def validate_schema(mhl_file: str) -> None:
     """Validate `mhl_file` against the bundled MediaHashList_v1_1.xsd."""
-    xsd_path = get_xsd_path()
-    if not xsd_path:
-        # get_xsd_path() already wrote to stderr; just exit.
-        # We use 60 (not 127) so mhlver can distinguish "couldn't find
-        # simple-mhl on PATH" (127, set by mhlver itself) from "simple-mhl
-        # ran but couldn't find its bundled XSD" (60, this case).
+    # get_xsd_path raises FileNotFoundError if the XSD cannot be located.
+    # We catch it here and exit 60 — the same code that mhlver maps to its
+    # "schema check unavailable" warning message — keeping error-reporting
+    # and exit-code responsibility together in the caller, consistent with
+    # how other error paths in this file work.
+    try:
+        xsd_path = get_xsd_path()
+    except FileNotFoundError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
         sys.exit(60)
 
     try:
@@ -556,12 +614,13 @@ def validate_schema(mhl_file: str) -> None:
 # CLI entry point
 # -----------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="simple-mhl",
         description="Modern verification and sealing tool for legacy MHL files",
     )
-    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # seal subcommand. argparse choices= rejects bad algorithm names before
@@ -572,7 +631,8 @@ def main() -> None:
     )
     seal_p.add_argument("path", help="path to directory to seal")
     seal_p.add_argument(
-        "-a", "--algorithm",
+        "-a",
+        "--algorithm",
         choices=sorted(ALGO_MAP),
         default="xxhash",
         help="hash algorithm (default: xxhash)",
@@ -588,7 +648,8 @@ def main() -> None:
     verify_p = subparsers.add_parser("verify", help="verify an MHL file")
     verify_p.add_argument("path", help="path to MHL file")
     verify_p.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="print per-file status",
     )
@@ -606,5 +667,5 @@ def main() -> None:
     args.func(args)
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

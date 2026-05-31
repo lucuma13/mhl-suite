@@ -1,52 +1,54 @@
 [build-system]
-requires = ["hatchling"]
 build-backend = "hatchling.build"
+requires = [ "hatchling" ]
 
 [project]
 name = "mhl-suite"
-version = "1.2.0"
+version = "1.2.0a1"
 description = "Simple MHL verification and sealing tools"
 readme = "README.md"
+license = { text = "MIT" }
+authors = [ { name = "Luis Gómez Gutiérrez" } ]
 requires-python = ">=3.11"
-license = {text = "MIT"}
-authors = [
-    {name = "Luis Gómez Gutiérrez"}
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    "ascmhl>=1.2.0",
-    "lxml>=4.9.0",
-    "xxhash>=3.0.0",
+  "ascmhl>=1.2",
+  "lxml>=6.1.1",
+  "rich>=15",
+  "xxhash>=3.7",
 ]
+urls.Homepage = "https://github.com/lucuma13/mhl-suite"
+scripts.mhlver = "mhl_suite.mhlver:main"
+scripts.simple-mhl = "mhl_suite.simple_mhl:main"
 
-# Optional extras for development / benchmarking. Install with:
-#   pip install -e ".[dev]"
-# psutil enables accurate RAM detection in bench.py for cache-warming
-# decisions; without it bench falls back to a 32 GB RAM assumption.
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
-    "psutil>=5.9.0",
-    "pytest>=7.4.0",
+  "pytest",
+  "pytest-cov",
+  "ruff",
+  "ty",
 ]
 
-# Format: command-name = "package.module:function"
-[project.scripts]
-simple-mhl = "mhl_suite.simple_mhl:main"
-mhlver = "mhl_suite.mhlver:main"
-
-# This ensures the source code and XSDs are bundled
-[tool.hatch.build.targets.wheel]
-packages = ["src/mhl_suite"]
-
-# This ensures the source code and XSD are included in the source distribution
-[tool.hatch.build.targets.sdist]
-include = [
-    "src/mhl_suite/",
-    "tests/",
-    "benchmarks/"
+[tool.hatch]
+build.targets.wheel.packages = [ "src/mhl_suite" ]
+build.targets.sdist.include = [
+  "src/mhl_suite/",
+  "tests/",
 ]
 
 [tool.uv]
 managed = true
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[tool.ty]
+src.include = [ "src", "tests" ]
+
+[tool.pytest]
+ini_options.testpaths = [ "tests" ]
+ini_options.pythonpath = [ "src" ]
+ini_options.addopts = "--strict-markers --cov=src --cov-branch --cov-report=term-missing"

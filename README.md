@@ -9,58 +9,50 @@
 
 ### 🚀 Installation
 
-1. Install the `uv` package manager with the [official installer](https://docs.astral.sh/uv/getting-started/installation/) (or `brew install uv` on macOS / Linux).
+1. Install the `uv` package manager with the [official installer](https://docs.astral.sh/uv/getting-started/installation/), or:
+* macOS: `brew install uv`
+* Windows: `winget install astral-sh.uv`
+* Linux (Debian): `apt-get install uv`
+<!--
+* Linux (RHEL): `yum install uv`
+* Linux (SUSE): `zypper install python-uv`
+* Linux (Arch): `pacman -S muv`
+-->
 
 2. Install the toolkit:
 
-```
+```bash
 uv tool install mhl-suite
 ```
 
-### 📖 Usage
+3. Test the installation (if the command is not recognised try `uv tool update-shell` and restart Terminal):
 
-##### `mhlver`
+```bash
+mhlver --version
+simple-mhl --version
+```
 
-Verify an MHL file or recursively verify all MHL files under a directory:
+### 📖 Usage examples
+
+Verify MHL files (both flat and ASC-MHL):
 
 ```bash
 mhlver path/to/file.mhl
 mhlver path/to/directory/
-mhlver                            # verifies the current directory
+mhlver                                     # verify current directory
 ```
 
-  ```
-  options:
-    -r, --report           : export a timestamped report log to the target directory
-    -s, --xsd-schema-check : validate XML Schema Definition
-  ```
-
-
-##### `simple-mhl`
-
-Seal a directory or verify an existing MHL file:
+Seal a directory:
 
 ```bash
 simple-mhl seal path/to/directory/
-simple-mhl seal -a md5 path/to/directory/
-simple-mhl verify path/to/file.mhl
+simple-mhl seal -a md5 path/to/directory/   # use MD5 algorithm
 ```
 
-  ```
-  commands:
-    seal              : seal directory (MHL file generated at the root)
-      -a, --algorithm : hash algorithm: xxhash (default), md5, sha1
-      --dont-reseal   : abort silently if an MHL with the same timestamp already exists
-    verify            : verify an MHL file
-    xsd-schema-check  : validate XML Schema Definition
-  ```
+Validate XML Schema Definition of a file:
 
-### 📊 Benchmark
+```bash
+mhlver --xsd-schema-check path/to/file
+```
 
-`simple-mhl` has been tested against real-world media workloads. Sample throughput on a 2 TB workload:
-
-| Algorithm | Seal       | Verify     |
-|-----------|-----------:|-----------:|
-| xxhash    | 2480 MB/s  | 2680 MB/s  |
-| md5       |  560 MB/s  |  560 MB/s  |
-| sha1      |  680 MB/s  |  690 MB/s  |
+Run `simple-mhl --help` and `mhlver --help` to see the full list of options.
