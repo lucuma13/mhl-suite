@@ -139,14 +139,11 @@ jobs:
           python-version: "3.14"
 
       - name: Delay execution for index propagation
-        if: runner.os != 'Windows'
+        shell: bash
         run: sleep 30
 
-      - name: Delay execution for index propagation (Windows)
-        if: runner.os == 'Windows'
-        run: Start-Sleep -Seconds 30
-
       - name: Install deployed package from TestPyPI
+        shell: bash
         run: |
           uv pip install --system \
             --index-url https://test.pypi.org/simple/ \
