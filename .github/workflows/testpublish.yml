@@ -57,14 +57,17 @@ jobs:
           fetch-depth: 0  # Fetches all history and tags so dynamic versioning works
 
       - name: Verify version tag matches TOML declaration
-        shell: bash
+        shell: python3 {0}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          SOURCE=$(grep -m1 '^version\s*=\s*' pyproject.toml | sed -E 's/version\s*=\s*"([^"]+)".*/\1/')
-          if [ "$TAG" != "$SOURCE" ]; then
-            echo "Version mismatch: tag=$TAG, pyproject.toml=$SOURCE"
-            exit 1
-          fi
+          import tomllib, os, sys
+
+          with open("pyproject.toml", "rb") as f:
+              source = tomllib.load(f)["project"]["version"]
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != source:
+              print(f"Version mismatch: tag={tag}, pyproject.toml={source}")
+              sys.exit(1)
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.1.0
