@@ -5,6 +5,8 @@ Covers:
   - mhlver: directory walking, ASC-MHL detection, report generation
 """
 
+import sys
+
 import pytest
 from pathlib import Path
 
@@ -688,11 +690,12 @@ class TestLogHelpers:
 
     def test_verbose_announce_with_cwd_includes_cwd(self, capsys):
         """_verbose_announce includes (cwd=...) when cwd is not None."""
+        cwd = Path("/some/dir")
         mhlver._verbose_announce(
-            ["/bin/cmd", "arg"], cwd=Path("/some/dir"), verbose=True, report_file=None
+            ["/bin/cmd", "arg"], cwd=cwd, verbose=True, report_file=None
         )
         captured = capsys.readouterr()
-        assert "cwd=/some/dir" in captured.err
+        assert f"cwd={cwd}" in captured.err
 
     def test_verbose_announce_without_cwd_omits_cwd(self, capsys):
         """_verbose_announce omits cwd when it is None."""
@@ -821,7 +824,8 @@ class TestGetCommandPath:
 
     def test_prefers_venv_candidate_when_present(self, monkeypatch, tmp_path):
         """Venv bin candidate is returned without calling shutil.which."""
-        venv_bin = tmp_path / "bin"
+        import sys as _sys
+        venv_bin = tmp_path / ("Scripts" if _sys.platform == "win32" else "bin")
         venv_bin.mkdir()
         candidate = venv_bin / "simple-mhl"
         candidate.write_text("#!/bin/sh")
@@ -1271,6 +1275,10 @@ class TestRun:
         assert rc == 0
         assert "successfully verified" in capsys.readouterr().out
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="os.mkfifo is not available on Windows"
+    )
     def test_src_is_neither_file_nor_dir_still_succeeds(self, tmp_path, monkeypatch):
         """When src exists but is neither a file nor a directory (e.g. a named
         pipe), _run takes the else branch (console = None) and returns 0."""
