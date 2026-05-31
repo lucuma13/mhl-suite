@@ -869,7 +869,8 @@ class TestWalkEdgeCases:
     """Exercises the two OSError-swallowing branches in _iter_files_for_seal."""
 
     @pytest.mark.skipif(
-        os.getuid() == 0, reason="root bypasses permission checks"
+        getattr(os, "getuid", lambda: 1)() == 0,
+        reason="root bypasses permission checks"
     )
     def test_unreadable_subdir_is_silently_skipped(self, mhl_cli, tmp_path):
         """A subdirectory that cannot be scanned (mode 000) must be silently
