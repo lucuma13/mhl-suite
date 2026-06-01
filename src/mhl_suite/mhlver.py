@@ -44,9 +44,10 @@ from rich.text import Text
 # Version
 # -----------------------------------------------------------------------------
 
-# Version is imported from mhl-suite
-__version__ = importlib.metadata.version("mhl-suite")
-
+try:
+    __version__ = importlib.metadata.version("mhl-suite")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+    __version__ = "unknown"
 
 # -----------------------------------------------------------------------------
 # Terminal colours
@@ -236,16 +237,9 @@ def _emit_step_output(
     # Terminal: shown when caller requests it; coloured only on failure.
     if show_on_terminal:
         if exit_code != 0:
-            msg = f"{RED}{out}{RESET}"
-            if console is not None:
-                console.print(msg)
-            else:
-                print(msg, file=sys.stderr)
+            _log(out, colour=RED, stream=sys.stderr, report_file=None, console=console)
         else:
-            if console is not None:
-                console.print(out)
-            else:
-                print(out)
+            _log(out, colour="", stream=sys.stdout, report_file=None, console=console)
 
 
 # -----------------------------------------------------------------------------
@@ -557,21 +551,9 @@ def _verify_ascmhl(
     # ascmhl-debug expects to find its bundled XSDs via paths relative to
     # its working directory. Setting cwd to the directory containing this
     # script lets it locate them when the suite is installed alongside.
-    suite_dir = Path(__file__).resolve().parent
-    cwd = suite_dir if suite_dir.exists() else None
-    if not cwd:
-        # This is unexpected but not immediately fatal: ascmhl-debug may still
-        # locate its XSDs from the process working directory. We log a warning
-        # (not an error) so the operator knows something is off, and we carry
-        # on. If ascmhl-debug does fail as a result, its non-zero exit code
-        # will surface through the normal dispatch table.
-        log_warning(
-            "Warning: could not determine suite directory; ascmhl-debug will "
-            "run without an explicit working directory and may fail to locate "
-            "its XSD files.",
-            report_file,
-            console=console,
-        )
+    # Path(__file__).resolve().parent is always valid — if it didn't exist,
+    # Python would have failed to import this module.
+    cwd = Path(__file__).resolve().parent
 
     if schema:
         return _ascmhl_schema_check(
@@ -766,9 +748,9 @@ def _mhl_total_bytes(mhl_file: Path) -> int:
     manifest count, giving a more accurate ETA when manifests vary wildly
     in size (e.g. 500 GB camera originals vs 2 GB proxies).
     """
-    try:
-        from lxml import etree
+    from lxml import etree
 
+    try:
         tree = etree.parse(str(mhl_file))
         return sum(
             int(el.text)
@@ -805,28 +787,25 @@ def _ascmhl_total_bytes(latest_mhl: Path) -> int:
     path: the first generation to record a path wins its size; later
     occurrences of the same path are skipped.
     """
-    try:
-        from lxml import etree
+    from lxml import etree
 
-        ascmhl_dir = latest_mhl.parent  # the ascmhl/ folder
-        seen: set[str] = set()
-        total = 0
-        for mhl_path in sorted(ascmhl_dir.glob("*.mhl")):
-            try:
-                tree = etree.parse(str(mhl_path))
-                for el in tree.iterfind(".//{*}path"):
-                    rel = (el.text or "").strip()
-                    if not rel or rel in seen:
-                        continue
-                    size_str = el.get("size", "")
-                    if size_str.strip().isdigit():
-                        seen.add(rel)
-                        total += int(size_str)
-            except Exception:
-                pass  # skip unreadable generation files; others still count
-        return total
-    except Exception:
-        return 0
+    ascmhl_dir = latest_mhl.parent  # the ascmhl/ folder
+    seen: set[str] = set()
+    total = 0
+    for mhl_path in sorted(ascmhl_dir.glob("*.mhl")):
+        try:
+            tree = etree.parse(str(mhl_path))
+            for el in tree.iterfind(".//{*}path"):
+                rel = (el.text or "").strip()
+                if not rel or rel in seen:
+                    continue
+                size_str = el.get("size", "")
+                if size_str.strip().isdigit():
+                    seen.add(rel)
+                    total += int(size_str)
+        except Exception:
+            pass  # skip unreadable generation files; others still count
+    return total
 
 
 def _build_live() -> "tuple[Live, Progress, Text, Console]":
@@ -1022,7 +1001,7 @@ def _run(
             log_warning(f"No MHL files found under {src}", report_file)
 
         use_progress = sys.stdout.isatty() and len(mhl_files) > 0
-        
+
         if use_progress:
             # Pre-read byte weights for accurate ETA (XML parse only, no
             # hashing).  Legacy manifests expose <size> child elements;

@@ -123,6 +123,36 @@ class TestSeal:
         assert rc == 2
 
 
+# =============================================================================
+# TestSealUnsupportedAlgorithm
+# =============================================================================
+# Covers lines 270-271: the algorithm guard inside seal().
+# argparse's choices= catches unknown algorithms before seal() is reached via
+# the CLI (test_seal_invalid_algorithm above exercises that path). These tests
+# call seal() directly, bypassing argparse, to exercise the defence-in-depth
+# guard that also lives inside the function.
+
+
+class TestSealUnsupportedAlgorithm:
+    """seal() exits 2 when called directly with an algorithm not in ALGO_MAP."""
+
+    def test_unsupported_algorithm_exits_2(self, tmp_path):
+        """Calling seal() directly with 'blake3' (not in ALGO_MAP) exits with 2."""
+        from mhl_suite import simple_mhl
+        (tmp_path / "a.bin").write_bytes(b"data")
+        with pytest.raises(SystemExit) as exc:
+            simple_mhl.seal(str(tmp_path), "blake3", dont_reseal=False)
+        assert exc.value.code == 2
+
+    def test_unsupported_algorithm_writes_error_to_stderr(self, tmp_path, capsys):
+        """The error message written to stderr names the unsupported algorithm."""
+        from mhl_suite import simple_mhl
+        (tmp_path / "a.bin").write_bytes(b"data")
+        with pytest.raises(SystemExit):
+            simple_mhl.seal(str(tmp_path), "blake3", dont_reseal=False)
+        assert "blake3" in capsys.readouterr().err
+
+
 class TestVerify:
     """Tests around the verify command."""
 
@@ -130,7 +160,7 @@ class TestVerify:
         """A freshly sealed dir should verify clean (exit 0)."""
         make_tree(tmp_path, {"a.bin": b"hello", "b/c.bin": b"world"})
         mhl = seal_helper(mhl_cli, tmp_path)
-        
+
         rc, out, err = mhl_cli(["verify", str(mhl)])
         assert rc == 0
 
@@ -139,7 +169,7 @@ class TestVerify:
         make_tree(tmp_path, {"a.bin": b"hello"})
         mhl = seal_helper(mhl_cli, tmp_path)
         (tmp_path / "a.bin").unlink()
-        
+
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 30
         assert "ERROR: missing file: a.bin" in out
@@ -149,7 +179,7 @@ class TestVerify:
         make_tree(tmp_path, {"a.bin": b"hello"})
         mhl = seal_helper(mhl_cli, tmp_path)
         (tmp_path / "a.bin").write_bytes(b"goodbye")
-        
+
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 40
         assert "ERROR: hash mismatch: a.bin" in out
@@ -160,7 +190,7 @@ class TestVerify:
         mhl = seal_helper(mhl_cli, tmp_path)
         (tmp_path / "a.bin").unlink()
         (tmp_path / "b.bin").write_bytes(b"changed")
-        
+
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 70
         assert "ERROR: missing file: a.bin" in out
@@ -170,7 +200,7 @@ class TestVerify:
         """A clean verify must produce no stdout at all (exit 0 only)."""
         make_tree(tmp_path, {"a.bin": b"hello"})
         mhl = seal_helper(mhl_cli, tmp_path)
-        
+
         rc, out, err = mhl_cli(["verify", str(mhl)])
         assert rc == 0
         assert out == ""
@@ -180,7 +210,7 @@ class TestVerify:
         """--verbose should print one 'OK: <path>' line per verified file."""
         make_tree(tmp_path, {"a.bin": b"hello", "sub/b.bin": b"world"})
         mhl = seal_helper(mhl_cli, tmp_path)
-        
+
         rc, out, err = mhl_cli(["verify", "-v", str(mhl)])
         assert rc == 0
         assert "OK: a.bin" in out
@@ -191,7 +221,7 @@ class TestVerify:
         make_tree(tmp_path, {"good.bin": b"hello", "bad.bin": b"world"})
         mhl = seal_helper(mhl_cli, tmp_path)
         (tmp_path / "bad.bin").write_bytes(b"changed")
-        
+
         rc, out, _ = mhl_cli(["verify", "-v", str(mhl)])
         assert rc == 40
         assert "OK: good.bin" in out
@@ -383,7 +413,7 @@ class TestStressAndEdgeCases:
 
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
-        
+
         mhl = next(tmp_path.glob("*.mhl"))
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 0, f"verify failed: {out}"
@@ -395,10 +425,10 @@ class TestStressAndEdgeCases:
             (tmp_path / long_name).write_bytes(b"x")
         except OSError:
             pytest.skip("FS doesn't allow 200-char names")
-            
+
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
-        
+
         mhl = next(tmp_path.glob("*.mhl"))
         rc, _, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 0
@@ -407,7 +437,7 @@ class TestStressAndEdgeCases:
         """Sealing an empty directory should produce a manifest with no <hash>."""
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
-        
+
         mhl = next(tmp_path.glob("*.mhl"))
         text = mhl.read_text()
         assert "<hash>" not in text
@@ -419,10 +449,10 @@ class TestStressAndEdgeCases:
             chunk = os.urandom(1024 * 1024)
             for _ in range(50):
                 f.write(chunk)
-                
+
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
-        
+
         mhl = next(tmp_path.glob("*.mhl"))
         rc, _, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 0
@@ -432,13 +462,13 @@ class TestStressAndEdgeCases:
         (tmp_path / "data.bin").write_bytes(b"X" * (10 * 1024 * 1024))
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
-        
+
         with open(tmp_path / "data.bin", "r+b") as f:
             f.seek(5 * 1024 * 1024)
             b = f.read(1)
             f.seek(-1, 1)
             f.write(bytes([b[0] ^ 1]))
-        
+
         mhl = next(tmp_path.glob("*.mhl"))
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 40
@@ -458,7 +488,7 @@ class TestStressAndEdgeCases:
 
         mhl = tmp_path / "ns.mhl"
         etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
-        
+
         rc, out, err = mhl_cli(["verify", str(mhl)])
         assert rc == 0, f"out={out}\nerr={err}"
 
@@ -474,7 +504,7 @@ class TestStressAndEdgeCases:
         etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
         mhl = tmp_path / "upper.mhl"
         etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
-        
+
         rc, _, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 0
 
@@ -505,7 +535,7 @@ class TestStressAndEdgeCases:
 
             monkeypatch.setenv("MHL_STRICT_TRAVERSAL", "1")
             rc, out, _ = mhl_cli(["verify", str(mhl)])
-            
+
             assert rc == 40
             assert "traversal" in out.lower()
         finally:
@@ -731,6 +761,84 @@ class TestValidateSchemaXsdNotFound:
 
 
 # =============================================================================
+# TestGetXsdPathFallbackPaths
+# =============================================================================
+# Covers lines 119-127: get_xsd_path fallback paths.
+# TestValidateSchemaXsdNotFound patches get_xsd_path itself to raise,
+# bypassing the function body. These tests let the body run by patching one
+# level lower — at importlib.resources.files — while redirecting the local
+# xsd/ fallback lookup via __file__.
+
+
+class TestGetXsdPathFallbackPaths:
+    """get_xsd_path fallback: importlib.resources raises → local xsd/ sibling."""
+
+    def test_falls_back_to_local_xsd_when_importlib_raises(self, tmp_path):
+        """When importlib.resources.files raises ImportError, the local xsd/
+        sibling is found and its path is returned."""
+        from unittest.mock import patch
+        from mhl_suite import simple_mhl
+
+        xsd_dir = tmp_path / "xsd"
+        xsd_dir.mkdir()
+        xsd_file = xsd_dir / "MediaHashList_v1_1.xsd"
+        xsd_file.write_text("<schema/>")
+
+        with (
+            patch.object(
+                simple_mhl.importlib.resources,
+                "files",
+                side_effect=ImportError("no package"),
+            ),
+            patch.object(simple_mhl, "__file__", str(tmp_path / "simple_mhl.py")),
+        ):
+            result = simple_mhl.get_xsd_path()
+
+        assert result == str(xsd_file)
+
+    def test_falls_back_to_local_xsd_when_resource_is_not_a_file(self, tmp_path):
+        """When files() succeeds but is_file() returns False (e.g. a namespace
+        package without the XSD installed), the local xsd/ sibling is used."""
+        from unittest.mock import MagicMock, patch
+        from mhl_suite import simple_mhl
+
+        xsd_dir = tmp_path / "xsd"
+        xsd_dir.mkdir()
+        xsd_file = xsd_dir / "MediaHashList_v1_1.xsd"
+        xsd_file.write_text("<schema/>")
+
+        fake_resource = MagicMock()
+        fake_resource.is_file.return_value = False
+        fake_pkg = MagicMock()
+        fake_pkg.joinpath.return_value = fake_resource
+
+        with (
+            patch.object(simple_mhl.importlib.resources, "files", return_value=fake_pkg),
+            patch.object(simple_mhl, "__file__", str(tmp_path / "simple_mhl.py")),
+        ):
+            result = simple_mhl.get_xsd_path()
+
+        assert result == str(xsd_file)
+
+    def test_raises_file_not_found_when_both_paths_absent(self, tmp_path):
+        """FileNotFoundError is raised when neither the package resource nor the
+        local xsd/ folder exists (tmp_path has no xsd/ subdirectory)."""
+        from unittest.mock import patch
+        from mhl_suite import simple_mhl
+
+        with (
+            patch.object(
+                simple_mhl.importlib.resources,
+                "files",
+                side_effect=ImportError("no package"),
+            ),
+            patch.object(simple_mhl, "__file__", str(tmp_path / "simple_mhl.py")),
+        ):
+            with pytest.raises(FileNotFoundError, match="MediaHashList_v1_1.xsd"):
+                simple_mhl.get_xsd_path()
+
+
+# =============================================================================
 # TestVerifyEdgeCases — coverage for uncovered verify() branches
 # =============================================================================
 
@@ -891,3 +999,86 @@ class TestWalkEdgeCases:
             assert "secret.bin" not in text
         finally:
             locked.chmod(0o755)   # restore so tmp_path cleanup can proceed
+
+
+# =============================================================================
+# TestStrictTraversalRealpathOsError
+# =============================================================================
+# Covers lines 509-512: the except OSError block inside the MHL_STRICT_TRAVERSAL
+# path of verify(). When os.path.realpath raises (e.g. a symlink component whose
+# intermediate directory is inaccessible), the except passes so the normal
+# existence check below handles it — the file is not present → missing → exit 30.
+# We patch os.path.realpath to raise OSError for the specific candidate path
+# without touching anything else.
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="symlinks require elevated privileges on Windows",
+)
+class TestStrictTraversalRealpathOsError:
+    """lines 509-512: OSError from realpath in strict-traversal is silently caught."""
+
+    def _make_mhl(self, pkg: Path, filename: str) -> Path:
+        """Write a minimal MHL referencing filename with a zeroed md5."""
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = filename
+        etree.SubElement(h, "size").text = "0"
+        etree.SubElement(h, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
+        etree.SubElement(h, "md5").text = "0" * 32
+        etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
+        mhl = pkg / "manual.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+        return mhl
+
+    def test_realpath_oserror_falls_through_to_missing(self, tmp_path, monkeypatch):
+        """When realpath raises OSError the except passes, the candidate is not
+        present on disk, and verify records it as a missing file → exit 30."""
+        from unittest.mock import patch
+
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        link = pkg / "broken.bin"
+        link.symlink_to(pkg / "nonexistent_target.bin")
+
+        mhl = self._make_mhl(pkg, "broken.bin")
+        monkeypatch.setenv("MHL_STRICT_TRAVERSAL", "1")
+
+        real_realpath = os.path.realpath
+
+        def raising_realpath(path, **kwargs):
+            if "broken.bin" in str(path):
+                raise OSError("simulated: permission denied on symlink component")
+            return real_realpath(path, **kwargs)
+
+        with patch("mhl_suite.simple_mhl.os.path.realpath", side_effect=raising_realpath):
+            with pytest.raises(SystemExit) as exc:
+                from mhl_suite import simple_mhl
+                simple_mhl.verify(str(mhl))
+
+        assert exc.value.code == 30
+
+    def test_realpath_oserror_does_not_propagate(self, tmp_path, monkeypatch):
+        """The OSError from realpath must be swallowed, not re-raised."""
+        from unittest.mock import patch
+
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        link = pkg / "broken.bin"
+        link.symlink_to(pkg / "nonexistent_target.bin")
+
+        mhl = self._make_mhl(pkg, "broken.bin")
+        monkeypatch.setenv("MHL_STRICT_TRAVERSAL", "1")
+
+        def always_raises(path, **kwargs):
+            raise OSError("simulated")
+
+        with patch("mhl_suite.simple_mhl.os.path.realpath", side_effect=always_raises):
+            try:
+                from mhl_suite import simple_mhl
+                simple_mhl.verify(str(mhl))
+            except SystemExit:
+                pass  # expected — the important thing is no OSError escapes
+            except OSError as e:
+                pytest.fail(f"OSError escaped the except handler: {e}")

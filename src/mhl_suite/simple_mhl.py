@@ -23,6 +23,7 @@ import importlib.metadata
 import importlib.resources
 import os
 import platform
+from pathlib import Path
 import sys
 from datetime import datetime, timezone
 from collections.abc import Callable
@@ -33,25 +34,29 @@ from lxml import etree
 
 
 # -----------------------------------------------------------------------------
+# Version
+# -----------------------------------------------------------------------------
+
+try:
+    __version__ = importlib.metadata.version("mhl-suite")
+except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+    __version__ = "unknown"
+
+# -----------------------------------------------------------------------------
 # Hasher protocol
 # -----------------------------------------------------------------------------
 # Both xxhash and hashlib hashers expose .update() and .hexdigest() but share
 # no common ABC. We define a structural Protocol so the type checker understands
 # what ALGO_MAP factories return without depending on private hashlib internals.
 
-
 @runtime_checkable
 class _Hasher(Protocol):
     def update(self, data: bytes) -> None: ...
     def hexdigest(self) -> str: ...
 
-
 # -----------------------------------------------------------------------------
 # Constants and lookups
 # -----------------------------------------------------------------------------
-
-# Version is imported from mhl-suite
-__version__ = importlib.metadata.version("mhl-suite")
 
 # 4 MiB chunk size for streaming hashing.
 #
@@ -115,13 +120,9 @@ def get_xsd_path() -> str:
         pass
 
     # Source-checkout fallback
-    local = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "xsd",
-        "MediaHashList_v1_1.xsd",
-    )
-    if os.path.exists(local):
-        return local
+    local = Path(__file__).resolve().parent / "xsd" / "MediaHashList_v1_1.xsd"
+    if local.exists():
+        return str(local)
 
     raise FileNotFoundError(
         f"Could not locate MediaHashList_v1_1.xsd (tried {local})"
@@ -234,6 +235,20 @@ def _iter_files_for_seal(
 # -----------------------------------------------------------------------------
 
 
+def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree._Element:
+    """Append a <creatorinfo> block to `parent` and return it."""
+    info = etree.SubElement(parent, "creatorinfo")
+    for tag, value in [
+        ("username",   getpass.getuser()),
+        ("hostname",   platform.node()),
+        ("tool",       tool),
+        ("startdate",  iso_now),
+        ("finishdate", iso_now),  # placeholder, updated after the walk
+    ]:
+        etree.SubElement(info, tag).text = value
+    return info
+
+
 def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
     """
     Walk `root`, hash every non-hidden file, and write a dated MHL manifest
@@ -306,15 +321,7 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
     doc = etree.Element("hashlist", version="1.1")
     etree.SubElement(doc, "creationdate").text = iso_now
 
-    info = etree.SubElement(doc, "creatorinfo")
-    for tag, value in (
-        ("username", getpass.getuser()),
-        ("hostname", platform.node()),
-        ("tool", f"simple-mhl {__version__}"),
-        ("startdate", iso_now),
-        ("finishdate", iso_now),  # placeholder, updated below
-    ):
-        etree.SubElement(info, tag).text = value
+    info = _build_creatorinfo(doc, f"simple-mhl {__version__}", iso_now)
 
     xml_tag = ALGO_MAP[algorithm][1]
 
@@ -368,6 +375,38 @@ def _localname(tag: str) -> str:
     return tag.rpartition("}")[2] if "}" in tag else tag
 
 
+def _validate_mhl_path(mhl_file: str) -> None:
+    """
+    Validate that `mhl_file` is a readable MHL file path, exiting with a
+    structured error message if not. Covers three cases:
+      - path does not exist
+      - path is a directory (with a specific hint for ASC-MHL v2 packages)
+      - path lacks a .mhl extension
+    """
+    if not os.path.exists(mhl_file):
+        sys.stderr.write(f"Verification Error: {mhl_file} not found\n")
+        sys.exit(1)
+    if os.path.isdir(mhl_file):
+        if os.path.basename(os.path.normpath(mhl_file)) == "ascmhl":
+            sys.stderr.write(
+                f"Verification Error: '{mhl_file}' is an ASC-MHL v2 package directory.\n"
+                "simple-mhl only handles MHL v1 (.mhl) files. "
+                "You may want to use mhlver to verify ASC-MHL packages.\n"
+            )
+        else:
+            sys.stderr.write(
+                f"Verification Error: '{mhl_file}' is a directory.\n"
+                "The verify command requires a path to an MHL file (e.g. manifest.mhl).\n"
+            )
+        sys.exit(1)
+    if not mhl_file.lower().endswith(".mhl"):
+        sys.stderr.write(
+            f"Verification Error: '{mhl_file}' does not have a .mhl extension.\n"
+            "The verify command requires a path to an MHL file (e.g. manifest.mhl).\n"
+        )
+        sys.exit(1)
+
+
 def verify(mhl_file: str, verbose: bool = False) -> None:
     """
     Verify each file listed in `mhl_file` against its stored hash.
@@ -396,36 +435,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
       40 = hash mismatches only
       70 = both missing and mismatches
     """
-    if not os.path.exists(mhl_file):
-        sys.stderr.write(f"Verification Error: {mhl_file} not found\n")
-        sys.exit(1)
-
-    # Reject directories and non-.mhl files before lxml ever sees the path.
-    # Two cases get distinct messages:
-    #   - A directory named 'ascmhl' contains ASC-MHL manifests; simple-mhl only
-    #     handles MHL v1 manifests, so point the user at mhlver.
-    #   - Any other directory or file without a .mhl extension is just wrong
-    #     input for this subcommand.
-    if os.path.isdir(mhl_file):
-        if os.path.basename(os.path.normpath(mhl_file)) == "ascmhl":
-            sys.stderr.write(
-                f"Verification Error: '{mhl_file}' is an ASC-MHL v2 package directory.\n"
-                "simple-mhl only handles MHL v1 (.mhl) files. "
-                "You may want to use mhlver to verify ASC-MHL packages.\n"
-            )
-        else:
-            sys.stderr.write(
-                f"Verification Error: '{mhl_file}' is a directory.\n"
-                "The verify command requires a path to an MHL file (e.g. manifest.mhl).\n"
-            )
-        sys.exit(1)
-
-    if not mhl_file.lower().endswith(".mhl"):
-        sys.stderr.write(
-            f"Verification Error: '{mhl_file}' does not have a .mhl extension.\n"
-            "The verify command requires a path to an MHL file (e.g. manifest.mhl).\n"
-        )
-        sys.exit(1)
+    _validate_mhl_path(mhl_file)
 
     # Optional symlink-escape protection. Enabled by setting the env var
     # MHL_STRICT_TRAVERSAL=1 in the caller's environment. Off by default

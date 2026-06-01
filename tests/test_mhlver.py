@@ -511,6 +511,54 @@ class TestAscmhlDispatch:
         assert "ERROR: no MHL history found" in report.getvalue()
 
 
+# =============================================================================
+# TestVerifyAscmhlSchemaFalseDispatch
+# =============================================================================
+# Covers line 568: return _ascmhl_verify(...) inside _verify_ascmhl when
+# schema=False. The existing tests in TestAscmhlDispatch call _ascmhl_verify
+# (the internal worker) directly, and test_schema_true_dispatches_to_ascmhl_
+# schema_check only exercises the schema=True arm. Neither hits the else arm
+# at line 568 of _verify_ascmhl (the public dispatcher).
+
+
+class TestVerifyAscmhlSchemaFalseDispatch:
+    """_verify_ascmhl with schema=False must call _ascmhl_verify, not _ascmhl_schema_check."""
+
+    def test_schema_false_dispatches_to_ascmhl_verify(self, ascmhl_setup, monkeypatch):
+        """schema=False routes to _ascmhl_verify; _ascmhl_schema_check is never called."""
+        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
+
+        called = {}
+
+        def _stub_verify(target, cmd_path, cwd, verbose, report_file, **kw):
+            called["verify"] = True
+            return 0
+
+        def _stub_schema(target, cmd_path, cwd, verbose, report_file, **kw):
+            called["schema"] = True
+            return 0
+
+        monkeypatch.setattr(mhlver, "_ascmhl_verify", _stub_verify)
+        monkeypatch.setattr(mhlver, "_ascmhl_schema_check", _stub_schema)
+
+        rc = mhlver._verify_ascmhl(
+            ascmhl_setup, verbose=False, schema=False, report_file=None
+        )
+
+        assert called.get("verify") is True, "_ascmhl_verify was not called"
+        assert "schema" not in called, "_ascmhl_schema_check must not be called"
+        assert rc == 0
+
+    def test_schema_false_return_value_is_propagated(self, ascmhl_setup, monkeypatch):
+        """The exit code from _ascmhl_verify is returned unchanged."""
+        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
+        monkeypatch.setattr(mhlver, "_ascmhl_verify", lambda *a, **kw: 11)
+        rc = mhlver._verify_ascmhl(
+            ascmhl_setup, verbose=False, schema=False, report_file=None
+        )
+        assert rc == 11
+
+
 class TestLegacyDispatch:
     """Tests for the MHL v1 exit-code translation layer in _verify_legacy."""
 
@@ -917,26 +965,6 @@ class TestVerifyAscmhlExtended:
             ascmhl_setup, verbose=False, schema=False, report_file=None
         )
         assert rc == 127
-
-    def test_suite_dir_missing_logs_warning(self, ascmhl_setup, monkeypatch, capsys):
-        """When suite_dir doesn't exist, a warning is logged and execution continues."""
-        import unittest.mock as _mock
-
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
-        monkeypatch.setattr(
-            mhlver, "_run_step", lambda cmd, **kw: mhlver.StepResult(0, "")
-        )
-        monkeypatch.setattr(mhlver, "_ascmhl_verify", lambda *a, **kw: 0)
-
-        # Patch __file__ to a path whose parent definitely doesn't exist,
-        # so suite_dir.exists() returns False and the warning branch fires.
-        with _mock.patch.object(mhlver, "__file__", "/nonexistent/suite/mhlver.py"):
-            mhlver._verify_ascmhl(
-                ascmhl_setup, verbose=False, schema=False, report_file=None
-            )
-
-        captured = capsys.readouterr()
-        assert "warning" in (captured.out + captured.err).lower()
 
     def test_schema_true_dispatches_to_ascmhl_schema_check(self, ascmhl_setup, monkeypatch):
         """With schema=True, _verify_ascmhl calls _ascmhl_schema_check."""
