@@ -2,7 +2,7 @@
 
 `mhl-suite` is a toolkit for sealing and verifying MHL files. It consists of two primary executables:
 
-* `mhlver`: one tool to verify them all. A wrapper that automatically detects MHL versions (legacy and ASC-MHL) and runs verification recursively across a directory, with optional XSD schema validation and reporting. It delegates to `simple-mhl` for legacy files and to [ascmhl](https://github.com/ascmitc/mhl) for modern manifests.
+* `mhlver`: one tool to verify them all. A wrapper that automatically detects MHL versions (flat/legacy and ASC-MHL) and runs verification recursively across a directory, with optional XSD schema validation and reporting. It delegates to `simple-mhl` for legacy files and to [ascmhl](https://github.com/ascmitc/mhl) for modern manifests.
 * `simple-mhl`: a modern sealing and verification tool, for legacy MHL files. A successor of the discontinued [mhl-tool](https://github.com/pomfort/mhl-tool) and backwards compatible with its manifests: it's 2 to 5 times faster, it fully supports standard `xxhash64be` hashes, and it features XSD schema validation, as well as cleaner output and structured exit codes.
 
 `mhl-suite` is written in [Python](https://www.python.org/) and it integrates [xxhash](https://github.com/ifduyue/python-xxhash), [lxml](https://lxml.de/) and [ascmhl](https://pypi.org/project/ascmhl/).
@@ -28,8 +28,7 @@ uv tool install mhl-suite
 3. Test the installation (if the command is not recognised try `uv tool update-shell` and restart your terminal):
 
 ```bash
-mhlver --version; \
-simple-mhl --version
+mhlver --version; simple-mhl --version
 ```
 
 ### 📖 Usage examples
