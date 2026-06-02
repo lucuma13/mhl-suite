@@ -5,7 +5,7 @@ Covers:
   - Correctness: seal/verify round-trips with multiple algorithms
   - Edge cases: hidden files, unicode names, nested dirs, empty files
   - Failure modes: corrupted files, missing files, malformed XML, schema errors
-  - Security: path traversal blocking
+  - Security: path traversal blocking (normpath-based)
   - Stress: large files, thousands of files, pathological naming conventions
 """
 import os
@@ -43,7 +43,7 @@ class TestSeal:
         """A simple seal with md5 produces a valid manifest."""
         make_tree(tmp_path, {"a.bin": b"hello", "b/c.bin": b"world"})
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
-        
+
         assert rc == 0
         mhls = list(tmp_path.glob("*.mhl"))
         assert len(mhls) == 1
@@ -55,7 +55,7 @@ class TestSeal:
         """sha1 algorithm produces sha1 tags."""
         make_tree(tmp_path, {"a.bin": b"x"})
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "sha1"])
-        
+
         assert rc == 0
         text = next(tmp_path.glob("*.mhl")).read_text()
         assert "<sha1>" in text
@@ -68,7 +68,7 @@ class TestSeal:
             ".hiddendir/inside.bin": b"also no",
         })
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
-        
+
         assert rc == 0
         text = next(tmp_path.glob("*.mhl")).read_text()
         assert "visible.bin" in text
@@ -77,13 +77,13 @@ class TestSeal:
     def test_seal_dont_reseal(self, mhl_cli, tmp_path):
         """--dont-reseal should bail out if MHL already exists."""
         make_tree(tmp_path, {"a.bin": b"hello"})
-        
+
         rc1, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc1 == 0
-        
+
         rc2, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc2 == 0
-        
+
         rc3, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "--dont-reseal"])
         assert rc3 == 0
 
@@ -95,7 +95,7 @@ class TestSeal:
             "🎬.mp4": b"emoji",
         })
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
-        
+
         assert rc == 0
         text = next(tmp_path.glob("*.mhl")).read_text(encoding="utf-8")
         assert "日本語.bin" in text
@@ -106,7 +106,7 @@ class TestSeal:
         """Zero-byte files should still get a hash entry."""
         make_tree(tmp_path, {"empty.bin": b""})
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
-        
+
         assert rc == 0
         text = next(tmp_path.glob("*.mhl")).read_text()
         assert "d41d8cd98f00b204e9800998ecf8427e" in text
@@ -507,58 +507,6 @@ class TestStressAndEdgeCases:
 
         rc, _, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 0
-
-    def test_traversal_strict_mode(self, mhl_cli, tmp_path, monkeypatch):
-        """In strict mode, a symlink escape should also be blocked."""
-        outside = tmp_path.parent / "stress_outside_secret.bin"
-        outside.write_bytes(b"secret")
-        try:
-            seal_root = tmp_path / "pkg"
-            seal_root.mkdir()
-            link = seal_root / "innocent_looking.bin"
-            try:
-                os.symlink(str(outside), str(link))
-            except (OSError, NotImplementedError):
-                pytest.skip("symlinks not supported")
-            (seal_root / "real.bin").write_bytes(b"yes")
-
-            root = etree.Element("hashlist", version="1.1")
-            for fname in ["real.bin", "innocent_looking.bin"]:
-                h = etree.SubElement(root, "hash")
-                etree.SubElement(h, "file").text = fname
-                etree.SubElement(h, "size").text = "0"
-                etree.SubElement(h, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
-                etree.SubElement(h, "md5").text = "0" * 32
-                etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
-            mhl = seal_root / "manual.mhl"
-            etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
-
-            monkeypatch.setenv("MHL_STRICT_TRAVERSAL", "1")
-            rc, out, _ = mhl_cli(["verify", str(mhl)])
-
-            assert rc == 40
-            assert "traversal" in out.lower()
-        finally:
-            outside.unlink(missing_ok=True)
-
-    def test_traversal_strict_mode_allows_internal_symlink(self, mhl_cli, tmp_path, monkeypatch):
-        """In strict mode, a symlink that resolves within the manifest directory must not be blocked."""
-        seal_root = tmp_path / "pkg"
-        seal_root.mkdir()
-        target = seal_root / "actual_data.bin"
-        target.write_bytes(b"data")
-        link = seal_root / "internal_link.bin"
-        try:
-            os.symlink(str(target), str(link))
-        except (OSError, NotImplementedError):
-            pytest.skip("Symlinks not supported on this filesystem.")
-
-        mhl = seal_helper(mhl_cli, seal_root, "md5")
-
-        monkeypatch.setenv("MHL_STRICT_TRAVERSAL", "1")
-        rc, out, _ = mhl_cli(["verify", str(mhl)])
-        assert rc == 0
-        assert "traversal" not in out.lower()
 
 # =============================================================================
 # TestSealAtomicCollision
@@ -1002,83 +950,182 @@ class TestWalkEdgeCases:
 
 
 # =============================================================================
-# TestStrictTraversalRealpathOsError
+# TestSymlinkCycleProtection
 # =============================================================================
-# Covers lines 509-512: the except OSError block inside the MHL_STRICT_TRAVERSAL
-# path of verify(). When os.path.realpath raises (e.g. a symlink component whose
-# intermediate directory is inaccessible), the except passes so the normal
-# existence check below handles it — the file is not present → missing → exit 30.
-# We patch os.path.realpath to raise OSError for the specific candidate path
-# without touching anything else.
+# Documents and pins the behaviour that prevents _iter_files_for_seal from
+# looping indefinitely when the directory tree contains symlink cycles.
+#
+# Protection works in two layers:
+#   1. is_dir(follow_symlinks=False) — a symlink to a directory is not descended
+#   2. is_file(follow_symlinks=False) — a symlink to a file also returns False,
+#      so symlinks are excluded from the seal entirely
+#
+# This means cycles are impossible by exclusion: symlinks are never walked or
+# yielded, regardless of what they point to. These tests document and pin that
+# guarantee so a future refactor cannot silently remove the follow_symlinks=False
+# calls without breaking them.
 
 
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="symlinks require elevated privileges on Windows",
 )
-class TestStrictTraversalRealpathOsError:
-    """lines 509-512: OSError from realpath in strict-traversal is silently caught."""
+class TestSymlinkCycleProtection:
+    """_iter_files_for_seal excludes symlinks entirely, making cycles impossible."""
 
-    def _make_mhl(self, pkg: Path, filename: str) -> Path:
-        """Write a minimal MHL referencing filename with a zeroed md5."""
+    def test_symlink_to_parent_is_excluded_from_seal(self, mhl_cli, tmp_path):
+        """A symlink pointing back to its own parent directory must be silently
+        excluded from the manifest — not descended into, not hashed."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "real.bin").write_bytes(b"data")
+        loop = pkg / "loop"
+        try:
+            loop.symlink_to(pkg)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
+
+        rc, _, _ = mhl_cli(["seal", str(pkg), "-a", "md5"])
+        assert rc == 0
+        text = next(pkg.glob("*.mhl")).read_text()
+        # Only the real file is sealed; the symlink is excluded entirely.
+        assert "real.bin" in text
+        assert "loop" not in text
+        assert text.count("<hash>") == 1
+
+    def test_mutual_symlinks_are_excluded_from_seal(self, mhl_cli, tmp_path):
+        """Two symlinks pointing at each other must both be silently excluded —
+        neither causes infinite descent, neither appears in the manifest."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "real.bin").write_bytes(b"data")
+        a = pkg / "a.bin"
+        b = pkg / "b.bin"
+        try:
+            a.symlink_to(b)
+            b.symlink_to(a)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
+
+        rc, _, _ = mhl_cli(["seal", str(pkg), "-a", "md5"])
+        assert rc == 0
+        text = next(pkg.glob("*.mhl")).read_text()
+        # Only the real file is sealed; both symlinks are excluded entirely.
+        assert "real.bin" in text
+        assert "a.bin" not in text
+        assert "b.bin" not in text
+        assert text.count("<hash>") == 1
+
+
+# =============================================================================
+# TestVerifySymlinkManifestEntries
+# =============================================================================
+# Covers what happens when a third-party manifest names a symlink on disk.
+# seal() excludes symlinks, so our own manifests never reference them —
+# but a manifest produced by another tool could. Three cases:
+#
+#   1. Symlink resolves to a real file inside the tree:
+#      verify follows the symlink, hashes the target, and reports correctly.
+#
+#   2. Same, but wrong digest → mismatch detected → exit 40.
+#
+#   3. Mutual symlinks (a → b, b → a) named in a manifest:
+#      os.path.exists() follows the chain and returns False when it cannot
+#      resolve — the existence check fires before get_hash is called, so
+#      both entries are reported as missing files → exit 30. No loop, no crash.
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="symlinks require elevated privileges on Windows",
+)
+class TestVerifySymlinkManifestEntries:
+    """verify() handles manifests that reference symlinks on disk."""
+
+    def _make_mhl(self, pkg: Path, entries: list[dict]) -> Path:
+        """Write a minimal MHL referencing the given entries.
+
+        Each entry dict must contain 'file', 'size', and 'md5'.
+        """
         root = etree.Element("hashlist", version="1.1")
-        h = etree.SubElement(root, "hash")
-        etree.SubElement(h, "file").text = filename
-        etree.SubElement(h, "size").text = "0"
-        etree.SubElement(h, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
-        etree.SubElement(h, "md5").text = "0" * 32
-        etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
+        for e in entries:
+            h = etree.SubElement(root, "hash")
+            etree.SubElement(h, "file").text = e["file"]
+            etree.SubElement(h, "size").text = e["size"]
+            etree.SubElement(h, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
+            etree.SubElement(h, "md5").text = e["md5"]
+            etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
         mhl = pkg / "manual.mhl"
         etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
         return mhl
 
-    def test_realpath_oserror_falls_through_to_missing(self, tmp_path, monkeypatch):
-        """When realpath raises OSError the except passes, the candidate is not
-        present on disk, and verify records it as a missing file → exit 30."""
-        from unittest.mock import patch
+    def test_symlink_to_file_inside_tree_verifies_correctly(self, mhl_cli, tmp_path):
+        """verify follows a symlink that resolves inside the tree and hashes its
+        target. A correct digest → exit 0."""
+        import hashlib
 
         pkg = tmp_path / "pkg"
         pkg.mkdir()
-        link = pkg / "broken.bin"
-        link.symlink_to(pkg / "nonexistent_target.bin")
+        real = pkg / "real.bin"
+        real.write_bytes(b"payload")
+        link = pkg / "link.bin"
+        try:
+            link.symlink_to(real)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
 
-        mhl = self._make_mhl(pkg, "broken.bin")
-        monkeypatch.setenv("MHL_STRICT_TRAVERSAL", "1")
+        correct_md5 = hashlib.md5(b"payload").hexdigest()
+        mhl = self._make_mhl(pkg, [
+            {"file": "link.bin", "size": "7", "md5": correct_md5},
+        ])
 
-        real_realpath = os.path.realpath
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0, f"unexpected output: {out}"
 
-        def raising_realpath(path, **kwargs):
-            if "broken.bin" in str(path):
-                raise OSError("simulated: permission denied on symlink component")
-            return real_realpath(path, **kwargs)
-
-        with patch("mhl_suite.simple_mhl.os.path.realpath", side_effect=raising_realpath):
-            with pytest.raises(SystemExit) as exc:
-                from mhl_suite import simple_mhl
-                simple_mhl.verify(str(mhl))
-
-        assert exc.value.code == 30
-
-    def test_realpath_oserror_does_not_propagate(self, tmp_path, monkeypatch):
-        """The OSError from realpath must be swallowed, not re-raised."""
-        from unittest.mock import patch
-
+    def test_symlink_to_file_inside_tree_detects_mismatch(self, mhl_cli, tmp_path):
+        """A wrong digest for a symlink target is detected and reported as a
+        hash mismatch → exit 40."""
         pkg = tmp_path / "pkg"
         pkg.mkdir()
-        link = pkg / "broken.bin"
-        link.symlink_to(pkg / "nonexistent_target.bin")
+        real = pkg / "real.bin"
+        real.write_bytes(b"payload")
+        link = pkg / "link.bin"
+        try:
+            link.symlink_to(real)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
 
-        mhl = self._make_mhl(pkg, "broken.bin")
-        monkeypatch.setenv("MHL_STRICT_TRAVERSAL", "1")
+        mhl = self._make_mhl(pkg, [
+            {"file": "link.bin", "size": "7", "md5": "0" * 32},
+        ])
 
-        def always_raises(path, **kwargs):
-            raise OSError("simulated")
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 40
+        assert "hash mismatch" in out
 
-        with patch("mhl_suite.simple_mhl.os.path.realpath", side_effect=always_raises):
-            try:
-                from mhl_suite import simple_mhl
-                simple_mhl.verify(str(mhl))
-            except SystemExit:
-                pass  # expected — the important thing is no OSError escapes
-            except OSError as e:
-                pytest.fail(f"OSError escaped the except handler: {e}")
+    def test_mutual_symlinks_in_manifest_report_missing(self, mhl_cli, tmp_path):
+        """A manifest naming mutually-pointing symlinks (a → b, b → a) must
+        not loop. os.path.exists() follows the chain and returns False when it
+        cannot resolve — the existence check fires before get_hash is ever
+        called, so both entries are reported as missing files → exit 30."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        a = pkg / "a.bin"
+        b = pkg / "b.bin"
+        try:
+            a.symlink_to(b)
+            b.symlink_to(a)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
+
+        mhl = self._make_mhl(pkg, [
+            {"file": "a.bin", "size": "0", "md5": "0" * 32},
+            {"file": "b.bin", "size": "0", "md5": "0" * 32},
+        ])
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+        # os.path.exists() returns False for unresolvable symlink chains;
+        # both entries hit the missing-file branch before get_hash is called.
+        assert rc == 30
+        assert "missing file: a.bin" in out
+        assert "missing file: b.bin" in out

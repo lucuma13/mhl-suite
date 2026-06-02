@@ -418,6 +418,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
         successfully verified file, mirroring ascmhl-debug's --verbose.
       * Path traversal attempts (manifest entries with ../ that escape the
         manifest's directory) are blocked and reported as mismatches.
+
       * Malformed XML exits 20 with no further output.
 
     Output format:
@@ -436,12 +437,6 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
       70 = both missing and mismatches
     """
     _validate_mhl_path(mhl_file)
-
-    # Optional symlink-escape protection. Enabled by setting the env var
-    # MHL_STRICT_TRAVERSAL=1 in the caller's environment. Off by default
-    # because legitimate offloads sometimes use symlinks for proxy/consolidation
-    # workflows that would break under strict mode.
-    strict_traversal = os.environ.get("MHL_STRICT_TRAVERSAL", "").strip() == "1"
 
     # All file references in the manifest are relative to the directory
     # the manifest lives in. We capture this once and use it as the
@@ -492,24 +487,6 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
         if candidate != mhl_dir and not candidate.startswith(mhl_dir_with_sep):
             mismatches.append(f"ERROR: blocked traversal attempt: {rel_path}")
             continue
-
-        # --- Optional strict-traversal mode (off by default) --------------
-        # When MHL_STRICT_TRAVERSAL=1 is set, also resolve symlinks via
-        # realpath and reject any entry that *resolves* outside mhl_dir.
-        # Without this, a malicious manifest could put a symlink inside the
-        # tree pointing to /etc/shadow and we'd happily hash it. The default
-        # is OFF because legitimate offloads sometimes use symlinks to
-        # consolidate proxies, and strict mode would break those workflows.
-        if strict_traversal and os.path.exists(candidate):
-            try:
-                resolved = os.path.realpath(candidate)
-                if resolved != mhl_dir and not resolved.startswith(mhl_dir_with_sep):
-                    mismatches.append(f"ERROR: blocked traversal attempt: {rel_path}")
-                    continue
-            except OSError:
-                # If realpath fails (e.g. broken symlink), treat as missing
-                # and let the existence check below handle it.
-                pass
 
         # Find the first child element whose tag is a recognised hash
         # algorithm. We iterate direct children only (one level deep)
