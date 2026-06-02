@@ -28,7 +28,8 @@ uv tool install mhl-suite
 3. Test the installation (if the command is not recognised try `uv tool update-shell` and restart your terminal):
 
 ```bash
-mhlver --version && simple-mhl --version
+mhlver --version; \
+simple-mhl --version
 ```
 
 ### 📖 Usage examples
