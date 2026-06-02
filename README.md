@@ -11,7 +11,7 @@
 
 1. Install the `uv` package manager with the [official installer](https://docs.astral.sh/uv/getting-started/installation/), or:
 * macOS: `brew install uv`
-* Windows: `winget install astral-sh.uv && uv tool update-shell`
+* Windows: `winget install astral-sh.uv`
 * Linux (Debian): `apt-get install uv`
 <!--
 * Linux (RHEL): `yum install uv`
@@ -25,7 +25,7 @@
 uv tool install mhl-suite
 ```
 
-3. Test the installation (if the command is not recognised restart Terminal):
+3. Test the installation (if the command is not recognised try `uv tool update-shell` and restart your terminal):
 
 ```bash
 mhlver --version
