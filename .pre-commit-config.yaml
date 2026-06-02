@@ -1,0 +1,40 @@
+repos:
+  - repo: https://github.com/tox-dev/pyproject-fmt
+    rev: v2.23.0
+    hooks:
+      - id: pyproject-fmt
+
+  - repo: https://github.com/abravalheri/validate-pyproject
+    rev: v0.25
+    hooks:
+      - id: validate-pyproject
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      - id: ruff-check
+        args: [ --fix ]
+      - id: ruff-format
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.37.2
+    hooks:
+      - id: check-github-workflows
+        args: ["--verbose"]
+
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.25.2
+    hooks:
+      - id: zizmor
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-gitignore
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: meta
+    hooks:
+      - id: check-hooks-apply
+      - id: check-useless-excludes

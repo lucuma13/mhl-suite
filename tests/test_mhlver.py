@@ -59,6 +59,7 @@ class TestMhlver:
 # Fixtures write minimal but schema-valid ASC-MHL 2.0 XML directly to
 # tmp_path so no external tools or mocking of the XML layer are needed.
 
+
 class TestAscmhlTotalBytes:
     """Unit tests for _ascmhl_total_bytes — byte-weight pre-read for ASC-MHL."""
 
@@ -66,10 +67,24 @@ class TestAscmhlTotalBytes:
         """All path/@size values in a single generation file are summed."""
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
-        write_mhl(ascdir, "0001.mhl", [
-            {"path": "Card/Clip/A001.jpg", "size": "223591", "action": "original", "digest": "aabbccdd"},
-            {"path": "Card/Clip/A002.jpg", "size": "329746", "action": "original", "digest": "11223344"},
-        ])
+        write_mhl(
+            ascdir,
+            "0001.mhl",
+            [
+                {
+                    "path": "Card/Clip/A001.jpg",
+                    "size": "223591",
+                    "action": "original",
+                    "digest": "aabbccdd",
+                },
+                {
+                    "path": "Card/Clip/A002.jpg",
+                    "size": "329746",
+                    "action": "original",
+                    "digest": "11223344",
+                },
+            ],
+        )
         assert mhlver._ascmhl_total_bytes(ascdir / "0001.mhl") == 223591 + 329746
 
     def test_verification_pass_does_not_double_count(self, tmp_path, write_mhl):
@@ -77,8 +92,18 @@ class TestAscmhlTotalBytes:
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
         entries = [
-            {"path": "Card/Clip/A001.jpg", "size": "223591", "action": "original", "digest": "aabbccdd"},
-            {"path": "Card/Clip/A002.jpg", "size": "329746", "action": "original", "digest": "11223344"},
+            {
+                "path": "Card/Clip/A001.jpg",
+                "size": "223591",
+                "action": "original",
+                "digest": "aabbccdd",
+            },
+            {
+                "path": "Card/Clip/A002.jpg",
+                "size": "329746",
+                "action": "original",
+                "digest": "11223344",
+            },
         ]
         write_mhl(ascdir, "0001.mhl", entries)
         write_mhl(ascdir, "0002.mhl", [{**e, "action": "verified"} for e in entries])
@@ -89,13 +114,36 @@ class TestAscmhlTotalBytes:
         """Files introduced in a later generation are counted exactly once."""
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
-        write_mhl(ascdir, "0001.mhl", [
-            {"path": "clip_A.mov", "size": "1000000", "action": "original", "digest": "aaaaaaaa"},
-        ])
-        write_mhl(ascdir, "0002.mhl", [
-            {"path": "clip_A.mov", "size": "1000000", "action": "verified", "digest": "aaaaaaaa"},
-            {"path": "clip_B.mov", "size": "2000000", "action": "original", "digest": "bbbbbbbb"},
-        ])
+        write_mhl(
+            ascdir,
+            "0001.mhl",
+            [
+                {
+                    "path": "clip_A.mov",
+                    "size": "1000000",
+                    "action": "original",
+                    "digest": "aaaaaaaa",
+                },
+            ],
+        )
+        write_mhl(
+            ascdir,
+            "0002.mhl",
+            [
+                {
+                    "path": "clip_A.mov",
+                    "size": "1000000",
+                    "action": "verified",
+                    "digest": "aaaaaaaa",
+                },
+                {
+                    "path": "clip_B.mov",
+                    "size": "2000000",
+                    "action": "original",
+                    "digest": "bbbbbbbb",
+                },
+            ],
+        )
         assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000000 + 2000000
 
     def test_directory_hashes_without_size_are_skipped(self, tmp_path, write_mhl):
@@ -145,11 +193,27 @@ class TestAscmhlTotalBytes:
             ("Card/Clip/A005.jpg", "288179", "29e214aa106f9037"),
             ("Card/Clip/A006.jpg", "452705", "5ec873de8ba744bc"),
         ]
-        write_mhl(ascdir, "0001.mhl", [{"path": p, "size": s, "action": "original", "digest": d} for p, s, d in files])
-        write_mhl(ascdir, "0002.mhl", [{"path": p, "size": s, "action": "verified",  "digest": d} for p, s, d in files])
+        write_mhl(
+            ascdir,
+            "0001.mhl",
+            [
+                {"path": p, "size": s, "action": "original", "digest": d}
+                for p, s, d in files
+            ],
+        )
+        write_mhl(
+            ascdir,
+            "0002.mhl",
+            [
+                {"path": p, "size": s, "action": "verified", "digest": d}
+                for p, s, d in files
+            ],
+        )
         assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 1_811_635
 
-    def test_ascmhl_from_shotputpro_single_generation_with_directory_hashes(self, tmp_path):
+    def test_ascmhl_from_shotputpro_single_generation_with_directory_hashes(
+        self, tmp_path
+    ):
         """Six MXF+sidecar pairs plus a manifest file, interspersed with directory hashes.
 
         Reproduces the structure a transfer tool generates for a camera card:
@@ -310,7 +374,9 @@ class TestAscmhlTotalBytes:
 </hashlist>""")
         assert mhlver._ascmhl_total_bytes(mhl) == 436085 + 2775033 + 161713671
 
-    def test_corrupt_generation_file_is_skipped_others_still_counted(self, tmp_path, write_mhl):
+    def test_corrupt_generation_file_is_skipped_others_still_counted(
+        self, tmp_path, write_mhl
+    ):
         """A corrupt .mhl in the ascmhl dir must be silently skipped; valid
         generations still contribute their sizes to the total.
 
@@ -320,9 +386,18 @@ class TestAscmhlTotalBytes:
         """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
-        write_mhl(ascdir, "0001.mhl", [
-            {"path": "clip_A.mov", "size": "1000000", "action": "original", "digest": "aaaaaaaa"},
-        ])
+        write_mhl(
+            ascdir,
+            "0001.mhl",
+            [
+                {
+                    "path": "clip_A.mov",
+                    "size": "1000000",
+                    "action": "original",
+                    "digest": "aaaaaaaa",
+                },
+            ],
+        )
         (ascdir / "0002.mhl").write_text("<not valid xml")
         assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000000
 
@@ -330,13 +405,31 @@ class TestAscmhlTotalBytes:
         """Earlier generation's size wins when the same path appears in multiple files."""
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
-        write_mhl(ascdir, "0001.mhl", [
-            {"path": "file.mov", "size": "100", "action": "original", "digest": "aaaaaaaa"},
-        ])
+        write_mhl(
+            ascdir,
+            "0001.mhl",
+            [
+                {
+                    "path": "file.mov",
+                    "size": "100",
+                    "action": "original",
+                    "digest": "aaaaaaaa",
+                },
+            ],
+        )
         # 0002 re-records file.mov — must be ignored since 0001 wins.
-        write_mhl(ascdir, "0002.mhl", [
-            {"path": "file.mov", "size": "999", "action": "verified", "digest": "aaaaaaaa"},
-        ])
+        write_mhl(
+            ascdir,
+            "0002.mhl",
+            [
+                {
+                    "path": "file.mov",
+                    "size": "999",
+                    "action": "verified",
+                    "digest": "aaaaaaaa",
+                },
+            ],
+        )
         assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 100
 
 
@@ -526,7 +619,9 @@ class TestVerifyAscmhlSchemaFalseDispatch:
 
     def test_schema_false_dispatches_to_ascmhl_verify(self, ascmhl_setup, monkeypatch):
         """schema=False routes to _ascmhl_verify; _ascmhl_schema_check is never called."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
+        monkeypatch.setattr(
+            mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug"
+        )
 
         called = {}
 
@@ -551,7 +646,9 @@ class TestVerifyAscmhlSchemaFalseDispatch:
 
     def test_schema_false_return_value_is_propagated(self, ascmhl_setup, monkeypatch):
         """The exit code from _ascmhl_verify is returned unchanged."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
+        monkeypatch.setattr(
+            mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug"
+        )
         monkeypatch.setattr(mhlver, "_ascmhl_verify", lambda *a, **kw: 11)
         rc = mhlver._verify_ascmhl(
             ascmhl_setup, verbose=False, schema=False, report_file=None
@@ -646,6 +743,7 @@ class TestLegacyDispatch:
         missing = documented_codes - set(mhlver._LEGACY_RESULTS.keys())
         assert missing == set(), f"Dispatch table missing codes: {missing}"
 
+
 # =============================================================================
 # TestLogHelpers
 # =============================================================================
@@ -660,6 +758,7 @@ class TestLogHelpers:
     def test_log_routes_through_console(self, capsys):
         """When a console object is passed, _log uses console.print, not print()."""
         import io as _io
+
         console_out = _io.StringIO()
 
         class FakeConsole:
@@ -682,6 +781,7 @@ class TestLogHelpers:
     def test_log_writes_to_report_file(self):
         """_log always writes a timestamped line to report_file."""
         import io as _io
+
         buf = _io.StringIO()
         mhlver._log("audit line", colour="", stream=None, report_file=buf)
         assert "audit line" in buf.getvalue()
@@ -695,6 +795,7 @@ class TestLogHelpers:
     def test_emit_step_output_success_via_console(self, capsys):
         """On exit_code==0, a console object is used instead of print()."""
         import io as _io
+
         console_out = _io.StringIO()
 
         class FakeConsole:
@@ -709,6 +810,7 @@ class TestLogHelpers:
     def test_emit_step_output_failure_via_console(self, capsys):
         """On exit_code!=0, a console object is used for the error output."""
         import io as _io
+
         console_out = _io.StringIO()
 
         class FakeConsole:
@@ -732,6 +834,7 @@ class TestLogHelpers:
     def test_emit_step_output_always_writes_report_file(self):
         """Report file always gets the output regardless of show_on_terminal."""
         import io as _io
+
         buf = _io.StringIO()
         mhlver._emit_step_output("detail", 0, buf, show_on_terminal=False)
         assert "detail" in buf.getvalue()
@@ -747,15 +850,14 @@ class TestLogHelpers:
 
     def test_verbose_announce_without_cwd_omits_cwd(self, capsys):
         """_verbose_announce omits cwd when it is None."""
-        mhlver._verbose_announce(
-            ["/bin/cmd"], cwd=None, verbose=True, report_file=None
-        )
+        mhlver._verbose_announce(["/bin/cmd"], cwd=None, verbose=True, report_file=None)
         captured = capsys.readouterr()
         assert "cwd" not in captured.err
 
     def test_verbose_announce_via_console(self):
         """_verbose_announce routes through console when provided."""
         import io as _io
+
         console_out = _io.StringIO()
 
         class FakeConsole:
@@ -763,13 +865,18 @@ class TestLogHelpers:
                 console_out.write(msg + "\n")
 
         mhlver._verbose_announce(
-            ["/bin/cmd"], cwd=None, verbose=True, report_file=None, console=FakeConsole()
+            ["/bin/cmd"],
+            cwd=None,
+            verbose=True,
+            report_file=None,
+            console=FakeConsole(),
         )
         assert "running:" in console_out.getvalue()
 
     def test_verbose_announce_writes_report_file(self):
         """_verbose_announce mirrors the command line to the report file."""
         import io as _io
+
         buf = _io.StringIO()
         mhlver._verbose_announce(
             ["/bin/cmd", "arg"], cwd=None, verbose=True, report_file=buf
@@ -779,6 +886,7 @@ class TestLogHelpers:
     def test_verbose_announce_noop_when_not_verbose(self, capsys):
         """_verbose_announce produces no output when verbose=False."""
         import io as _io
+
         buf = _io.StringIO()
         mhlver._verbose_announce(["/bin/cmd"], cwd=None, verbose=False, report_file=buf)
         captured = capsys.readouterr()
@@ -800,6 +908,7 @@ class TestReportViaTable:
         """When show_status_on_terminal=False and exit=0, the success line must
         still be written to the report file (the silent-progress-bar path)."""
         import io as _io
+
         buf = _io.StringIO()
         mhlver._report_via_table(
             mhlver._LEGACY_RESULTS,
@@ -856,7 +965,9 @@ class TestReportViaTable:
 class TestGetCommandPath:
     """Tests for get_command_path venv-first lookup."""
 
-    def test_falls_back_to_which_when_venv_candidate_missing(self, monkeypatch, tmp_path):
+    def test_falls_back_to_which_when_venv_candidate_missing(
+        self, monkeypatch, tmp_path
+    ):
         """When the venv bin candidate doesn't exist, shutil.which is tried."""
         monkeypatch.setattr(mhlver.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
         # Point sys.prefix at tmp_path so the venv candidate definitely won't exist.
@@ -873,6 +984,7 @@ class TestGetCommandPath:
     def test_prefers_venv_candidate_when_present(self, monkeypatch, tmp_path):
         """Venv bin candidate is returned without calling shutil.which."""
         import sys as _sys
+
         venv_bin = tmp_path / ("Scripts" if _sys.platform == "win32" else "bin")
         venv_bin.mkdir()
         candidate = venv_bin / "simple-mhl"
@@ -933,7 +1045,9 @@ class TestVerifyLegacyExtended:
         mhlver._verify_legacy(mhl, verbose=True, schema=False, report_file=None)
         assert "-v" in captured_cmd["cmd"]
 
-    def test_schema_uses_legacy_schema_results_table(self, tmp_path, monkeypatch, capsys):
+    def test_schema_uses_legacy_schema_results_table(
+        self, tmp_path, monkeypatch, capsys
+    ):
         """With schema=True, exit 60 is looked up in _LEGACY_SCHEMA_RESULTS
         (which has a specific message) not _LEGACY_RESULTS (which doesn't)."""
         monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
@@ -966,9 +1080,13 @@ class TestVerifyAscmhlExtended:
         )
         assert rc == 127
 
-    def test_schema_true_dispatches_to_ascmhl_schema_check(self, ascmhl_setup, monkeypatch):
+    def test_schema_true_dispatches_to_ascmhl_schema_check(
+        self, ascmhl_setup, monkeypatch
+    ):
         """With schema=True, _verify_ascmhl calls _ascmhl_schema_check."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
+        monkeypatch.setattr(
+            mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug"
+        )
         called = {}
 
         def _stub_schema_check(target, cmd_path, cwd, verbose, report_file, **kw):
@@ -1038,9 +1156,9 @@ class TestMhlTotalBytes:
         mhl.write_text(
             '<?xml version="1.0"?>\n'
             '<hashlist version="1.1">'
-            '<hash><file>a.bin</file><size>100</size></hash>'
-            '<hash><file>b.bin</file><size>200</size></hash>'
-            '</hashlist>'
+            "<hash><file>a.bin</file><size>100</size></hash>"
+            "<hash><file>b.bin</file><size>200</size></hash>"
+            "</hashlist>"
         )
         assert mhlver._mhl_total_bytes(mhl) == 300
 
@@ -1060,9 +1178,9 @@ class TestMhlTotalBytes:
         mhl.write_text(
             '<?xml version="1.0"?>\n'
             '<hashlist version="1.1">'
-            '<hash><file>a.bin</file><size>bad</size></hash>'
-            '<hash><file>b.bin</file><size>50</size></hash>'
-            '</hashlist>'
+            "<hash><file>a.bin</file><size>bad</size></hash>"
+            "<hash><file>b.bin</file><size>50</size></hash>"
+            "</hashlist>"
         )
         assert mhlver._mhl_total_bytes(mhl) == 50
 
@@ -1252,9 +1370,7 @@ class TestRun:
     """Tests for the _run orchestration function."""
 
     def _stub_verify_item(self, monkeypatch, return_code: int):
-        monkeypatch.setattr(
-            mhlver, "verify_item", lambda *a, **kw: return_code
-        )
+        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: return_code)
 
     def test_run_with_single_file_success(self, tmp_path, monkeypatch, capsys):
         """_run with a file path calls verify_item and returns 0 on success."""
@@ -1304,13 +1420,13 @@ class TestRun:
         assert "successfully verified" in capsys.readouterr().out
 
     @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="os.mkfifo is not available on Windows"
+        sys.platform == "win32", reason="os.mkfifo is not available on Windows"
     )
     def test_src_is_neither_file_nor_dir_still_succeeds(self, tmp_path, monkeypatch):
         """When src exists but is neither a file nor a directory (e.g. a named
         pipe), _run takes the else branch (console = None) and returns 0."""
         import os
+
         pipe = tmp_path / "fifo.mhl"
         os.mkfifo(pipe)
         # verify_item is never called — exit_status stays 0.
@@ -1320,6 +1436,7 @@ class TestRun:
     def test_run_writes_to_report_file(self, tmp_path, monkeypatch):
         """_run mirrors output to the report file when one is provided."""
         import io as _io
+
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: 0)
         (tmp_path / "a.mhl").write_text("")
@@ -1330,6 +1447,7 @@ class TestRun:
     def test_run_with_report_file_includes_separator(self, tmp_path, monkeypatch):
         """Each manifest verification is separated by '---' in the report."""
         import io as _io
+
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: 0)
         (tmp_path / "a.mhl").write_text("")
@@ -1361,6 +1479,7 @@ class TestRunStep:
         stays fast and cross-platform.
         """
         import threading
+
         event = threading.Event()
         result = mhlver._run_step(
             cmd=["python3", "-c", "import time; time.sleep(0.15)"],
@@ -1414,7 +1533,9 @@ class TestRunWithProgress:
         console = MagicMock()
         console.file = _io.StringIO()
 
-        monkeypatch.setattr(mhlver, "_build_live", lambda: (live, progress, label, console))
+        monkeypatch.setattr(
+            mhlver, "_build_live", lambda: (live, progress, label, console)
+        )
         return progress
 
     def test_progress_branch_calls_verify_item_for_each_manifest(
@@ -1461,6 +1582,7 @@ class TestRunWithProgress:
     def test_progress_branch_writes_separator_to_report(self, tmp_path, monkeypatch):
         """Each manifest is preceded by '---' in the report file."""
         import io as _io
+
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: True)
         self._stub_build_live(monkeypatch)
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: 0)

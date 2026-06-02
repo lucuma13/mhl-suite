@@ -32,6 +32,7 @@ _HASH_ENTRY = """\
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def write_mhl():
     """Factory fixture that writes a minimal ASC-MHL 2.0 generation file.
@@ -62,6 +63,7 @@ def write_mhl():
 @pytest.fixture
 def mhl_cli():
     """Fixture to execute simple_mhl in-process and capture results."""
+
     def _run(argv):
         # Convert Path objects to strings to prevent sys.argv type errors
         str_argv = [str(arg) for arg in argv]
@@ -79,4 +81,5 @@ def mhl_cli():
             return exit_code, out.getvalue(), err.getvalue()
         finally:
             sys.argv, sys.stdout, sys.stderr = old_argv, old_stdout, old_stderr
+
     return _run

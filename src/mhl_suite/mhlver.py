@@ -724,10 +724,10 @@ def _select_mhl_files(root: Path) -> list[Path]:
 
     for f in sorted(find_mhl_files(root)):
         if f.parent.name == "ascmhl":
-            key = f.parent.parent   # package root is the dedup key
+            key = f.parent.parent  # package root is the dedup key
         else:
-            key = f                 # legacy MHL: each file is its own key
-        latest[key] = f             # sorted order → last write wins
+            key = f  # legacy MHL: each file is its own key
+        latest[key] = f  # sorted order → last write wins
 
     # Re-sort the values to preserve the original output order (dict insertion
     # order is sorted-key order here, but an explicit sort is clearer).

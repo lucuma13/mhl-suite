@@ -8,6 +8,7 @@ Covers:
   - Security: path traversal blocking (normpath-based)
   - Stress: large files, thousands of files, pathological naming conventions
 """
+
 import os
 import sys
 import time
@@ -62,11 +63,14 @@ class TestSeal:
 
     def test_seal_skips_hidden_files(self, mhl_cli, tmp_path):
         """Files starting with '.' should be excluded from the manifest."""
-        make_tree(tmp_path, {
-            "visible.bin": b"yes",
-            ".hidden.bin": b"no",
-            ".hiddendir/inside.bin": b"also no",
-        })
+        make_tree(
+            tmp_path,
+            {
+                "visible.bin": b"yes",
+                ".hidden.bin": b"no",
+                ".hiddendir/inside.bin": b"also no",
+            },
+        )
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
 
         assert rc == 0
@@ -89,11 +93,14 @@ class TestSeal:
 
     def test_seal_unicode_filenames(self, mhl_cli, tmp_path):
         """Manifests must handle non-ASCII filenames cleanly (UTF-8)."""
-        make_tree(tmp_path, {
-            "日本語.bin": b"japanese",
-            "café/résumé.txt": b"french",
-            "🎬.mp4": b"emoji",
-        })
+        make_tree(
+            tmp_path,
+            {
+                "日本語.bin": b"japanese",
+                "café/résumé.txt": b"french",
+                "🎬.mp4": b"emoji",
+            },
+        )
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
 
         assert rc == 0
@@ -139,6 +146,7 @@ class TestSealUnsupportedAlgorithm:
     def test_unsupported_algorithm_exits_2(self, tmp_path):
         """Calling seal() directly with 'blake3' (not in ALGO_MAP) exits with 2."""
         from mhl_suite import simple_mhl
+
         (tmp_path / "a.bin").write_bytes(b"data")
         with pytest.raises(SystemExit) as exc:
             simple_mhl.seal(str(tmp_path), "blake3", dont_reseal=False)
@@ -147,6 +155,7 @@ class TestSealUnsupportedAlgorithm:
     def test_unsupported_algorithm_writes_error_to_stderr(self, tmp_path, capsys):
         """The error message written to stderr names the unsupported algorithm."""
         from mhl_suite import simple_mhl
+
         (tmp_path / "a.bin").write_bytes(b"data")
         with pytest.raises(SystemExit):
             simple_mhl.seal(str(tmp_path), "blake3", dont_reseal=False)
@@ -286,6 +295,7 @@ class TestVerify:
         """Old MHL files stored xxhash as decimal int — must verify correctly."""
         make_tree(tmp_path, {"a.bin": b"x"})
         import xxhash
+
         h = xxhash.xxh64()
         h.update(b"x")
         hex_digest = h.hexdigest()
@@ -363,8 +373,8 @@ class TestSchemaCheck:
         bad_mhl.write_text(
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<hashlist version="1.1">\n'
-            '  <fake_tag>This breaks the schema</fake_tag>\n'
-            '</hashlist>\n'
+            "  <fake_tag>This breaks the schema</fake_tag>\n"
+            "</hashlist>\n"
         )
         rc, _, err = mhl_cli(["xsd-schema-check", str(bad_mhl)])
         assert rc == 10
@@ -383,14 +393,14 @@ class TestStressAndEdgeCases:
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         seal_time = time.perf_counter() - t0
         assert rc == 0
-        print(f"\n  seal 1000 files: {seal_time*1000:.0f}ms")
+        print(f"\n  seal 1000 files: {seal_time * 1000:.0f}ms")
 
         mhl = next(tmp_path.glob("*.mhl"))
         t0 = time.perf_counter()
         rc, _, _ = mhl_cli(["verify", str(mhl)])
         verify_time = time.perf_counter() - t0
         assert rc == 0
-        print(f"  verify 1000 files: {verify_time*1000:.0f}ms")
+        print(f"  verify 1000 files: {verify_time * 1000:.0f}ms")
 
     def test_pathological_filenames(self, mhl_cli, tmp_path):
         """Files with spaces, brackets, accented chars, etc."""
@@ -400,7 +410,7 @@ class TestStressAndEdgeCases:
             "(parens).bin",
             "ampersand&.bin",
             "single'quote.bin",
-            "double\"quote.bin",
+            'double"quote.bin',
             "tab\there.bin",
             "naïve.bin",
             "über.bin",
@@ -482,7 +492,9 @@ class TestStressAndEdgeCases:
         h = etree.SubElement(root, f"{{{ns}}}hash")
         etree.SubElement(h, f"{{{ns}}}file").text = "x.bin"
         etree.SubElement(h, f"{{{ns}}}size").text = "2"
-        etree.SubElement(h, f"{{{ns}}}lastmodificationdate").text = "2025-01-01T00:00:00Z"
+        etree.SubElement(
+            h, f"{{{ns}}}lastmodificationdate"
+        ).text = "2025-01-01T00:00:00Z"
         etree.SubElement(h, f"{{{ns}}}md5").text = "49f68a5c8493ec2c0bf489821c21fc3b"
         etree.SubElement(h, f"{{{ns}}}hashdate").text = "2025-01-01T00:00:00Z"
 
@@ -507,6 +519,7 @@ class TestStressAndEdgeCases:
 
         rc, _, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 0
+
 
 # =============================================================================
 # TestSealAtomicCollision
@@ -544,6 +557,7 @@ class TestSealAtomicCollision:
         assert len(mhls) == 1
         # Name must match <dir>_<YYYY-MM-DD_HHMMSS>.mhl with no numeric suffix.
         import re
+
         assert re.fullmatch(
             rf"{re.escape(tmp_path.name)}_\d{{4}}-\d{{2}}-\d{{2}}_\d{{6}}\.mhl",
             mhls[0].name,
@@ -684,7 +698,9 @@ class TestValidateSchemaXsdNotFound:
         )
 
         def _raise():
-            raise FileNotFoundError("Could not locate MediaHashList_v1_1.xsd (tried /fake/path)")
+            raise FileNotFoundError(
+                "Could not locate MediaHashList_v1_1.xsd (tried /fake/path)"
+            )
 
         monkeypatch.setattr(simple_mhl, "get_xsd_path", _raise)
 
@@ -761,7 +777,9 @@ class TestGetXsdPathFallbackPaths:
         fake_pkg.joinpath.return_value = fake_resource
 
         with (
-            patch.object(simple_mhl.importlib.resources, "files", return_value=fake_pkg),
+            patch.object(
+                simple_mhl.importlib.resources, "files", return_value=fake_pkg
+            ),
             patch.object(simple_mhl, "__file__", str(tmp_path / "simple_mhl.py")),
         ):
             result = simple_mhl.get_xsd_path()
@@ -811,6 +829,7 @@ class TestVerifyEdgeCases:
         etree.SubElement(h_good, "size").text = "4"
         etree.SubElement(h_good, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
         import hashlib
+
         etree.SubElement(h_good, "md5").text = hashlib.md5(b"data").hexdigest()
         etree.SubElement(h_good, "hashdate").text = "2025-01-01T00:00:00Z"
 
@@ -834,7 +853,7 @@ class TestVerifyEdgeCases:
         etree.SubElement(h, "file").text = "x.bin"
         etree.SubElement(h, "size").text = "1"
         etree.SubElement(h, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
-        etree.SubElement(h, "blake3").text = "0" * 64   # not in SUPPORTED_HASH_TAGS
+        etree.SubElement(h, "blake3").text = "0" * 64  # not in SUPPORTED_HASH_TAGS
         etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
         mhl = tmp_path / "unsupported.mhl"
         etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
@@ -893,7 +912,9 @@ class TestVerifyEdgeCases:
         assert rc == 30
         assert "ERROR: missing file: ghost.bin" in out
 
-    def test_unsupported_read_only_algorithm_reports_cannot_verify(self, mhl_cli, tmp_path):
+    def test_unsupported_read_only_algorithm_reports_cannot_verify(
+        self, mhl_cli, tmp_path
+    ):
         """An xxhash128 digest (accepted for reading, not writable) must produce
         the 'cannot verify' mismatch (exit 40) rather than crashing."""
         (tmp_path / "x.bin").write_bytes(b"x")
@@ -919,23 +940,26 @@ class TestVerifyEdgeCases:
 
 @pytest.mark.skipif(
     sys.platform == "win32",
-    reason="chmod-based permission tests are not applicable on Windows"
+    reason="chmod-based permission tests are not applicable on Windows",
 )
 class TestWalkEdgeCases:
     """Exercises the two OSError-swallowing branches in _iter_files_for_seal."""
 
     @pytest.mark.skipif(
         getattr(os, "getuid", lambda: 1)() == 0,
-        reason="root bypasses permission checks"
+        reason="root bypasses permission checks",
     )
     def test_unreadable_subdir_is_silently_skipped(self, mhl_cli, tmp_path):
         """A subdirectory that cannot be scanned (mode 000) must be silently
         skipped — the seal must still succeed and include the files that
         ARE accessible."""
-        make_tree(tmp_path, {
-            "accessible.bin": b"yes",
-            "locked/secret.bin": b"no",
-        })
+        make_tree(
+            tmp_path,
+            {
+                "accessible.bin": b"yes",
+                "locked/secret.bin": b"no",
+            },
+        )
         locked = tmp_path / "locked"
         locked.chmod(0o000)
         try:
@@ -946,7 +970,7 @@ class TestWalkEdgeCases:
             assert "accessible.bin" in text
             assert "secret.bin" not in text
         finally:
-            locked.chmod(0o755)   # restore so tmp_path cleanup can proceed
+            locked.chmod(0o755)  # restore so tmp_path cleanup can proceed
 
 
 # =============================================================================
@@ -1075,9 +1099,12 @@ class TestVerifySymlinkManifestEntries:
             pytest.skip("symlinks not supported on this filesystem")
 
         correct_md5 = hashlib.md5(b"payload").hexdigest()
-        mhl = self._make_mhl(pkg, [
-            {"file": "link.bin", "size": "7", "md5": correct_md5},
-        ])
+        mhl = self._make_mhl(
+            pkg,
+            [
+                {"file": "link.bin", "size": "7", "md5": correct_md5},
+            ],
+        )
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 0, f"unexpected output: {out}"
@@ -1095,9 +1122,12 @@ class TestVerifySymlinkManifestEntries:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks not supported on this filesystem")
 
-        mhl = self._make_mhl(pkg, [
-            {"file": "link.bin", "size": "7", "md5": "0" * 32},
-        ])
+        mhl = self._make_mhl(
+            pkg,
+            [
+                {"file": "link.bin", "size": "7", "md5": "0" * 32},
+            ],
+        )
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 40
@@ -1118,10 +1148,13 @@ class TestVerifySymlinkManifestEntries:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks not supported on this filesystem")
 
-        mhl = self._make_mhl(pkg, [
-            {"file": "a.bin", "size": "0", "md5": "0" * 32},
-            {"file": "b.bin", "size": "0", "md5": "0" * 32},
-        ])
+        mhl = self._make_mhl(
+            pkg,
+            [
+                {"file": "a.bin", "size": "0", "md5": "0" * 32},
+                {"file": "b.bin", "size": "0", "md5": "0" * 32},
+            ],
+        )
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         # os.path.exists() returns False for unresolvable symlink chains;

@@ -49,10 +49,12 @@ except importlib.metadata.PackageNotFoundError:  # pragma: no cover
 # no common ABC. We define a structural Protocol so the type checker understands
 # what ALGO_MAP factories return without depending on private hashlib internals.
 
+
 @runtime_checkable
 class _Hasher(Protocol):
     def update(self, data: bytes) -> None: ...
     def hexdigest(self) -> str: ...
+
 
 # -----------------------------------------------------------------------------
 # Constants and lookups
@@ -124,9 +126,7 @@ def get_xsd_path() -> str:
     if local.exists():
         return str(local)
 
-    raise FileNotFoundError(
-        f"Could not locate MediaHashList_v1_1.xsd (tried {local})"
-    )
+    raise FileNotFoundError(f"Could not locate MediaHashList_v1_1.xsd (tried {local})")
 
 
 # -----------------------------------------------------------------------------
@@ -235,14 +235,16 @@ def _iter_files_for_seal(
 # -----------------------------------------------------------------------------
 
 
-def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree._Element:
+def _build_creatorinfo(
+    parent: etree._Element, tool: str, iso_now: str
+) -> etree._Element:
     """Append a <creatorinfo> block to `parent` and return it."""
     info = etree.SubElement(parent, "creatorinfo")
     for tag, value in [
-        ("username",   getpass.getuser()),
-        ("hostname",   platform.node()),
-        ("tool",       tool),
-        ("startdate",  iso_now),
+        ("username", getpass.getuser()),
+        ("hostname", platform.node()),
+        ("tool", tool),
+        ("startdate", iso_now),
         ("finishdate", iso_now),  # placeholder, updated after the walk
     ]:
         etree.SubElement(info, tag).text = value
