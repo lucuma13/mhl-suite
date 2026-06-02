@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<schema targetNamespace="urn:ASC:MHL:DIRECTORY:v2.0" 
-	xmlns="http://www.w3.org/2001/XMLSchema" 
-	xmlns:ascmhldirectory="urn:ASC:MHL:DIRECTORY:v2.0" 
-	xmlns:ascmhl="urn:ASC:MHL:v2.0"  
+<schema targetNamespace="urn:ASC:MHL:DIRECTORY:v2.0"
+	xmlns="http://www.w3.org/2001/XMLSchema"
+	xmlns:ascmhldirectory="urn:ASC:MHL:DIRECTORY:v2.0"
+	xmlns:ascmhl="urn:ASC:MHL:v2.0"
 	elementFormDefault="qualified">
-		
+
 	<import schemaLocation="ASCMHL.xsd" namespace="urn:ASC:MHL:v2.0"/>
-	
+
 	<complexType name="DirectoryType">
 		<sequence>
 			<element name="hashlist" type="ascmhldirectory:HashlistType" maxOccurs="unbounded"/>

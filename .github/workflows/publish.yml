@@ -8,56 +8,39 @@ concurrency:
   group: pypi-publish
   cancel-in-progress: true
 
+permissions: {}  # deny all by default; each job grants only what it needs
+
 jobs:
   # JOB 0: Read project metadata from pyproject.toml
   read-metadata:
     name: Read pyproject.toml metadata
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       package-name: ${{ steps.meta.outputs.package-name }}
       smoke-test-cmds: ${{ steps.meta.outputs.smoke-test-cmds }}
+      version: ${{ steps.meta.outputs.version }}
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Extract metadata from pyproject.toml
         id: meta
         shell: python3 {0}
         run: |
-          import tomllib, os, re, sys
+          import tomllib, os
 
           with open("pyproject.toml", "rb") as f:
               data = tomllib.load(f)
 
           project = data["project"]
           name = project["name"]
+          version = project["version"]
           cmds = " ".join(project.get("scripts", {}).keys())
-
-          # If version is dynamic (e.g. flit reads it from __version__),
-          # locate the module file and extract it from there.
-          if "version" not in project:
-              module = data.get("tool", {}).get("flit", {}).get("module", {}).get("name", name)
-              candidates = [
-                  f"src/{module}.py",
-                  f"src/{module}/__init__.py",
-                  f"{module}.py",
-              ]
-              version = None
-              for path in candidates:
-                  try:
-                      src = open(path).read()
-                      m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', src, re.M)
-                      if m:
-                          version = m.group(1)
-                          break
-                  except FileNotFoundError:
-                      continue
-              if version is None:
-                  print("Could not determine version from source files")
-                  sys.exit(1)
-          else:
-              version = project["version"]
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               print(f"package-name={name}", file=out)
@@ -69,6 +52,8 @@ jobs:
     name: Unit Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
     needs: read-metadata
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: true
       matrix:
@@ -77,26 +62,31 @@ jobs:
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0  # Fetches all history and tags so dynamic versioning works
+          persist-credentials: false
 
       - name: Verify release tag matches declared version
+        env:
+          DECLARED_VERSION: ${{ needs.read-metadata.outputs.version }}
         shell: python3 {0}
         run: |
           import os, sys
 
           tag = os.environ["GITHUB_REF_NAME"]
-          version = "${{ needs.read-metadata.outputs.version }}"
+          version = os.environ["DECLARED_VERSION"]
           if tag != version:
               print(f"Version mismatch: tag={tag}, declared={version}")
               sys.exit(1)
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          enable-cache: false
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -124,20 +114,23 @@ jobs:
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
-          fetch-depth: 0  # Required for flit dynamic versioning from git tag
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          enable-cache: false  # disabled on publish workflows to prevent cache poisoning
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version-file: "pyproject.toml"
 
       - name: Build binary wheels and source tarball
-        run: uv build  # Delegates to the build backend in pyproject.toml (hatchling, flit, etc.)
+        run: uv build
 
       - name: Publish to PyPI via uv
         run: uv publish
@@ -147,6 +140,7 @@ jobs:
     name: Verify Live Package (${{ matrix.os }})
     needs: [read-metadata, build-n-publish]
     runs-on: ${{ matrix.os }}
+    permissions: {}
     strategy:
       fail-fast: false
       matrix:
@@ -154,10 +148,12 @@ jobs:
 
     steps:
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          enable-cache: false  # disabled on publish workflows to prevent cache poisoning
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: "3.14"
 
@@ -166,13 +162,17 @@ jobs:
         run: sleep 30
 
       - name: Install deployed package from PyPI
+        env:
+          PACKAGE_NAME: ${{ needs.read-metadata.outputs.package-name }}
         shell: bash
-        run: uv pip install --system ${{ needs.read-metadata.outputs.package-name }}
+        run: uv pip install --system "$PACKAGE_NAME"
 
       - name: Smoke test CLI entry points
+        env:
+          SMOKE_TEST_CMDS: ${{ needs.read-metadata.outputs.smoke-test-cmds }}
         shell: bash
         run: |
-          for cmd in ${{ needs.read-metadata.outputs.smoke-test-cmds }}; do
+          for cmd in $SMOKE_TEST_CMDS; do
             echo "→ $cmd --version"
             "$cmd" --version
           done

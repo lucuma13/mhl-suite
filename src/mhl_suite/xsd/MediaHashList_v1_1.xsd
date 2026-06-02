@@ -62,7 +62,7 @@
   <xs:complexType>
     <xs:simpleContent>
       	<xs:extension base="md5Type">
-      	</xs:extension>  
+      	</xs:extension>
     </xs:simpleContent>
   </xs:complexType>
 </xs:element>
@@ -71,7 +71,7 @@
   <xs:complexType>
     <xs:simpleContent>
       	<xs:extension base="sha1Type">
-      	</xs:extension>  
+      	</xs:extension>
     </xs:simpleContent>
   </xs:complexType>
 </xs:element>
@@ -80,7 +80,7 @@
   <xs:complexType>
     <xs:simpleContent>
       	<xs:extension base="xxhashType">
-      	</xs:extension>  
+      	</xs:extension>
     </xs:simpleContent>
   </xs:complexType>
 </xs:element>
@@ -90,7 +90,7 @@
   <xs:complexType>
     <xs:simpleContent>
       	<xs:extension base="xxhash64Type">
-      	</xs:extension>  
+      	</xs:extension>
     </xs:simpleContent>
   </xs:complexType>
 </xs:element>
@@ -99,7 +99,7 @@
   <xs:complexType>
     <xs:simpleContent>
       	<xs:extension base="xxhash64Type">
-      	</xs:extension>  
+      	</xs:extension>
     </xs:simpleContent>
   </xs:complexType>
 </xs:element>
@@ -111,7 +111,7 @@
 <xs:element name="creatorinfo">
   <xs:complexType>
     <xs:sequence>
-      <xs:element ref="name" minOccurs="0" maxOccurs ="1"/>      
+      <xs:element ref="name" minOccurs="0" maxOccurs ="1"/>
       <xs:element ref="username" minOccurs="1" maxOccurs ="1"/>
       <xs:element ref="hostname" minOccurs="1" maxOccurs ="1"/>
       <xs:element ref="tool" minOccurs="1" maxOccurs ="1"/>
@@ -152,7 +152,7 @@
       <!-- Mandatory Field -->
       <xs:element ref="creatorinfo" minOccurs ="1" maxOccurs ="1"/>
       <xs:element ref="hash"  minOccurs ="1" maxOccurs="unbounded"/>
-      <xs:element ref="xs2:Signature" minOccurs = "0" maxOccurs ="1"/>      
+      <xs:element ref="xs2:Signature" minOccurs = "0" maxOccurs ="1"/>
     </xs:sequence>
     <xs:attribute ref="version" use="required"/>
   </xs:complexType>

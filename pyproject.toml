@@ -8,6 +8,7 @@ version = "1.2.0a4"
 description = "Simple MHL verification and sealing tools"
 readme = "README.md"
 license = { text = "MIT" }
+authors = [ { name = "Luis Gómez Gutiérrez" } ]
 requires-python = ">=3.11"
 classifiers = [
   "Programming Language :: Python :: 3 :: Only",
@@ -22,13 +23,9 @@ dependencies = [
   "rich>=15",
   "xxhash>=3.7",
 ]
-[[project.authors]]
-name = "Luis Gómez Gutiérrez"
-[project.scripts]
-mhlver = "mhl_suite.mhlver:main"
-simple-mhl = "mhl_suite.simple_mhl:main"
-[project.urls]
-Homepage = "https://github.com/lucuma13/mhl-suite"
+urls.Homepage = "https://github.com/lucuma13/mhl-suite"
+scripts.mhlver = "mhl_suite.mhlver:main"
+scripts.simple-mhl = "mhl_suite.simple_mhl:main"
 
 [dependency-groups]
 dev = [
@@ -38,9 +35,9 @@ dev = [
   "ty",
 ]
 
-[tool.hatch.build]
-targets.wheel.packages = [ "src/mhl_suite" ]
-targets.sdist.include = [
+[tool.hatch]
+build.targets.wheel.packages = [ "src/mhl_suite" ]
+build.targets.sdist.include = [
   "src/mhl_suite/",
   "tests/",
 ]
@@ -49,11 +46,9 @@ targets.sdist.include = [
 managed = true
 
 [tool.ty]
-[tool.ty.src]
-include = [ "src", "tests" ]
+src.include = [ "src", "tests" ]
 
 [tool.pytest]
-[tool.pytest.ini_options]
-testpaths = [ "tests" ]
-pythonpath = [ "src" ]
-addopts = "--strict-markers --cov=src --cov-branch --cov-report=term-missing"
+ini_options.testpaths = [ "tests" ]
+ini_options.pythonpath = [ "src" ]
+ini_options.addopts = "--strict-markers --cov=src --cov-branch --cov-report=term-missing"
