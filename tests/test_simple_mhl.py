@@ -9,13 +9,22 @@ Covers:
   - Stress: large files, thousands of files, pathological naming conventions
 """
 
+import hashlib
 import os
+import random
+import re
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
+from unittest.mock import MagicMock, patch
 
 import pytest
+import xxhash
 from lxml import etree
+
+from mhl_suite import simple_mhl
 
 
 def make_tree(root: Path, spec: dict):
@@ -145,7 +154,6 @@ class TestSealUnsupportedAlgorithm:
 
     def test_unsupported_algorithm_exits_2(self, tmp_path):
         """Calling seal() directly with 'blake3' (not in ALGO_MAP) exits with 2."""
-        from mhl_suite import simple_mhl
 
         (tmp_path / "a.bin").write_bytes(b"data")
         with pytest.raises(SystemExit) as exc:
@@ -154,7 +162,6 @@ class TestSealUnsupportedAlgorithm:
 
     def test_unsupported_algorithm_writes_error_to_stderr(self, tmp_path, capsys):
         """The error message written to stderr names the unsupported algorithm."""
-        from mhl_suite import simple_mhl
 
         (tmp_path / "a.bin").write_bytes(b"data")
         with pytest.raises(SystemExit):
@@ -170,7 +177,7 @@ class TestVerify:
         make_tree(tmp_path, {"a.bin": b"hello", "b/c.bin": b"world"})
         mhl = seal_helper(mhl_cli, tmp_path)
 
-        rc, out, err = mhl_cli(["verify", str(mhl)])
+        rc, _out, _err = mhl_cli(["verify", str(mhl)])
         assert rc == 0
 
     def test_verify_missing_file(self, mhl_cli, tmp_path):
@@ -184,14 +191,21 @@ class TestVerify:
         assert "ERROR: missing file: a.bin" in out
 
     def test_verify_modified_file(self, mhl_cli, tmp_path):
-        """A modified file should produce exit 40."""
+        """A modified file should produce exit 40.
+
+        The size pre-check fires before hash computation, so a replacement with
+        different byte-length produces 'size mismatch' rather than 'hash mismatch'.
+        Either error is a correct corruption signal; we assert on the filename and
+        exit code, not the specific check that fires first.
+        """
         make_tree(tmp_path, {"a.bin": b"hello"})
         mhl = seal_helper(mhl_cli, tmp_path)
         (tmp_path / "a.bin").write_bytes(b"goodbye")
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 40
-        assert "ERROR: hash mismatch: a.bin" in out
+        assert "a.bin" in out
+        assert "ERROR:" in out
 
     def test_verify_missing_and_modified(self, mhl_cli, tmp_path):
         """If BOTH missing and mismatch occur, exit 70 (combined failure)."""
@@ -203,7 +217,9 @@ class TestVerify:
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 70
         assert "ERROR: missing file: a.bin" in out
-        assert "ERROR: hash mismatch: b.bin" in out
+        # "world" (5 bytes) → "changed" (7 bytes): size pre-check fires first.
+        assert "b.bin" in out
+        assert "ERROR:" in out
 
     def test_verify_clean_is_silent(self, mhl_cli, tmp_path):
         """A clean verify must produce no stdout at all (exit 0 only)."""
@@ -220,7 +236,7 @@ class TestVerify:
         make_tree(tmp_path, {"a.bin": b"hello", "sub/b.bin": b"world"})
         mhl = seal_helper(mhl_cli, tmp_path)
 
-        rc, out, err = mhl_cli(["verify", "-v", str(mhl)])
+        rc, out, _err = mhl_cli(["verify", "-v", str(mhl)])
         assert rc == 0
         assert "OK: a.bin" in out
         assert "OK: sub/b.bin" in out.replace(os.sep, "/")
@@ -234,7 +250,9 @@ class TestVerify:
         rc, out, _ = mhl_cli(["verify", "-v", str(mhl)])
         assert rc == 40
         assert "OK: good.bin" in out
-        assert "ERROR: hash mismatch: bad.bin" in out
+        # "world" (5 bytes) → "changed" (7 bytes): size pre-check fires first.
+        assert "bad.bin" in out
+        assert "ERROR:" in out
 
     def test_verify_directory_argument(self, mhl_cli, tmp_path):
         """Passing a directory to verify should exit 1 with an error on stderr."""
@@ -294,7 +312,6 @@ class TestVerify:
     def test_verify_legacy_decimal_xxhash(self, mhl_cli, tmp_path):
         """Old MHL files stored xxhash as decimal int — must verify correctly."""
         make_tree(tmp_path, {"a.bin": b"x"})
-        import xxhash
 
         h = xxhash.xxh64()
         h.update(b"x")
@@ -457,8 +474,7 @@ class TestStressAndEdgeCases:
         path = tmp_path / "huge.bin"
         with open(path, "wb") as f:
             chunk = os.urandom(1024 * 1024)
-            for _ in range(50):
-                f.write(chunk)
+            f.writelines(chunk for _ in range(50))
 
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
@@ -488,13 +504,15 @@ class TestStressAndEdgeCases:
         """A manifest that uses an XML namespace should still verify cleanly."""
         (tmp_path / "x.bin").write_bytes(b"hi")
         ns = "urn:foo:mhl"
-        root = etree.Element(f"{{{ns}}}hashlist", version="1.1", nsmap={None: ns})
+        root = etree.Element(
+            f"{{{ns}}}hashlist",
+            version="1.1",
+            nsmap=cast(dict[str, str], {None: ns}),  # lxml requires None for default ns
+        )
         h = etree.SubElement(root, f"{{{ns}}}hash")
         etree.SubElement(h, f"{{{ns}}}file").text = "x.bin"
         etree.SubElement(h, f"{{{ns}}}size").text = "2"
-        etree.SubElement(
-            h, f"{{{ns}}}lastmodificationdate"
-        ).text = "2025-01-01T00:00:00Z"
+        etree.SubElement(h, f"{{{ns}}}lastmodificationdate").text = "2025-01-01T00:00:00Z"
         etree.SubElement(h, f"{{{ns}}}md5").text = "49f68a5c8493ec2c0bf489821c21fc3b"
         etree.SubElement(h, f"{{{ns}}}hashdate").text = "2025-01-01T00:00:00Z"
 
@@ -544,9 +562,38 @@ class TestStressAndEdgeCases:
 class TestSealAtomicCollision:
     """Tests for the O_EXCL atomic-collision fix in seal()."""
 
-    def _expected_mhl_name(self, root: Path, dt_str: str) -> Path:
-        """Return the primary (no-suffix) MHL path for a given timestamp string."""
-        return root / f"{root.name}_{dt_str}.mhl"
+    # -------------------------------------------------------------------------
+    # Class-scoped fixture: frozen datetime + patch
+    # -------------------------------------------------------------------------
+    # Two tests need to deterministically control the timestamp that seal()
+    # uses for its filename — they freeze datetime.now() to a fixed value and
+    # pre-create collider files at the known path. Both tests share identical
+    # patch boilerplate, so we factor it into a class-scoped fixture that:
+    #
+    #   * patches mhl_suite.simple_mhl.datetime once for the whole class
+    #   * exposes the frozen timestamp string (ts) and base dir name (base)
+    #     as attributes on the fixture object
+    #
+    # Tests that don't need a fixed timestamp (the first three) ignore it.
+    # The fixture is class-scoped because the patch has no side-effects that
+    # would bleed between tests — each test still gets its own tmp_path.
+
+    @pytest.fixture(scope="class")
+    def frozen_dt(self):
+        """Freeze simple_mhl's datetime to 2025-06-01T12:00:00Z for the class.
+
+        Yields a namespace with .ts (the formatted timestamp string) so tests
+        can construct known collision filenames without repeating the patch.
+        """
+        fixed = datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)
+
+        class _Info:
+            ts = "2025-06-01_120000"
+
+        with patch("mhl_suite.simple_mhl.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed
+            mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
+            yield _Info()
 
     def test_no_collision_writes_primary_path(self, mhl_cli, tmp_path):
         """Under no collision the manifest lands at the bare timestamped name."""
@@ -555,43 +602,24 @@ class TestSealAtomicCollision:
         assert rc == 0
         mhls = list(tmp_path.glob("*.mhl"))
         assert len(mhls) == 1
-        # Name must match <dir>_<YYYY-MM-DD_HHMMSS>.mhl with no numeric suffix.
-        import re
-
         assert re.fullmatch(
             rf"{re.escape(tmp_path.name)}_\d{{4}}-\d{{2}}-\d{{2}}_\d{{6}}\.mhl",
             mhls[0].name,
         ), f"unexpected filename: {mhls[0].name}"
 
     def test_dont_reseal_exits_0_when_file_exists(self, mhl_cli, tmp_path):
-        """--dont-reseal must exit 0 (and NOT write a second manifest) when one
-        already exists for the current timestamp.
-
-        We inject the collision by pre-creating the expected filename, then
-        invoke seal with --dont-reseal. The invocation must exit 0 and the
-        injected file must be the only MHL in the directory (no _1.mhl created).
-        """
+        """--dont-reseal must exit 0 whether it collides or picks a fresh timestamp."""
         make_tree(tmp_path, {"a.bin": b"data"})
 
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
 
-        # A second --dont-reseal invocation must exit 0 whether it collides
-        # (same second) or picks a fresh timestamp (new second). Either outcome
-        # is acceptable; the invariant is the exit code.
         rc2, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "--dont-reseal"])
         assert rc2 == 0
 
     def test_collision_without_dont_reseal_creates_suffix(self, mhl_cli, tmp_path):
-        """Without --dont-reseal a collision on the primary path must produce a
-        _1.mhl (or higher) file rather than overwriting or failing.
-
-        Strategy: seal once, seal again without --dont-reseal in the same
-        second. If both finish in the same second, two distinct .mhl files must
-        exist. If a second has ticked, two different timestamps are used and
-        there's no collision — still two files, both named without collision.
-        Either way, exactly two .mhl files must exist and both must be valid.
-        """
+        """Without --dont-reseal a collision must produce a _1.mhl rather than
+        overwriting or failing. Two seals → two distinct files."""
         make_tree(tmp_path, {"a.bin": b"data"})
         rc1, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc1 == 0
@@ -600,80 +628,44 @@ class TestSealAtomicCollision:
         assert rc2 == 0
 
         mhls = sorted(tmp_path.glob("*.mhl"))
-        # Both seals succeeded and produced distinct files.
         assert len(mhls) == 2
         assert mhls[0] != mhls[1]
 
-    def test_pre_injected_collision_suffix_loop(self, mhl_cli, tmp_path, monkeypatch):
+    def test_pre_injected_collision_suffix_loop(self, mhl_cli, tmp_path, frozen_dt):
         """Deterministically trigger the O_EXCL suffix loop by pre-creating both
         the primary *and* _1 filenames, then verifying seal lands on _2.
-
-        We monkeypatch datetime so seal() produces a known timestamp, allowing
-        us to construct the collision filenames precisely.
         """
-        from datetime import datetime, timezone
-        from unittest.mock import patch
-
         make_tree(tmp_path, {"a.bin": b"hello"})
-
-        fixed_dt = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        ts = "2025-06-01_120000"
         base = tmp_path.name
 
-        # Pre-create both the primary and _1 colliders.
-        (tmp_path / f"{base}_{ts}.mhl").write_text("placeholder")
-        (tmp_path / f"{base}_{ts}_1.mhl").write_text("placeholder")
+        (tmp_path / f"{base}_{frozen_dt.ts}.mhl").write_text("placeholder")
+        (tmp_path / f"{base}_{frozen_dt.ts}_1.mhl").write_text("placeholder")
 
-        with patch("mhl_suite.simple_mhl.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_dt
-            # Forward strftime calls to the real datetime.
-            mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
-            rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
 
         assert rc == 0
-        # The _2 file should have been created.
-        expected = tmp_path / f"{base}_{ts}_2.mhl"
-        assert expected.exists(), (
-            f"Expected _2 collision file not found. Files: {list(tmp_path.glob('*.mhl'))}"
-        )
-        # And it must be a real, parseable manifest, not the injected placeholder.
-        text = expected.read_text()
-        assert "<hashlist" in text
+        expected = tmp_path / f"{base}_{frozen_dt.ts}_2.mhl"
+        assert expected.exists(), f"Expected _2 collision file not found. Files: {list(tmp_path.glob('*.mhl'))}"
+        assert "<hashlist" in expected.read_text()
 
-    def test_dont_reseal_with_injected_collision_exits_0_writes_nothing(
-        self, mhl_cli, tmp_path, monkeypatch
-    ):
+    def test_dont_reseal_with_injected_collision_exits_0_writes_nothing(self, mhl_cli, tmp_path, frozen_dt):
         """--dont-reseal with a pre-injected collision must exit 0 immediately
         and must NOT create any new .mhl files.
 
-        This directly exercises the FileExistsError → dont_reseal → sys.exit(0)
+        Directly exercises the FileExistsError → dont_reseal → sys.exit(0)
         branch inside the O_EXCL loop.
         """
-        from datetime import datetime, timezone
-        from unittest.mock import patch
-
         make_tree(tmp_path, {"a.bin": b"hello"})
-
-        fixed_dt = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        ts = "2025-06-01_120000"
         base = tmp_path.name
 
-        # Pre-create only the primary filename — that's enough to fire O_EXCL.
-        collider = tmp_path / f"{base}_{ts}.mhl"
+        collider = tmp_path / f"{base}_{frozen_dt.ts}.mhl"
         collider.write_text("placeholder")
 
-        with patch("mhl_suite.simple_mhl.datetime") as mock_dt:
-            mock_dt.now.return_value = fixed_dt
-            mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
-            rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "--dont-reseal"])
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "--dont-reseal"])
 
         assert rc == 0
-        # The only MHL in the directory must still be our placeholder — nothing
-        # new was written.
         mhls = list(tmp_path.glob("*.mhl"))
-        assert mhls == [collider], (
-            f"Expected only the injected placeholder; found: {mhls}"
-        )
+        assert mhls == [collider], f"Expected only the injected placeholder; found: {mhls}"
         assert collider.read_text() == "placeholder"
 
 
@@ -690,17 +682,12 @@ class TestValidateSchemaXsdNotFound:
     def test_xsd_not_found_exits_60_with_stderr(self, mhl_cli, tmp_path, monkeypatch):
         """When get_xsd_path raises FileNotFoundError, xsd-schema-check must
         exit 60 and write an error message to stderr."""
-        from mhl_suite import simple_mhl
 
         mhl_file = tmp_path / "dummy.mhl"
-        mhl_file.write_text(
-            '<?xml version="1.0" encoding="UTF-8"?>\n<hashlist version="1.1"/>\n'
-        )
+        mhl_file.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<hashlist version="1.1"/>\n')
 
         def _raise():
-            raise FileNotFoundError(
-                "Could not locate MediaHashList_v1_1.xsd (tried /fake/path)"
-            )
+            raise FileNotFoundError("Could not locate MediaHashList_v1_1.xsd (tried /fake/path)")
 
         monkeypatch.setattr(simple_mhl, "get_xsd_path", _raise)
 
@@ -719,7 +706,7 @@ class TestValidateSchemaXsdNotFound:
         # Rename it to have a .mhl extension so verify's extension check passes.
         mhl_path = tmp_path / "broken.mhl"
         mhl_path.mkdir()  # a directory masquerading as a .mhl file
-        rc, _, err = mhl_cli(["xsd-schema-check", str(mhl_path)])
+        rc, _, _err = mhl_cli(["xsd-schema-check", str(mhl_path)])
         # lxml raises OSError trying to open a directory; validate_schema → exit 20.
         assert rc in (20, 1)  # 1 if the dir check fires first
 
@@ -740,8 +727,6 @@ class TestGetXsdPathFallbackPaths:
     def test_falls_back_to_local_xsd_when_importlib_raises(self, tmp_path):
         """When importlib.resources.files raises ImportError, the local xsd/
         sibling is found and its path is returned."""
-        from unittest.mock import patch
-        from mhl_suite import simple_mhl
 
         xsd_dir = tmp_path / "xsd"
         xsd_dir.mkdir()
@@ -763,8 +748,6 @@ class TestGetXsdPathFallbackPaths:
     def test_falls_back_to_local_xsd_when_resource_is_not_a_file(self, tmp_path):
         """When files() succeeds but is_file() returns False (e.g. a namespace
         package without the XSD installed), the local xsd/ sibling is used."""
-        from unittest.mock import MagicMock, patch
-        from mhl_suite import simple_mhl
 
         xsd_dir = tmp_path / "xsd"
         xsd_dir.mkdir()
@@ -777,9 +760,7 @@ class TestGetXsdPathFallbackPaths:
         fake_pkg.joinpath.return_value = fake_resource
 
         with (
-            patch.object(
-                simple_mhl.importlib.resources, "files", return_value=fake_pkg
-            ),
+            patch.object(simple_mhl.importlib.resources, "files", return_value=fake_pkg),
             patch.object(simple_mhl, "__file__", str(tmp_path / "simple_mhl.py")),
         ):
             result = simple_mhl.get_xsd_path()
@@ -789,8 +770,6 @@ class TestGetXsdPathFallbackPaths:
     def test_raises_file_not_found_when_both_paths_absent(self, tmp_path):
         """FileNotFoundError is raised when neither the package resource nor the
         local xsd/ folder exists (tmp_path has no xsd/ subdirectory)."""
-        from unittest.mock import patch
-        from mhl_suite import simple_mhl
 
         with (
             patch.object(
@@ -799,9 +778,9 @@ class TestGetXsdPathFallbackPaths:
                 side_effect=ImportError("no package"),
             ),
             patch.object(simple_mhl, "__file__", str(tmp_path / "simple_mhl.py")),
+            pytest.raises(FileNotFoundError, match=r"MediaHashList_v1_1\.xsd"),
         ):
-            with pytest.raises(FileNotFoundError, match="MediaHashList_v1_1.xsd"):
-                simple_mhl.get_xsd_path()
+            simple_mhl.get_xsd_path()
 
 
 # =============================================================================
@@ -828,7 +807,6 @@ class TestVerifyEdgeCases:
         etree.SubElement(h_good, "file").text = "real.bin"
         etree.SubElement(h_good, "size").text = "4"
         etree.SubElement(h_good, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
-        import hashlib
 
         etree.SubElement(h_good, "md5").text = hashlib.md5(b"data").hexdigest()
         etree.SubElement(h_good, "hashdate").text = "2025-01-01T00:00:00Z"
@@ -840,7 +818,7 @@ class TestVerifyEdgeCases:
         mhl = tmp_path / "partial.mhl"
         etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
 
-        rc, out, err = mhl_cli(["verify", str(mhl)])
+        rc, _out, _err = mhl_cli(["verify", str(mhl)])
         # The legit file verifies; the malformed entry is silently skipped.
         assert rc == 0
 
@@ -875,7 +853,7 @@ class TestVerifyEdgeCases:
         mhl = tmp_path / "null_present.mhl"
         etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
 
-        rc, out, err = mhl_cli(["verify", str(mhl)])
+        rc, out, _err = mhl_cli(["verify", str(mhl)])
         assert rc == 0
         assert out == ""
 
@@ -912,9 +890,7 @@ class TestVerifyEdgeCases:
         assert rc == 30
         assert "ERROR: missing file: ghost.bin" in out
 
-    def test_unsupported_read_only_algorithm_reports_cannot_verify(
-        self, mhl_cli, tmp_path
-    ):
+    def test_unsupported_read_only_algorithm_reports_cannot_verify(self, mhl_cli, tmp_path):
         """An xxhash128 digest (accepted for reading, not writable) must produce
         the 'cannot verify' mismatch (exit 40) rather than crashing."""
         (tmp_path / "x.bin").write_bytes(b"x")
@@ -1086,7 +1062,6 @@ class TestVerifySymlinkManifestEntries:
     def test_symlink_to_file_inside_tree_verifies_correctly(self, mhl_cli, tmp_path):
         """verify follows a symlink that resolves inside the tree and hashes its
         target. A correct digest → exit 0."""
-        import hashlib
 
         pkg = tmp_path / "pkg"
         pkg.mkdir()
@@ -1162,3 +1137,515 @@ class TestVerifySymlinkManifestEntries:
         assert rc == 30
         assert "missing file: a.bin" in out
         assert "missing file: b.bin" in out
+
+
+# =============================================================================
+# Robustness and security tests
+# =============================================================================
+
+
+class TestXXEInjection:
+    """XML External Entity injection must be rejected gracefully."""
+
+    def test_xxe_entity_payload_exits_20(self, mhl_cli, tmp_path):
+        """A manifest containing an XXE <!ENTITY> payload must exit 20 (malformed XML)
+        and must never exfiltrate file content via entity expansion.
+
+        lxml's default parser does not resolve external entities; it raises
+        XMLSyntaxError instead. simple_mhl.verify() already maps that to exit 20.
+        This test pins that behaviour as a regression guard — if the parser is
+        ever reconfigured to resolve entities, this test will fail loudly.
+        """
+        xxe_payload = (
+            '<?xml version="1.0"?>\n'
+            "<!DOCTYPE foo [\n"
+            '  <!ENTITY xxe SYSTEM "file:///etc/passwd">\n'
+            "]>\n"
+            '<hashlist version="1.1">'
+            "<hash><file>&xxe;</file><md5>" + "0" * 32 + "</md5></hash>"
+            "</hashlist>"
+        )
+        mhl = tmp_path / "xxe.mhl"
+        mhl.write_text(xxe_payload, encoding="utf-8")
+
+        rc, out, err = mhl_cli(["verify", str(mhl)])
+        assert rc == 20, f"Expected exit 20 for XXE payload, got {rc}"
+        # No file content must leak into stdout or stderr.
+        for stream in (out, err):
+            assert "root:" not in stream, "Potential XXE exfiltration detected in output"
+            assert "/bin/" not in stream, "Potential XXE exfiltration detected in output"
+
+
+class TestXMLStructuralAnomalies:
+    """Adversarial XML structures must not crash the tool."""
+
+    def test_comment_and_pi_nodes_inside_hash_do_not_crash(self, mhl_cli, tmp_path):
+        """lxml Comment and ProcessingInstruction nodes carry a callable (not a string)
+        as their .tag attribute. simple_mhl._localname() used to call .rpartition()
+        on it, triggering an AttributeError crash.
+
+        The fix: _localname() returns '' for non-string tags, making them invisible
+        to the SUPPORTED_HASH_TAGS membership test.
+        """
+        (tmp_path / "target.bin").write_bytes(b"data")
+
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "target.bin"
+        # Inject adversarial non-element nodes directly inside the <hash> element.
+        h.append(etree.Comment("Adversarial comment insertion"))
+        h.append(etree.PI("xml-stylesheet", 'href="style.css"'))
+        # A real md5 tag follows — the tool must still find it.
+
+        digest = hashlib.md5(b"data").hexdigest()
+        etree.SubElement(h, "md5").text = digest
+
+        mhl = tmp_path / "anomaly.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, _, _ = mhl_cli(["verify", str(mhl)])
+        # The real md5 tag follows the Comment/PI; the tool must find it and verify.
+        assert rc == 0, f"Expected exit 0 after skipping Comment/PI nodes, got {rc}"
+
+    def test_comment_only_hash_reports_no_supported_hash(self, mhl_cli, tmp_path):
+        """A <hash> containing only Comment/PI nodes (no algorithm tag) must be
+        reported as 'no supported hash found' (exit 40), not crash.
+        """
+        (tmp_path / "x.bin").write_bytes(b"x")
+
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "x.bin"
+        h.append(etree.Comment("no real hash here"))
+
+        mhl = tmp_path / "comment_only.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 40
+        assert "no supported hash found" in out
+
+
+class TestTOCTOURaceCondition:
+    """Files deleted between os.path.exists() and the next filesystem call must be handled gracefully.
+
+    There are two distinct race windows in verify():
+
+      1. exists() -> getsize(): covered by test_file_vanishes_between_exists_and_getsize.
+         Requires a manifest <size> element; the OSError is caught by the size
+         pre-check handler and reported as 'missing file' (exit 30).
+
+      2. getsize() -> get_hash(): covered by test_file_deleted_during_get_hash.
+         Requires NO <size> element so the size block is skipped entirely; the
+         OSError is caught by the get_hash handler and reported as 'cannot verify'
+         (exit 40).
+
+    Both handlers must produce a structured error message, not an unhandled exception.
+    """
+
+    def test_file_vanishes_between_exists_and_getsize(self, mhl_cli, tmp_path, monkeypatch):
+        """Race window 1: file disappears after exists() but before getsize().
+
+        The size pre-check's OSError handler (lines 549-555 of simple_mhl.py) must
+        catch this and report 'missing file' (exit 30), not propagate the exception.
+
+        Manifest includes a <size> element so the size pre-check block is entered.
+        os.path.getsize is patched to raise OSError for the target file only.
+        """
+        mhl = _make_mhl_with_size(tmp_path, "vanishing.bin", b"data")
+
+        real_getsize = os.path.getsize
+
+        def _getsize_raises(path):
+            if str(path).endswith("vanishing.bin"):
+                raise OSError("simulated vanish during getsize")
+            return real_getsize(path)
+
+        monkeypatch.setattr(simple_mhl.os.path, "getsize", _getsize_raises)
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+
+        assert rc == 30, f"Expected exit 30 (missing file), got {rc}"
+        assert "ERROR: missing file: vanishing.bin" in out
+
+    def test_file_deleted_during_get_hash(self, mhl_cli, tmp_path, monkeypatch):
+        """Race window 2: file disappears after getsize() but before get_hash() opens it.
+
+        The get_hash OSError handler must catch this and report 'cannot verify'
+        (exit 40), not propagate the exception.
+
+        Manifest has NO <size> element so the size pre-check is skipped and the
+        race happens at get_hash() as intended. get_hash is patched to delete the
+        file then attempt the real open, which raises OSError.
+        """
+        target = tmp_path / "vanishing.bin"
+        target.write_bytes(b"data")
+
+        real_get_hash = simple_mhl.get_hash
+
+        def _get_hash_after_delete(filepath, algo_key):
+            target.unlink(missing_ok=True)
+            return real_get_hash(filepath, algo_key)
+
+        monkeypatch.setattr(simple_mhl, "get_hash", _get_hash_after_delete)
+
+        # No <size> element — size pre-check block is not entered.
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "vanishing.bin"
+        etree.SubElement(h, "md5").text = "0" * 32
+        mhl = tmp_path / "race.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+
+        assert rc == 40, f"Expected exit 40 (cannot verify), got {rc}"
+        assert "ERROR: cannot verify vanishing.bin" in out
+
+
+class TestMutationFuzz:
+    """Mutation-based fuzz testing: the tool must never crash on corrupted manifests."""
+
+    def test_verify_pure_garbage_bytes_exits_cleanly(self, mhl_cli, tmp_path):
+        """A file filled with random bytes must produce a defined exit code, never a traceback."""
+
+        fuzzed = tmp_path / "garbage.mhl"
+        fuzzed.write_bytes(os.urandom(4096))
+
+        rc, _, _ = mhl_cli(["verify", str(fuzzed)])
+        assert rc in (0, 1, 20, 30, 40, 70), f"Unexpected exit code {rc} on pure garbage input"
+
+    def test_verify_mutation_fuzz_loop(self, mhl_cli, tmp_path):
+        """Apply sequential random byte-level mutations to a valid manifest and
+        assert the tool always exits with a defined code — never crashes.
+
+        20 iterations is enough to exercise truncation, bit-flip, null-injection,
+        and garbage-insertion without making the test suite noticeably slow.
+        """
+
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "sample.bin"
+        etree.SubElement(h, "md5").text = "0" * 32
+        baseline = etree.tostring(root, xml_declaration=True, encoding="UTF-8")
+
+        def mutate(content: bytes) -> bytes:
+            if not content:
+                return b""
+            stream = bytearray(content)
+            strategy = random.choice(["flip_bit", "truncate", "insert_garbage", "inject_null"])
+            if strategy == "flip_bit":
+                stream[random.randint(0, len(stream) - 1)] ^= random.randint(1, 255)
+            elif strategy == "truncate" and len(stream) > 2:
+                start = random.randint(0, len(stream) - 2)
+                del stream[start : random.randint(start + 1, len(stream))]
+            elif strategy == "insert_garbage":
+                idx = random.randint(0, len(stream))
+                stream[idx:idx] = os.urandom(random.randint(1, 50))
+            elif strategy == "inject_null":
+                stream[random.randint(0, len(stream) - 1)] = 0
+            return bytes(stream)
+
+        random.seed(42)  # fixed seed for reproducibility
+        for i in range(20):
+            mutated = mutate(baseline)
+            manifest = tmp_path / f"mutated_{i}.mhl"
+            manifest.write_bytes(mutated)
+            rc, _, _ = mhl_cli(["verify", str(manifest)])
+            assert rc in (0, 1, 20, 30, 40, 70), f"Unexpected exit code {rc} on mutation iteration {i}"
+
+
+class TestLargeManifestMemory:
+    """verify() must parse large manifests with bounded memory via iterparse."""
+
+    def test_large_manifest_uses_iterparse_not_parse(self, mhl_cli, tmp_path, monkeypatch):
+        """Confirm verify() calls etree.iterparse() rather than etree.parse().
+
+        etree.parse() loads the full XML DOM into memory — for a 100MB manifest
+        tracking hundreds of thousands of DPX/EXR frames that means 300-500MB of
+        RAM. etree.iterparse() yields one <hash> at a time and frees it
+        immediately, keeping peak memory proportional to one element, not the
+        full document.
+
+        This test is implementation-level: it directly asserts the streaming
+        path is taken so that a future refactor cannot silently regress to DOM
+        loading without a test failure.
+        """
+        parse_calls: list[str] = []
+        iterparse_calls: list[str] = []
+
+        real_iterparse = etree.iterparse
+
+        def spy_parse(path, *args, **kwargs):
+            parse_calls.append(str(path))
+            raise AssertionError(
+                "verify() called etree.parse() — this loads the full DOM into "
+                "memory. Use etree.iterparse() to keep memory bounded."
+            )
+
+        def spy_iterparse(path, *args, **kwargs):
+            iterparse_calls.append(str(path))
+            return real_iterparse(path, *args, **kwargs)
+
+        monkeypatch.setattr(simple_mhl.etree, "parse", spy_parse)
+        monkeypatch.setattr(simple_mhl.etree, "iterparse", spy_iterparse)
+
+        # Minimal manifest — just enough to exercise the parse path.
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "frame.dpx"
+        etree.SubElement(h, "md5").text = "d41d8cd98f00b204e9800998ecf8427e"
+        mhl = tmp_path / "test.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        mhl_cli(["verify", str(mhl)])
+
+        assert not parse_calls, "etree.parse() was called — DOM loading detected"
+        assert iterparse_calls, "etree.iterparse() was never called"
+
+
+# =============================================================================
+# TestSmartDispatch
+# =============================================================================
+
+
+class TestSmartDispatch:
+    """Bare path arguments are dispatched to the correct subcommand.
+
+    simple-mhl <directory>   →  simple-mhl seal <directory>
+    simple-mhl <file>.mhl    →  simple-mhl verify <file>.mhl
+    """
+
+    def test_bare_directory_dispatches_to_seal(self, mhl_cli, tmp_path):
+        """Passing only a directory path (no subcommand) should seal it.
+
+        The smart-dispatch logic in main() inspects sys.argv[1], detects an
+        existing directory, and injects the 'seal' subcommand before argparse
+        sees the arguments.  The result must be identical to calling
+        'simple-mhl seal <dir>' explicitly.
+        """
+        make_tree(tmp_path, {"clip.bin": b"data"})
+
+        # Invoke with just the directory — no explicit 'seal' subcommand.
+        rc, _, _ = mhl_cli([str(tmp_path)])
+
+        assert rc == 0, f"Expected exit 0 from implicit seal, got {rc}"
+        mhls = list(tmp_path.glob("*.mhl"))
+        assert len(mhls) == 1, "Expected exactly one .mhl file to be created"
+
+    def test_bare_directory_dispatch_produces_valid_manifest(self, mhl_cli, tmp_path):
+        """The manifest produced by implicit seal must be verifiable.
+
+        Ensures dispatch injects the right subcommand *and* that all normal
+        seal arguments (default algorithm, etc.) are preserved.
+        """
+        make_tree(tmp_path, {"a.bin": b"hello", "sub/b.bin": b"world"})
+        mhl_cli([str(tmp_path)])
+        mhl = next(tmp_path.glob("*.mhl"))
+
+        rc, _, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0, "Manifest produced by implicit seal did not verify clean"
+
+    def test_bare_mhl_path_dispatches_to_verify(self, mhl_cli, tmp_path):
+        """Passing only a .mhl path (no subcommand) should verify it.
+
+        The smart-dispatch logic detects a .mhl extension and injects the
+        'verify' subcommand.  A clean manifest must exit 0.
+        """
+        make_tree(tmp_path, {"a.bin": b"data"})
+        mhl = seal_helper(mhl_cli, tmp_path)
+
+        # Invoke with just the .mhl path — no explicit 'verify' subcommand.
+        rc, _, _ = mhl_cli([str(mhl)])
+
+        assert rc == 0, f"Expected exit 0 from implicit verify of clean manifest, got {rc}"
+
+    def test_bare_mhl_path_dispatch_reports_corruption(self, mhl_cli, tmp_path):
+        """Implicit verify must surface errors just as explicit verify does.
+
+        Corrupting a file after sealing then invoking via bare .mhl path must
+        produce exit 40 and the expected ERROR line — confirming dispatch
+        reaches the real verify() code path, not a stub.
+        """
+        make_tree(tmp_path, {"a.bin": b"original"})
+        mhl = seal_helper(mhl_cli, tmp_path)
+        # Write same-length replacement so size pre-check passes and the hash
+        # check is what catches the corruption — confirming the full verify
+        # code path is exercised by implicit dispatch.
+        (tmp_path / "a.bin").write_bytes(b"ORIGINAL")  # 8 bytes == len("original")
+
+        rc, out, _ = mhl_cli([str(mhl)])
+
+        assert rc == 40, f"Expected exit 40 from implicit verify of corrupt file, got {rc}"
+        assert "ERROR: hash mismatch: a.bin" in out
+
+    def test_explicit_subcommand_not_intercepted(self, mhl_cli, tmp_path):
+        """An explicit 'seal' or 'verify' subcommand must pass through unchanged.
+
+        Regression guard: the dispatch block must only fire when the first
+        token is NOT already a recognised subcommand.
+        """
+        make_tree(tmp_path, {"a.bin": b"x"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        assert rc == 0
+
+        mhl = next(tmp_path.glob("*.mhl"))
+        rc, _, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0
+
+
+# =============================================================================
+# TestSizePreCheck
+# =============================================================================
+
+
+def _make_mhl_with_size(dest_dir: Path, filename: str, content: bytes, size_override: str | None = None) -> Path:
+    """Write a file and a matching MHL, optionally overriding the <size> value.
+
+    Uses xxhash64 (the tool's default algorithm) for the digest so tests
+    exercise the primary production code path.
+    """
+    filepath = dest_dir / filename
+    filepath.write_bytes(content)
+
+    digest = xxhash.xxh64(content).hexdigest()
+    actual_size = str(len(content))
+    recorded_size = size_override if size_override is not None else actual_size
+
+    root = etree.Element("hashlist", version="1.1")
+    h = etree.SubElement(root, "hash")
+    etree.SubElement(h, "file").text = filename
+    etree.SubElement(h, "size").text = recorded_size
+    etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+    etree.SubElement(h, "xxhash64be").text = digest
+    etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+
+    mhl = dest_dir / "test.mhl"
+    etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+    return mhl
+
+
+class TestSizePreCheck:
+    """File size is checked before hash computation during verify.
+
+    The size pre-check is a fast, cheap guard: a stat() call that can rule
+    out corruption without reading the entire file.  These tests confirm:
+
+      * A single size-mismatched file is caught and reported.
+      * The check fires *before* get_hash() is called (get_hash is not
+        invoked when the size already proves the file is wrong).
+      * A malformed (non-decimal) <size> field is flagged as corruption
+        rather than silently skipped.
+      * Even if a hash digest happens to match (forced via monkeypatch), a
+        size discrepancy is still reported — size wins over hash agreement.
+    """
+
+    def test_size_mismatch_is_caught(self, mhl_cli, tmp_path):
+        """A file whose on-disk size differs from the manifest <size> exits 40.
+
+        Mechanism: we write the file with content 'hello' (5 bytes) but record
+        size=9999 in the manifest, then verify.  The size pre-check must catch
+        this without needing to hash the file.
+        """
+        mhl = _make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="9999")
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+
+        assert rc == 40, f"Expected exit 40 for size mismatch, got {rc}"
+        assert "clip.bin" in out, "Affected filename must appear in output"
+        # Accept either 'size mismatch' or 'malformed size' phrasing — both
+        # indicate the size check fired before hashing.
+        assert "size" in out.lower(), f"Expected a size-related error message, got: {out!r}"
+
+    def test_size_mismatch_skips_hash_computation(self, mhl_cli, tmp_path, monkeypatch):
+        """get_hash() must NOT be called when the size pre-check already fails.
+
+        A size mismatch is a definitive failure signal.  Calling get_hash()
+        afterwards wastes I/O on a file that is already known to be wrong.
+        This test uses a spy to confirm get_hash is never reached.
+        """
+        get_hash_calls: list[str] = []
+        real_get_hash = simple_mhl.get_hash
+
+        def spy_get_hash(filepath, algo_key):
+            get_hash_calls.append(filepath)
+            return real_get_hash(filepath, algo_key)
+
+        monkeypatch.setattr(simple_mhl, "get_hash", spy_get_hash)
+
+        mhl = _make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="9999")
+
+        rc, _, _ = mhl_cli(["verify", str(mhl)])
+
+        assert rc == 40, f"Expected exit 40, got {rc}"
+        assert get_hash_calls == [], (
+            f"get_hash() was called {len(get_hash_calls)} time(s) despite size mismatch — "
+            "the pre-check must short-circuit before hashing"
+        )
+
+    def test_malformed_size_field_is_flagged(self, mhl_cli, tmp_path):
+        """A <size> containing non-decimal characters must be flagged as corrupt.
+
+        Non-decimal Unicode digits (e.g. superscript '2\xb246896176' as seen in
+        real-world corrupted MHL files) are rejected by isdecimal().  The tool
+        must report this as a manifest error, not silently skip the check.
+        """
+        # Embed a superscript-two (U+00B2) mid-string — exactly the pattern
+        # seen in the BGR2_20260426 fixture that triggered this requirement.
+        mhl = _make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="2\xb246896176")
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+
+        assert rc == 40, f"Expected exit 40 for malformed size field, got {rc}"
+        assert "clip.bin" in out
+        assert "malformed size" in out.lower(), f"Expected 'malformed size' in output, got: {out!r}"
+
+    def test_size_mismatch_caught_even_when_hash_matches(self, mhl_cli, tmp_path, monkeypatch):
+        """A size discrepancy must be reported even if the hash digest matches.
+
+        xxhash64 is non-cryptographic and constructing a real same-digest
+        collision for two files of different lengths is impractical without
+        specialised tooling.  Instead we monkeypatch get_hash() to return the
+        *correct* digest for the on-disk file regardless, then verify that the
+        size check still fires before get_hash is reached.
+
+        This is the adversarially interesting case: a tool that only checks the
+        hash would silently pass a file whose size is wrong (e.g. a truncated
+        file that happens to share its hash with another file).  The size check
+        must take priority.
+        """
+        content = b"A" * 1024
+        correct_digest = xxhash.xxh64(content).hexdigest()
+
+        # Record the correct digest but a wrong size.
+        mhl = _make_mhl_with_size(tmp_path, "clip.bin", content, size_override="9999")
+
+        # Ensure get_hash would return the correct digest if ever called,
+        # so the only thing that can trigger the failure is the size check.
+        def always_correct_hash(filepath, algo_key):
+            return correct_digest
+
+        monkeypatch.setattr(simple_mhl, "get_hash", always_correct_hash)
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+
+        assert rc == 40, f"Expected exit 40: size mismatch must be caught even when hash matches, got {rc}"
+        assert "clip.bin" in out
+        assert "size" in out.lower(), f"Expected a size-related error message, got: {out!r}"
+
+    def test_correct_size_proceeds_to_hash_check(self, mhl_cli, tmp_path):
+        """When size matches, verify must still check the hash.
+
+        Regression guard: the size pre-check must not short-circuit a clean
+        file.  A file with a matching size but a wrong hash must still exit 40.
+        """
+        content = b"original"
+        mhl = _make_mhl_with_size(tmp_path, "clip.bin", content)
+
+        # Overwrite with same-size content that has a different hash.
+        (tmp_path / "clip.bin").write_bytes(b"ORIGINAL")  # same 8 bytes, different content
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+
+        assert rc == 40, f"Expected exit 40 for hash mismatch after size matches, got {rc}"
+        assert "hash mismatch" in out.lower()

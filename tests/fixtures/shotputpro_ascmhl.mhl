@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0">
+  <hashes>
+    <hash>
+      <path size="2246896176" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A001/A001C001.mxf</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">d4b2ab4a3e2619c6</xxh64>
+    </hash>
+    <hash>
+      <path size="4170" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A001/A001C001M01.xml</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">fb5ba52fd1791f62</xxh64>
+    </hash>
+    <directoryhash>
+      <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A001</path>
+      <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">3995de7ad212a6f6</xxh64></content>
+    </directoryhash>
+    <hash>
+      <path size="15758019120" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A002/A002C001.mxf</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">958a6c5a73c506bf</xxh64>
+    </hash>
+    <hash>
+      <path size="4172" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A002/A002C001M01.xml</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">cde877e7e0079f3d</xxh64>
+    </hash>
+    <directoryhash>
+      <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A002</path>
+      <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">92ff6973ff1159b6</xxh64></content>
+    </directoryhash>
+    <hash>
+      <path size="14349986352" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A003/A003C001.mxf</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">fd9f619aa924c818</xxh64>
+    </hash>
+    <hash>
+      <path size="4172" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A003/A003C001M01.xml</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">56c61ebd8b38365b</xxh64>
+    </hash>
+    <directoryhash>
+      <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A003</path>
+      <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">b8c58576b4441883</xxh64></content>
+    </directoryhash>
+    <hash>
+      <path size="5392501296" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A004/A004C001.mxf</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">a7bda6dee54d41e9</xxh64>
+    </hash>
+    <hash>
+      <path size="4170" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A004/A004C001M01.xml</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">967a863160e4bade</xxh64>
+    </hash>
+    <directoryhash>
+      <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A004</path>
+      <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">c02ddd33f04c3378</xxh64></content>
+    </directoryhash>
+    <hash>
+      <path size="10904799792" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A005/A005C001.mxf</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">947991d5d2dfe31f</xxh64>
+    </hash>
+    <hash>
+      <path size="4172" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A005/A005C001M01.xml</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">e25972c74459f110</xxh64>
+    </hash>
+    <directoryhash>
+      <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A005</path>
+      <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">1c44cbd0b2aa08d0</xxh64></content>
+    </directoryhash>
+    <hash>
+      <path size="13421283888" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A006/A006C001.mxf</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">02df4015bd2ba8ae</xxh64>
+    </hash>
+    <hash>
+      <path size="4172" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A006/A006C001M01.xml</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">5c5026562225f157</xxh64>
+    </hash>
+    <directoryhash>
+      <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A006</path>
+      <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">d04b1d08aa1c2cfd</xxh64></content>
+    </directoryhash>
+    <directoryhash>
+      <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip</path>
+      <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">e72e32641f908e9b</xxh64></content>
+    </directoryhash>
+    <directoryhash>
+      <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card/General</path>
+      <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">ef46db3751d8e999</xxh64></content>
+    </directoryhash>
+    <hash>
+      <path size="2945" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/MEDIAPRO.xml</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">d7dd876f790aa002</xxh64>
+    </hash>
+    <directoryhash>
+      <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card</path>
+      <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">bf9d9533d19dc938</xxh64></content>
+    </directoryhash>
+  </hashes>
+</hashlist>

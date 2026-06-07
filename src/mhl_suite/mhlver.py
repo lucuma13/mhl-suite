@@ -20,17 +20,20 @@
 # =============================================================================
 
 import argparse
+import contextlib
 import importlib.metadata
 import shutil
 import subprocess
 import sys
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, TextIO
+from typing import Any, TextIO
 
+from lxml import etree
 from rich.console import Console, Group
 from rich.live import Live
 from rich.progress import (
@@ -83,9 +86,9 @@ def _log(
     msg: str,
     *,
     colour: str,
-    stream,
+    stream: TextIO | None,
     report_file: TextIO | None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
 ) -> None:
     """Print to a stream (with colour) and mirror to report_file (without).
 
@@ -107,7 +110,7 @@ def _log(
 def log_success(
     msg: str,
     report_file: TextIO | None = None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
 ) -> None:
     _log(msg, colour="", stream=sys.stdout, report_file=report_file, console=console)
 
@@ -115,17 +118,15 @@ def log_success(
 def log_warning(
     msg: str,
     report_file: TextIO | None = None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
 ) -> None:
-    _log(
-        msg, colour=ORANGE, stream=sys.stderr, report_file=report_file, console=console
-    )
+    _log(msg, colour=ORANGE, stream=sys.stderr, report_file=report_file, console=console)
 
 
 def log_error(
     msg: str,
     report_file: TextIO | None = None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
 ) -> None:
     _log(msg, colour=RED, stream=sys.stderr, report_file=report_file, console=console)
 
@@ -194,10 +195,8 @@ def _run_step(
     while proc.poll() is None:
         if on_poll is not None:
             on_poll.set()
-        try:
-            proc.wait(timeout=0.1)
-        except subprocess.TimeoutExpired:
-            pass  # still running — expected, keep polling
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=0.1)  # still running if it raises — expected
     stdout, stderr = proc.communicate()
     combined = ((stdout or "") + (stderr or "")).strip()
     return StepResult(exit_code=proc.returncode, output=combined)
@@ -209,7 +208,7 @@ def _emit_step_output(
     report_file: TextIO | None,
     *,
     show_on_terminal: bool,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
 ) -> None:
     """
     Write captured backend output to the report file (always) and to the
@@ -338,7 +337,7 @@ def _log_by_severity(
     severity: str,
     msg: str,
     report_file: TextIO | None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
 ) -> None:
     """Dispatch a message to the right logger based on its severity label."""
     if severity == "success":
@@ -358,7 +357,7 @@ def _report_via_table(
     *,
     show_backend_output: bool,
     show_status_on_terminal: bool = True,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
 ) -> None:
     """
     Look up exit_code in `table`, log the appropriate message, and emit any
@@ -402,7 +401,7 @@ def _verbose_announce(
     cwd: Path | None,
     verbose: bool,
     report_file: TextIO | None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
 ) -> None:
     """
     When --verbose, print the exact command (and cwd) that's about to run.
@@ -438,7 +437,7 @@ def verify_item(
     verbose: bool,
     schema: bool,
     report_file: TextIO | None = None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> int:
@@ -483,7 +482,7 @@ def _verify_legacy(
     verbose: bool,
     schema: bool,
     report_file: TextIO | None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> int:
@@ -505,9 +504,7 @@ def _verify_legacy(
     # mhlver's "always show legacy backend output" rule will surface.
     if verbose and not schema:
         cmd.append("-v")
-    _verbose_announce(
-        cmd, cwd=None, verbose=verbose, report_file=report_file, console=console
-    )
+    _verbose_announce(cmd, cwd=None, verbose=verbose, report_file=report_file, console=console)
 
     step = _run_step(cmd, on_poll=poll_event)
 
@@ -537,7 +534,7 @@ def _verify_ascmhl(
     verbose: bool,
     schema: bool,
     report_file: TextIO | None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> int:
@@ -582,7 +579,7 @@ def _ascmhl_schema_check(
     cwd: Path | None,
     verbose: bool,
     report_file: TextIO | None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> int:
@@ -639,7 +636,7 @@ def _ascmhl_verify(
     cwd: Path | None,
     verbose: bool,
     report_file: TextIO | None,
-    console=None,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> int:
@@ -723,10 +720,7 @@ def _select_mhl_files(root: Path) -> list[Path]:
     latest: dict[Path, Path] = {}
 
     for f in sorted(find_mhl_files(root)):
-        if f.parent.name == "ascmhl":
-            key = f.parent.parent  # package root is the dedup key
-        else:
-            key = f  # legacy MHL: each file is its own key
+        key = f.parent.parent if f.parent.name == "ascmhl" else f  # ascmhl: pkg root; legacy: file itself
         latest[key] = f  # sorted order → last write wins
 
     # Re-sort the values to preserve the original output order (dict insertion
@@ -748,16 +742,11 @@ def _mhl_total_bytes(mhl_file: Path) -> int:
     manifest count, giving a more accurate ETA when manifests vary wildly
     in size (e.g. 500 GB camera originals vs 2 GB proxies).
     """
-    from lxml import etree
 
     try:
         tree = etree.parse(str(mhl_file))
-        return sum(
-            int(el.text)
-            for el in tree.iterfind(".//{*}size")
-            if el.text and el.text.strip().isdigit()
-        )
-    except Exception:
+        return sum(int(el.text) for el in tree.iterfind(".//{*}size") if el.text and el.text.strip().isdecimal())
+    except (OSError, ValueError, etree.XMLSyntaxError):
         return 0
 
 
@@ -787,7 +776,6 @@ def _ascmhl_total_bytes(latest_mhl: Path) -> int:
     path: the first generation to record a path wins its size; later
     occurrences of the same path are skipped.
     """
-    from lxml import etree
 
     ascmhl_dir = latest_mhl.parent  # the ascmhl/ folder
     seen: set[str] = set()
@@ -800,10 +788,10 @@ def _ascmhl_total_bytes(latest_mhl: Path) -> int:
                 if not rel or rel in seen:
                     continue
                 size_str = el.get("size", "")
-                if size_str.strip().isdigit():
+                if size_str.strip().isdecimal():
                     seen.add(rel)
                     total += int(size_str)
-        except Exception:
+        except (OSError, ValueError, etree.XMLSyntaxError):
             pass  # skip unreadable generation files; others still count
     return total
 
@@ -873,18 +861,12 @@ def _open_report(src: Path) -> Iterator[tuple[TextIO, Path]]:
     report_dir = src if src.is_dir() else src.parent
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = report_dir / f"mhlver_report_{src.name}_{timestamp}.log"
-    fh = open(report_path, "w", encoding="utf-8")
-    try:
-        fh.write(
-            f"mhlver {__version__} report — "
-            f"{datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n"
-        )
+    with open(report_path, "w", encoding="utf-8") as fh:
+        fh.write(f"mhlver {__version__} report — {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
         fh.write(f"path: {src}\n")
         fh.write("---\n")
         yield fh, report_path
         fh.write("---\n")
-    finally:
-        fh.close()
 
 
 # -----------------------------------------------------------------------------
@@ -892,15 +874,20 @@ def _open_report(src: Path) -> Iterator[tuple[TextIO, Path]]:
 # -----------------------------------------------------------------------------
 
 
+_SECONDS_PER_MINUTE: int = 60
+_SECONDS_PER_HOUR: int = 3600
+
+
 def _format_duration(seconds: float) -> str:
     """Render seconds as a compact human-readable duration."""
-    if seconds < 60:
+    if seconds < _SECONDS_PER_MINUTE:
         return f"{seconds:.1f}s"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m {int(seconds % 60)}s"
-    return (
-        f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m {int(seconds % 60)}s"
-    )
+    if seconds < _SECONDS_PER_HOUR:
+        return f"{int(seconds // _SECONDS_PER_MINUTE)}m {int(seconds % _SECONDS_PER_MINUTE)}s"
+    hours = int(seconds // _SECONDS_PER_HOUR)
+    minutes = int((seconds % _SECONDS_PER_HOUR) // _SECONDS_PER_MINUTE)
+    secs = int(seconds % _SECONDS_PER_MINUTE)
+    return f"{hours}h {minutes}m {secs}s"
 
 
 # -----------------------------------------------------------------------------
@@ -944,9 +931,7 @@ def main() -> None:
     src = Path(args.path).resolve()
 
     if not src.exists():
-        log_error(
-            "Argument should be a file or directory that exists in the filesystem"
-        )
+        log_error("Argument should be a file or directory that exists in the filesystem")
         sys.exit(2)
 
     # Open the report file if requested. Using a context manager means we
@@ -962,7 +947,7 @@ def main() -> None:
     sys.exit(exit_status)
 
 
-def _run(
+def _run(  # noqa: C901 — branches are independent cases, not nested complexity
     src: Path,
     verbose: bool,
     schema: bool,
@@ -1009,21 +994,12 @@ def _run(
             # (ASCMHL.xsd HashType).  A well-formed MHL always carries sizes,
             # so a zero return indicates a genuinely malformed file — verify
             # will surface the error; we don't paper over it with a fallback.
-            weights = {
-                f: (
-                    _ascmhl_total_bytes(f)
-                    if "ascmhl" in f.parts
-                    else _mhl_total_bytes(f)
-                )
-                for f in mhl_files
-            }
+            weights = {f: (_ascmhl_total_bytes(f) if "ascmhl" in f.parts else _mhl_total_bytes(f)) for f in mhl_files}
             total_bytes = sum(weights.values())
 
             live, progress, label, stdout_console = _build_live()
             total_n = len(mhl_files)
-            bar_task = progress.add_task(
-                " ", total=total_bytes, done=0, total_n=total_n
-            )
+            bar_task = progress.add_task(" ", total=total_bytes, done=0, total_n=total_n)
             # poll_event is set() every ~100 ms while a subprocess runs,
             # causing the Live display to refresh and animate the bar.
             # stop_event is a separate signal used only to tell the refresh

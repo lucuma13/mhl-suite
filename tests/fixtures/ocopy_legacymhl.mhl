@@ -1,0 +1,29 @@
+<?xml version='1.0' encoding='utf-8'?>
+<hashlist version="1.1">
+  <creatorinfo>
+    <tool>o/COPY</tool>
+    <startdate>2026-01-01T00:00:00Z</startdate>
+    <finishdate>2026-01-01T00:00:00Z</finishdate>
+  </creatorinfo>
+  <hash>
+    <file>aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa.JPG</file>
+    <size>436085</size>
+    <lastmodificationdate>2026-01-01T00:00:00Z</lastmodificationdate>
+    <xxhash64be>e8142245c45a9730</xxhash64be>
+    <hashdate>2026-01-01T00:00:00Z</hashdate>
+  </hash>
+  <hash>
+    <file>A001.HEIC</file>
+    <size>2775033</size>
+    <lastmodificationdate>2026-01-01T00:00:00Z</lastmodificationdate>
+    <xxhash64be>cbb243888a8034de</xxhash64be>
+    <hashdate>2026-01-01T00:00:00Z</hashdate>
+  </hash>
+  <hash>
+    <file>A002.MOV</file>
+    <size>161713671</size>
+    <lastmodificationdate>2026-01-01T00:00:00Z</lastmodificationdate>
+    <xxhash64be>fe53d4b59c94d282</xxhash64be>
+    <hashdate>2026-01-01T00:00:00Z</hashdate>
+  </hash>
+</hashlist>

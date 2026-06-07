@@ -5,10 +5,21 @@ consistent command-line execution and state isolation across all modules.
 """
 
 import io
-import pytest
 import sys
 from pathlib import Path
+
+import pytest
+
 from mhl_suite import simple_mhl
+
+# ---------------------------------------------------------------------------
+# Fixture file location
+# ---------------------------------------------------------------------------
+
+#: Directory containing real-tool MHL fixture files used by the test suite.
+#: Each file is a verbatim (anonymised) MHL output from a specific transfer
+#: tool, named <tool>_<format>.mhl (e.g. shotputpro_ascmhl.mhl).
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 # ---------------------------------------------------------------------------
 # ASC-MHL XML helpers
@@ -61,6 +72,31 @@ def write_mhl():
 
 
 @pytest.fixture
+def load_fixture_mhl():
+    """Factory fixture that copies a fixture MHL file into a test directory.
+
+    Usage::
+
+        def test_something(tmp_path, load_fixture_mhl):
+            ascdir = tmp_path / "ascmhl"
+            ascdir.mkdir()
+            mhl = load_fixture_mhl(ascdir, "shotputpro_ascmhl.mhl")
+
+    The fixture file is read from the ``fixtures/`` directory next to
+    ``conftest.py`` and written verbatim into *dest_dir* under its original
+    filename.  Returns the :class:`~pathlib.Path` of the written file.
+    """
+
+    def _load(dest_dir: Path, fixture_name: str) -> Path:
+        src = FIXTURES_DIR / fixture_name
+        dest = dest_dir / fixture_name
+        dest.write_bytes(src.read_bytes())
+        return dest
+
+    return _load
+
+
+@pytest.fixture
 def mhl_cli():
     """Fixture to execute simple_mhl in-process and capture results."""
 
@@ -69,7 +105,7 @@ def mhl_cli():
         str_argv = [str(arg) for arg in argv]
 
         old_argv, old_stdout, old_stderr = sys.argv, sys.stdout, sys.stderr
-        sys.argv = ["simple-mhl"] + str_argv
+        sys.argv = ["simple-mhl", *str_argv]
         out, err = io.StringIO(), io.StringIO()
         sys.stdout, sys.stderr = out, err
         try:

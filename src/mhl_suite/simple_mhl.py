@@ -23,15 +23,14 @@ import importlib.metadata
 import importlib.resources
 import os
 import platform
-from pathlib import Path
 import sys
-from datetime import datetime, timezone
-from collections.abc import Callable
-from typing import Iterator, Protocol, cast, runtime_checkable
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Protocol, cast, runtime_checkable
 
 import xxhash
 from lxml import etree
-
 
 # -----------------------------------------------------------------------------
 # Version
@@ -113,9 +112,7 @@ def get_xsd_path() -> str:
     # Installed-package case. files() is the modern API (added 3.9, the
     # legacy path() helper is deprecated in 3.11+ and emits a warning).
     try:
-        resource = importlib.resources.files("mhl_suite.xsd").joinpath(
-            "MediaHashList_v1_1.xsd"
-        )
+        resource = importlib.resources.files("mhl_suite.xsd").joinpath("MediaHashList_v1_1.xsd")
         if resource.is_file():
             return str(resource)
     except (ImportError, FileNotFoundError, TypeError, ModuleNotFoundError):
@@ -164,9 +161,7 @@ def get_hash(filepath: str, algo_key: str) -> str:
 # -----------------------------------------------------------------------------
 
 
-def _iter_files_for_seal(
-    root: str, mhl_path: str
-) -> Iterator[tuple[str, os.stat_result]]:
+def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.stat_result]]:
     """
     Walk `root` recursively and yield (absolute_path, stat_result) for every
     file that should appear in the manifest, in deterministic sorted order.
@@ -235,9 +230,7 @@ def _iter_files_for_seal(
 # -----------------------------------------------------------------------------
 
 
-def _build_creatorinfo(
-    parent: etree._Element, tool: str, iso_now: str
-) -> etree._Element:
+def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree._Element:
     """Append a <creatorinfo> block to `parent` and return it."""
     info = etree.SubElement(parent, "creatorinfo")
     for tag, value in [
@@ -282,7 +275,7 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
     # All times in the manifest are UTC ISO 8601 with the trailing 'Z' that
     # the v1.1 schema expects. We capture creation time once and reuse it
     # so every <hashdate> is consistent with the <creationdate>.
-    now_dt = datetime.now(timezone.utc)
+    now_dt = datetime.now(UTC)
     timestamp_for_filename = now_dt.strftime("%Y-%m-%d_%H%M%S")
     iso_now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -311,9 +304,7 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
             if dont_reseal:
                 sys.exit(0)
             suffix += 1
-            mhl_path = os.path.join(
-                root, f"{base_name}_{timestamp_for_filename}_{suffix}.mhl"
-            )
+            mhl_path = os.path.join(root, f"{base_name}_{timestamp_for_filename}_{suffix}.mhl")
 
     # Build the manifest skeleton. We construct in memory and write at the
     # end; for typical shoots (≤5000 files) the in-memory tree is a few MB
@@ -338,10 +329,8 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
         h = etree.SubElement(doc, "hash")
         etree.SubElement(h, "file").text = rel_path_posix
         etree.SubElement(h, "size").text = str(stat_result.st_size)
-        mtime = datetime.fromtimestamp(stat_result.st_mtime, timezone.utc)
-        etree.SubElement(h, "lastmodificationdate").text = mtime.strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        mtime = datetime.fromtimestamp(stat_result.st_mtime, UTC)
+        etree.SubElement(h, "lastmodificationdate").text = mtime.strftime("%Y-%m-%dT%H:%M:%SZ")
         etree.SubElement(h, xml_tag).text = get_hash(filepath, algorithm)
         etree.SubElement(h, "hashdate").text = iso_now
 
@@ -349,16 +338,14 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
     # how long the seal took.
     finish_el = info.find("finishdate")
     if finish_el is not None:
-        finish_el.text = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        finish_el.text = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Pretty-print so a human can read the manifest in a text editor; lxml
     # adds the XML declaration and UTF-8 encoding header.
     # We write via the fd we already hold from the O_EXCL open above so
     # we never re-open the file by path (which would be another race window).
     with os.fdopen(fd, "wb") as fh:
-        etree.ElementTree(doc).write(
-            fh, xml_declaration=True, encoding="UTF-8", pretty_print=True
-        )
+        etree.ElementTree(doc).write(fh, xml_declaration=True, encoding="UTF-8", pretty_print=True)
 
 
 # -----------------------------------------------------------------------------
@@ -366,14 +353,20 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
 # -----------------------------------------------------------------------------
 
 
-def _localname(tag: str) -> str:
+def _localname(tag: object) -> str:
     """
     Return the local-name part of a possibly-namespaced XML tag.
 
     lxml stores namespaced tags as '{uri}localname'. rpartition('}')[2]
     gives 'localname' if the brace exists and the whole tag if it doesn't.
     Faster than etree.QName() because it skips the QName object construction.
+
+    Non-string tags (lxml Comment and ProcessingInstruction nodes carry a
+    callable as their .tag attribute) are returned as an empty string so
+    callers can safely test membership in a frozenset of string tag names.
     """
+    if not isinstance(tag, str):
+        return ""
     return tag.rpartition("}")[2] if "}" in tag else tag
 
 
@@ -409,7 +402,7 @@ def _validate_mhl_path(mhl_file: str) -> None:
         sys.exit(1)
 
 
-def verify(mhl_file: str, verbose: bool = False) -> None:
+def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
     """
     Verify each file listed in `mhl_file` against its stored hash.
 
@@ -448,13 +441,6 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
     # but not '/foobar'.
     mhl_dir_with_sep = mhl_dir + os.sep
 
-    # Parse once. Empty manifests, missing root, or malformed XML all land
-    # here as XMLSyntaxError; we treat any of them as exit-20.
-    try:
-        tree = etree.parse(mhl_file)
-    except etree.XMLSyntaxError:
-        sys.exit(20)
-
     # We collect failures in two buckets so the final exit code can
     # distinguish missing-only (30), mismatch-only (40), or both (70).
     # Lines are pre-formatted with their structured prefix at append time
@@ -462,87 +448,147 @@ def verify(mhl_file: str, verbose: bool = False) -> None:
     missing: list[str] = []
     mismatches: list[str] = []
 
-    # iterfind('.//{*}hash') walks the tree once and yields every <hash>
-    # element regardless of namespace. Bench: 1.4-2.3x faster than the
-    # original's xpath("//*[local-name()='hash']") on 500-5000 entry
-    # manifests. The {*} wildcard matches any (or no) namespace.
-    for h in tree.iterfind(".//{*}hash"):
-        # Find the <file> child. Should be exactly one; malformed entries
-        # without a file are silently skipped (the schema would have caught
-        # them at xsd-schema-check time).
-        file_el = h.find("{*}file")
-        if file_el is None or file_el.text is None:
-            continue
+    # iterparse yields each <hash> element as soon as its closing tag is
+    # read, then we immediately free it — keeping peak memory proportional
+    # to one element rather than the full document DOM.  This matters for
+    # VFX pipelines where manifests can track hundreds of thousands of DPX
+    # or EXR frames and grow to hundreds of megabytes.
+    #
+    # OSError covers lxml raising "Invalid bytes in character encoding"
+    # (e.g. null bytes mid-XML introduced by mutation fuzzing or disk
+    # corruption) — a case etree.parse() also raises as OSError rather
+    # than XMLSyntaxError.  Both are malformed-manifest conditions → exit 20.
+    try:
+        for _, h in etree.iterparse(mhl_file, events=("end",), tag="{*}hash"):
+            # Find the <file> child. Should be exactly one; malformed entries
+            # without a file are silently skipped (the schema would have caught
+            # them at xsd-schema-check time).
+            file_el = h.find("{*}file")
+            if file_el is None or file_el.text is None:
+                h.clear()
+                continue
 
-        # Manifests use forward slashes; convert to platform separator for
-        # the local filesystem call. On POSIX this is a no-op.
-        rel_path = file_el.text
-        if os.sep != "/":
-            rel_path = rel_path.replace("/", os.sep)
+            # Manifests use forward slashes; convert to platform separator for
+            # the local filesystem call. On POSIX this is a no-op.
+            rel_path = file_el.text
+            if os.sep != "/":
+                rel_path = rel_path.replace("/", os.sep)
 
-        # --- Path traversal guard ---------------------------------------
-        # Collapse '..' and '.' via normpath, then check the result is
-        # inside mhl_dir. This blocks attacks where a malicious manifest
-        # contains entries like "../../etc/passwd" — without the guard,
-        # we'd happily read and report on files outside the offload tree.
-        candidate = os.path.normpath(os.path.join(mhl_dir, rel_path))
-        if candidate != mhl_dir and not candidate.startswith(mhl_dir_with_sep):
-            mismatches.append(f"ERROR: blocked traversal attempt: {rel_path}")
-            continue
+            # --- Path traversal guard -----------------------------------
+            # Collapse '..' and '.' via normpath, then check the result is
+            # inside mhl_dir. This blocks attacks where a malicious manifest
+            # contains entries like "../../etc/passwd" — without the guard,
+            # we'd happily read and report on files outside the offload tree.
+            candidate = os.path.normpath(os.path.join(mhl_dir, rel_path))
+            if candidate != mhl_dir and not candidate.startswith(mhl_dir_with_sep):
+                mismatches.append(f"ERROR: blocked traversal attempt: {rel_path}")
+                h.clear()
+                continue
 
-        # Find the first child element whose tag is a recognised hash
-        # algorithm. We iterate direct children only (one level deep)
-        # rather than the original's recursive xpath; a malformed manifest
-        # with a <hash> nested inside a <hash> is not a real concern, and
-        # one-level iteration is faster.
-        hash_node = None
-        for child in h:
-            if _localname(child.tag) in SUPPORTED_HASH_TAGS:
-                hash_node = child
-                break
+            # Find the first child element whose tag is a recognised hash
+            # algorithm. We iterate direct children only (one level deep)
+            # rather than the original's recursive xpath; a malformed manifest
+            # with a <hash> nested inside a <hash> is not a real concern, and
+            # one-level iteration is faster.
+            hash_node = None
+            for child in h:
+                if _localname(child.tag) in SUPPORTED_HASH_TAGS:
+                    hash_node = child
+                    break
 
-        if hash_node is None:
-            mismatches.append(f"ERROR: no supported hash found: {rel_path}")
-            continue
+            if hash_node is None:
+                mismatches.append(f"ERROR: no supported hash found: {rel_path}")
+                h.clear()
+                continue
 
-        tag = _localname(hash_node.tag)
-        expected = (hash_node.text or "").strip()
+            tag = _localname(hash_node.tag)
+            expected = (hash_node.text or "").strip()
 
-        # 'null' tag = manifest acknowledges the file's existence but
-        # records no digest. Verify reduces to a presence check.
-        if tag == "null":
+            # 'null' tag = manifest acknowledges the file's existence but
+            # records no digest. Verify reduces to a presence check.
+            if tag == "null":
+                if not os.path.exists(candidate):
+                    missing.append(f"ERROR: missing file: {rel_path}")
+                elif verbose:
+                    print(f"OK: {rel_path}")
+                h.clear()
+                continue
+
             if not os.path.exists(candidate):
                 missing.append(f"ERROR: missing file: {rel_path}")
+                h.clear()
+                continue
+
+            # --- File size pre-check ------------------------------------
+            # Compare the manifest's <size> against the file on disk before
+            # spending time on a full hash pass.  A size mismatch is a
+            # definitive corruption signal that costs only one stat() call.
+            #
+            # isdecimal() is stricter than isdigit() or isnumeric(): it
+            # rejects superscripts (e.g. '²'), vulgar fractions, and other
+            # Unicode "digit" codepoints that would silently produce a wrong
+            # integer via int().  A <size> that fails this guard is itself
+            # evidence of manifest corruption -- a well-formed MHL never has
+            # a non-decimal size -- so we flag it as a mismatch rather than
+            # silently falling through to hash a file whose manifest entry
+            # is already known to be corrupt.
+            size_el = h.find("{*}size")
+            if size_el is not None and size_el.text is not None:
+                size_text = size_el.text.strip()
+                if not size_text.isdecimal():
+                    mismatches.append(f"ERROR: malformed size field: {rel_path}")
+                    h.clear()
+                    continue
+                try:
+                    manifest_size = int(size_text)
+                    actual_size = os.path.getsize(candidate)
+                    if manifest_size != actual_size:
+                        mismatches.append(f"ERROR: size mismatch: {rel_path}")
+                        h.clear()
+                        continue
+                except OSError:
+                    # File vanished between the existence check above and
+                    # getsize(); treat as missing to give a consistent
+                    # message rather than a bare OSError traceback.
+                    missing.append(f"ERROR: missing file: {rel_path}")
+                    h.clear()
+                    continue
+
+            # Tags we accept-on-read but cannot recompute (xxhash128, xxhash3_64)
+            # raise ValueError inside get_hash; surface this as a mismatch
+            # rather than crashing.
+            try:
+                calculated = get_hash(candidate, tag)
+            except (ValueError, OSError) as e:
+                mismatches.append(f"ERROR: cannot verify {rel_path}: {e}")
+                h.clear()
+                continue
+
+            # Some legacy MHL files stored xxhash as a *decimal integer* rather
+            # than the modern big-endian hex. Detect that case and compare
+            # numerically, otherwise compare hex case-insensitively (uppercase
+            # hex appears in some third-party tool output).
+            if tag == "xxhash" and expected.isdecimal():
+                ok = int(calculated, 16) == int(expected)
+            else:
+                ok = calculated.lower() == expected.lower()
+
+            if not ok:
+                mismatches.append(f"ERROR: hash mismatch: {rel_path}")
             elif verbose:
                 print(f"OK: {rel_path}")
-            continue
 
-        if not os.path.exists(candidate):
-            missing.append(f"ERROR: missing file: {rel_path}")
-            continue
+            # Free this element and all already-processed siblings. Each
+            # cleared element becomes an empty shell with no children or
+            # text; deleting it from the parent removes it entirely.
+            h.clear()
+            parent = h.getparent()
+            if parent is not None:
+                while h.getprevious() is not None:
+                    del parent[0]
 
-        # Tags we accept-on-read but cannot recompute (xxhash128, xxhash3_64)
-        # raise ValueError inside get_hash; surface this as a mismatch
-        # rather than crashing.
-        try:
-            calculated = get_hash(candidate, tag)
-        except (ValueError, OSError) as e:
-            mismatches.append(f"ERROR: cannot verify {rel_path}: {e}")
-            continue
-
-        # Some legacy MHL files stored xxhash as a *decimal integer* rather
-        # than the modern big-endian hex. Detect that case and compare
-        # numerically, otherwise compare hex case-insensitively (uppercase
-        # hex appears in some third-party tool output).
-        if tag == "xxhash" and expected.isdigit():
-            ok = int(calculated, 16) == int(expected)
-        else:
-            ok = calculated.lower() == expected.lower()
-
-        if not ok:
-            mismatches.append(f"ERROR: hash mismatch: {rel_path}")
-        elif verbose:
-            print(f"OK: {rel_path}")
+    except (etree.XMLSyntaxError, OSError):
+        sys.exit(20)
 
     # Default mode: silent on full success, structured per-file output on
     # failure. Verbose mode also prints OK lines (printed inline above as
@@ -605,6 +651,31 @@ def validate_schema(mhl_file: str) -> None:
 
 
 def main() -> None:
+    # --- Smart dispatch -------------------------------------------------------
+    # When invoked without an explicit subcommand we inspect the sole positional
+    # argument (if there is exactly one) and infer the intended operation:
+    #
+    #   simple-mhl <directory>   →  simple-mhl seal <directory>
+    #   simple-mhl <file>.mhl    →  simple-mhl verify <file>.mhl
+    #
+    # This is done by rewriting sys.argv before argparse sees it, so all normal
+    # validation (choices=, required=, etc.) still applies.  We only rewrite
+    # when the first token after the program name is not already a recognised
+    # subcommand or flag, keeping full backwards-compatibility.
+    _SUBCOMMANDS = {"seal", "verify", "xsd-schema-check"}
+    _raw = sys.argv[1:]
+    if _raw and _raw[0] not in _SUBCOMMANDS and not _raw[0].startswith("-"):
+        # Candidate: a single bare path with no subcommand prefix.
+        _candidate = _raw[0]
+        if os.path.isdir(_candidate):
+            # Directory → seal, injecting the subcommand into argv.
+            sys.argv = [sys.argv[0], "seal", *_raw]
+        elif _candidate.lower().endswith(".mhl"):
+            # .mhl file → verify, injecting the subcommand into argv.
+            sys.argv = [sys.argv[0], "verify", *_raw]
+        # Anything else falls through to argparse, which will produce its
+        # normal "argument command: invalid choice" error message.
+
     parser = argparse.ArgumentParser(
         prog="simple-mhl",
         description="Modern verification and sealing tool for legacy MHL files",
