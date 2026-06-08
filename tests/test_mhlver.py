@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Test suite for mhlver.py orchestrator and ASC-MHL dispatch.
-
-Covers:
-  - mhlver: directory walking, ASC-MHL detection, report generation
-"""
+"""Test suite for mhlver.py orchestrator and ASC-MHL dispatch."""
 
 import io
 import os
@@ -67,11 +63,30 @@ def _write_ascmhl(path: Path, entries: list[dict]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-# =============================================================================
+def stub_run_step(monkeypatch, exit_code: int, output: str = ""):
+    """Replace _run_step with a stub that returns a fixed StepResult."""
+
+    def _stub(cmd, cwd=None, **kwargs):
+        return mhlver.StepResult(exit_code=exit_code, output=output)
+
+    monkeypatch.setattr(mhlver, "_run_step", _stub)
+
+
+def call_verify(manifest):
+    """Invoke _ascmhl_verify with sane defaults and return its exit code."""
+
+    return mhlver._ascmhl_verify(
+        target=manifest,
+        cmd_path="/fake/ascmhl-debug",
+        cwd=None,
+        verbose=False,
+        report_file=None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # TestMhlver
-# =============================================================================
-# Covers top-level orchestration: directory walking, ASC-MHL detection,
-# duration formatting, and manifest selection.
+# ---------------------------------------------------------------------------
 
 
 class TestMhlver:
@@ -110,24 +125,22 @@ class TestMhlver:
         assert mhlver._format_duration(125) == "2m 5s"
         assert mhlver._format_duration(3725) == "1h 2m 5s"
 
+    def test_dot_underscore_filter_applies_only_to_filename_not_parent_dir(self, tmp_path):
+        """Files inside a directory named '._hidden' must NOT be excluded.
 
-# =============================================================================
-# TestFindMhlFilesReservedNames
-# =============================================================================
-# Windows reserves device names (CON, PRN, AUX, …) at every extension.
-# find_mhl_files must not special-case or silently drop them when they exist.
-# On Windows the files cannot be created, so the test skips automatically.
-# On Linux/macOS CI the files are created and the assertion runs in full.
+        The macOS resource-fork filter checks p.name (the file's own name),
+        not any parent directory component.
+        """
+        hidden_dir = tmp_path / "._hidden"
+        hidden_dir.mkdir()
+        (hidden_dir / "valid.mhl").write_text("")
+        (tmp_path / "._resource.mhl").write_text("")
 
+        found = list(mhlver.find_mhl_files(tmp_path))
+        names = {p.name for p in found}
 
-class TestFindMhlFilesReservedNames:
-    """find_mhl_files must handle Windows-reserved filenames without error.
-
-    The test attempts to create each reserved-name .mhl file; if the OS
-    refuses (Windows PermissionError / FileNotFoundError), it skips rather
-    than failing, so it runs and asserts on every platform where the files
-    can actually exist.
-    """
+        assert "valid.mhl" in names, "File inside ._hidden dir should be included"
+        assert "._resource.mhl" not in names, "File named ._resource.mhl should be excluded"
 
     def test_windows_reserved_names_are_found_when_they_exist(self, tmp_path):
         """Files named CON.mhl, PRN.mhl, etc. are yielded by find_mhl_files
@@ -177,20 +190,23 @@ class TestFindMhlFilesReservedNames:
             assert f.name in found_names, f"{f.name} was unexpectedly filtered out by find_mhl_files"
 
 
-# =============================================================================
-# TestSelectMhlFilesProperties
-# =============================================================================
-# Hypothesis property-based tests for _select_mhl_files structural invariants.
-# These verify the deduplication CONTRACT over generated directory layouts,
-# covering cases that would be tedious to enumerate by hand.
-#
-# Hypothesis @given tests must not use function-scoped pytest fixtures like
-# tmp_path because the fixture is not reset between generated examples.
-# Each test manages its own TemporaryDirectory instead.
+# ---------------------------------------------------------------------------
+# TestSelectMhlFiles
+# ---------------------------------------------------------------------------
 
 
-class TestSelectMhlFilesProperties:
-    """Property-based tests for _select_mhl_files structural invariants."""
+class TestSelectMhlFiles:
+    """Property-based and unit tests for _select_mhl_files.
+
+    The @given tests verify structural invariants over generated directory
+    layouts (at least-once, latest-generation, output-count, sort-order).
+    The remaining tests cover specific layout patterns that complement
+    the Hypothesis properties.
+
+    Note: @given tests must not use function-scoped fixtures like tmp_path
+    because the fixture is not reset between generated examples; each manages
+    its own TemporaryDirectory.
+    """
 
     @given(
         pkg_names=strategies.lists(_filename_stem, min_size=1, max_size=5, unique=True),
@@ -327,19 +343,6 @@ class TestSelectMhlFilesProperties:
             selected = mhlver._select_mhl_files(root)
             assert selected == sorted(selected)
 
-
-# =============================================================================
-# TestSelectMhlFilesTopLevelAscmhlDir
-# =============================================================================
-# Structural gap in the original suite: no test covered a scan root whose
-# immediate child is named 'ascmhl/' (not nested inside a package directory).
-# The deduplication key for files in that layout is f.parent.parent == root,
-# which is valid but untested.
-
-
-class TestSelectMhlFilesTopLevelAscmhlDir:
-    """_select_mhl_files with an ascmhl/ folder directly under the scan root."""
-
     def test_ascmhl_folder_directly_under_scan_root_yields_latest(self, tmp_path):
         """When ascmhl/ is immediately under the scan root, the latest
         generation is selected and exactly one manifest is returned.
@@ -375,31 +378,10 @@ class TestSelectMhlFilesTopLevelAscmhlDir:
         assert "0001.mhl" in names
         assert "0002.mhl" in names
 
-    def test_dot_underscore_filter_applies_only_to_filename_not_parent_dir(self, tmp_path):
-        """Files inside a directory named '._hidden' must NOT be excluded.
 
-        The macOS resource-fork filter checks p.name (the file's own name),
-        not any parent directory component.
-        """
-        hidden_dir = tmp_path / "._hidden"
-        hidden_dir.mkdir()
-        (hidden_dir / "valid.mhl").write_text("")
-        (tmp_path / "._resource.mhl").write_text("")
-
-        found = list(mhlver.find_mhl_files(tmp_path))
-        names = {p.name for p in found}
-
-        assert "valid.mhl" in names, "File inside ._hidden dir should be included"
-        assert "._resource.mhl" not in names, "File named ._resource.mhl should be excluded"
-
-
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestAscmhlTotalBytes
-# =============================================================================
-# Covers ascmhl_total_bytes — path/@size deduplication across ASC-MHL generation files.
-#
-# Fixtures write minimal but schema-valid ASC-MHL 2.0 XML directly to
-# tmp_path so no external tools or mocking of the XML layer are needed.
+# ---------------------------------------------------------------------------
 
 
 class TestAscmhlTotalBytes:
@@ -548,37 +530,33 @@ class TestAscmhlTotalBytes:
         assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 1_811_635
 
     def test_ascmhl_from_shotputpro_single_generation_with_directory_hashes(self, tmp_path, load_fixture_mhl):
-        """Six MXF+sidecar pairs plus a manifest file, interspersed with directory hashes.
+        """ShotPut Pro ASC-MHL
 
-        Reproduces the structure a transfer tool generates for a camera card:
-        each clip folder gets a <directoryhash> with no size, while each file
-        gets a <hash> with a size attribute. The parent folder and a top-level
-        metadata file are also present.
-
-        Expected total (13 files with size):
-          2246896176 + 4170 + 15758019120 + 4172 + 14349986352 + 4172
-        + 5392501296 + 4170 + 10904799792 + 4172 + 13421283888 + 4172 + 2945
-        = 62_073_514_597
+        Expected total: 2246896176 + 4170 + 15758019120 + 4172 = 18_004_923_638
         """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
-        mhl = load_fixture_mhl(ascdir, "shotputpro_ascmhl.mhl")
-        assert mhlver._ascmhl_total_bytes(mhl) == 62_073_514_597
+        mhl = load_fixture_mhl(ascdir, "shotputpro_ascmhl_example.mhl")
+        assert mhlver._ascmhl_total_bytes(mhl) == 18_004_923_638
+
+    def test_ascmhl_from_silverstack_single_generation_with_directory_hashes(self, tmp_path, load_fixture_mhl):
+        """Silverstack Lab ASC-MHL
+
+        Expected total: 2246896176 + 4170 + 15758019120 + 4172 = 18_004_923_638
+        """
+        ascdir = tmp_path / "ascmhl"
+        ascdir.mkdir()
+        mhl = load_fixture_mhl(ascdir, "shotputpro_ascmhl_example.mhl")
+        assert mhlver._ascmhl_total_bytes(mhl) == 18_004_923_638
 
     def test_ascmhl_from_ocopy_in_place_single_generation(self, tmp_path, load_fixture_mhl):
-        """o/COPY in-place seal: <directoryhash> with empty <content/> and <structure/>, sub-second hashdate.
-
-        o/COPY emits <directoryhash> blocks when subfolders are present, but unlike
-        ShotPutPro their <content/> and <structure/> child elements are self-closing
-        empty tags rather than containing a hash value. The <path> inside still
-        carries no size attribute, so the size guard must skip it correctly regardless.
-        Hashdate timestamps include sub-second precision.
+        """o/COPY ASC-MHL
 
         Expected total: 436085 + 2775033 + 161713671 = 164_924_789
         """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
-        mhl = load_fixture_mhl(ascdir, "ocopy_ascmhl.mhl")
+        mhl = load_fixture_mhl(ascdir, "ocopy_ascmhl_example.mhl")
         assert mhlver._ascmhl_total_bytes(mhl) == 436085 + 2775033 + 161713671
 
     def test_corrupt_generation_file_is_skipped_others_still_counted(self, tmp_path, write_mhl):
@@ -740,47 +718,14 @@ class TestAscmhlTotalBytes:
         assert mhlver._ascmhl_total_bytes(mhl) == 100
 
 
-@pytest.fixture
-def ascmhl_setup(tmp_path):
-    """Set up the layout ascmhl-debug expects and return the manifest path."""
-    pkg = tmp_path / "pkg"
-    ascdir = pkg / "ascmhl"
-    ascdir.mkdir(parents=True)
-    manifest = ascdir / "0001.mhl"
-    manifest.write_text("<dummy/>")
-    return manifest
-
-
-def stub_run_step(monkeypatch, exit_code: int, output: str = ""):
-    """Replace _run_step with a stub that returns a fixed StepResult."""
-
-    def _stub(cmd, cwd=None, **kwargs):
-        return mhlver.StepResult(exit_code=exit_code, output=output)
-
-    monkeypatch.setattr(mhlver, "_run_step", _stub)
-
-
-def call_verify(manifest: Path) -> int:
-    """Invoke _ascmhl_verify with sane defaults and return its exit code."""
-    return mhlver._ascmhl_verify(
-        target=manifest,
-        cmd_path="/fake/ascmhl-debug",
-        cwd=None,
-        verbose=False,
-        report_file=None,
-    )
-
-
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestAscmhlDispatch
-# =============================================================================
-# Covers the ASC-MHL (v2) exit-code translation layer: _ascmhl_verify,
-# _ascmhl_schema_check, and the dispatch table completeness check.
+# ---------------------------------------------------------------------------
 
 
 class TestAscmhlDispatch:
-    """
-    Tests for the ASC-MHL (v2) exit-code translation layer in mhlver.
+    """ASC-MHL exit-code translation, schema dispatch, schema=False routing,
+    output visibility, and command-not-found (127).
     """
 
     def test_verify_clean_returns_zero(self, ascmhl_setup, monkeypatch):
@@ -877,7 +822,7 @@ class TestAscmhlDispatch:
         captured = capsys.readouterr()
         assert "ERROR: no MHL history found" in captured.err
 
-    def test_ascmhl_backend_output_also_shown_with_verbose(self, ascmhl_setup, monkeypatch, capsys):
+    def test_ascmhl_backend_output_also_shown_with_verbose(self, ascmhl_setup, capsys, monkeypatch):
         """With --verbose, ascmhl's output is also shown on terminal."""
         stub_run_step(monkeypatch, 30, "ERROR: no MHL history found at /pkg")
 
@@ -906,20 +851,6 @@ class TestAscmhlDispatch:
         )
 
         assert "ERROR: no MHL history found" in report.getvalue()
-
-
-# =============================================================================
-# TestVerifyAscmhlSchemaFalseDispatch
-# =============================================================================
-# Covers return _ascmhl_verify(...) inside _verify_ascmhl when
-# schema=False. The existing tests in TestAscmhlDispatch call _ascmhl_verify
-# (the internal worker) directly, and test_schema_true_dispatches_to_ascmhl_
-# schema_check only exercises the schema=True arm. Neither hits the else arm
-# at line 568 of _verify_ascmhl (the public dispatcher).
-
-
-class TestVerifyAscmhlSchemaFalseDispatch:
-    """_verify_ascmhl with schema=False must call _ascmhl_verify, not _ascmhl_schema_check."""
 
     def test_schema_false_dispatches_to_ascmhl_verify(self, ascmhl_setup, monkeypatch):
         """schema=False routes to _ascmhl_verify; _ascmhl_schema_check is never called."""
@@ -951,22 +882,37 @@ class TestVerifyAscmhlSchemaFalseDispatch:
         rc = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False, report_file=None)
         assert rc == 11
 
+    def test_command_not_found_returns_127(self, ascmhl_setup, monkeypatch):
+        """When ascmhl-debug is not found, _verify_ascmhl returns 127."""
+        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: None)
+        rc = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False, report_file=None)
+        assert rc == 127
 
-# =============================================================================
+    def test_schema_true_dispatches_to_ascmhl_schema_check(self, ascmhl_setup, monkeypatch):
+        """With schema=True, _verify_ascmhl calls _ascmhl_schema_check."""
+        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
+        called = {}
+
+        def _stub_schema_check(target, cmd_path, cwd, verbose, report_file, **kw):
+            called["yes"] = True
+            return 0
+
+        monkeypatch.setattr(mhlver, "_ascmhl_schema_check", _stub_schema_check)
+        rc = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=True, report_file=None)
+        assert called.get("yes") is True
+        assert rc == 0
+
+
+# ---------------------------------------------------------------------------
 # TestLegacyDispatch
-# =============================================================================
-# Covers the MHL v1 exit-code translation layer in _verify_legacy.
-# Both get_command_path and _run_step are patched so no real subprocess
-# is spawned and the test is independent of the installed environment.
+# ---------------------------------------------------------------------------
 
 
 class TestLegacyDispatch:
-    """Tests for the MHL v1 exit-code translation layer in _verify_legacy.
+    """MHL v1 exit-code translation, verbose/schema flags, dispatch table, and command-not-found.
 
-    _verify_legacy calls get_command_path("simple-mhl") before _run_step, so
-    both must be patched: get_command_path to return a sentinel path (so the
-    function proceeds past the command-not-found guard), and _run_step to
-    return the desired StepResult without spawning a real subprocess.
+    Both get_command_path and _run_step are patched so no real subprocess
+    is spawned and tests are independent of the installed environment.
     """
 
     def test_verify_legacy_clean_returns_zero(self, tmp_path, monkeypatch):
@@ -1059,12 +1005,62 @@ class TestLegacyDispatch:
         missing = documented_codes - set(mhlver._LEGACY_RESULTS.keys())
         assert missing == set(), f"Dispatch table missing codes: {missing}"
 
+    def test_command_not_found_returns_127(self, tmp_path, monkeypatch):
+        """When simple-mhl is not found, _verify_legacy returns 127."""
+        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: None)
+        mhl = tmp_path / "dummy.mhl"
+        mhl.write_text("")
+        rc = mhlver._verify_legacy(mhl, verbose=False, schema=False, report_file=None)
+        assert rc == 127
 
-# =============================================================================
+    def test_verbose_with_schema_does_not_add_v_flag(self, tmp_path, monkeypatch):
+        """With verbose=True and schema=True, -v must NOT be appended
+        (xsd-schema-check has no per-file output)."""
+        captured_cmd = {}
+
+        def _stub(cmd, cwd=None, **kwargs):
+            captured_cmd["cmd"] = cmd
+            return mhlver.StepResult(exit_code=0, output="")
+
+        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
+        monkeypatch.setattr(mhlver, "_run_step", _stub)
+        mhl = tmp_path / "dummy.mhl"
+        mhl.write_text("")
+        mhlver._verify_legacy(mhl, verbose=True, schema=True, report_file=None)
+        assert "-v" not in captured_cmd["cmd"]
+        assert "xsd-schema-check" in captured_cmd["cmd"]
+
+    def test_verbose_without_schema_adds_v_flag(self, tmp_path, monkeypatch):
+        """With verbose=True and schema=False, -v IS appended."""
+        captured_cmd = {}
+
+        def _stub(cmd, cwd=None, **kwargs):
+            captured_cmd["cmd"] = cmd
+            return mhlver.StepResult(exit_code=0, output="")
+
+        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
+        monkeypatch.setattr(mhlver, "_run_step", _stub)
+        mhl = tmp_path / "dummy.mhl"
+        mhl.write_text("")
+        mhlver._verify_legacy(mhl, verbose=True, schema=False, report_file=None)
+        assert "-v" in captured_cmd["cmd"]
+
+    def test_schema_uses_legacy_schema_results_table(self, tmp_path, monkeypatch, capsys):
+        """With schema=True, exit 60 is looked up in _LEGACY_SCHEMA_RESULTS
+        (which has a specific message) not _LEGACY_RESULTS (which doesn't)."""
+        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
+        monkeypatch.setattr(mhlver, "_run_step", lambda cmd, **kw: mhlver.StepResult(60, ""))
+        mhl = tmp_path / "dummy.mhl"
+        mhl.write_text("")
+        rc = mhlver._verify_legacy(mhl, verbose=False, schema=True, report_file=None)
+        assert rc == 60
+        captured = capsys.readouterr()
+        assert "schema" in (captured.out + captured.err).lower()
+
+
+# ---------------------------------------------------------------------------
 # TestLogHelpers
-# =============================================================================
-# Covers _log's console branch, _emit_step_output's success and console paths,
-# and _verbose_announce's cwd/console/ report_file branches.
+# ---------------------------------------------------------------------------
 
 
 class TestLogHelpers:
@@ -1194,11 +1190,9 @@ class TestLogHelpers:
         assert buf.getvalue() == ""
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestReportViaTable
-# =============================================================================
-# Covers the suppressed-success-but-report-file branch:
-# show_status_on_terminal=False AND severity=="success" AND report_file set.
+# ---------------------------------------------------------------------------
 
 
 class TestReportViaTable:
@@ -1240,6 +1234,8 @@ class TestReportViaTable:
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == ""
+
+    def test_errors_always_shown_on_terminal_regardless_of_suppression(self, capsys):
         """Errors must always appear on the terminal regardless of
         show_status_on_terminal, because operators need immediate visibility."""
         mhlver._report_via_table(
@@ -1255,10 +1251,9 @@ class TestReportViaTable:
         assert "bad.mhl" in captured.err
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestGetCommandPath
-# =============================================================================
-# Covers the shutil.which fallback when the venv candidate doesn't exist.
+# ---------------------------------------------------------------------------
 
 
 class TestGetCommandPath:
@@ -1291,102 +1286,9 @@ class TestGetCommandPath:
         assert mhlver.get_command_path("simple-mhl") == str(candidate)
 
 
-# =============================================================================
-# TestVerifyLegacyExtended
-# =============================================================================
-# Covers command not found → 127, verbose+schema, and the schema table selection path.
-
-
-class TestVerifyLegacyExtended:
-    """Additional _verify_legacy branch coverage."""
-
-    def test_command_not_found_returns_127(self, tmp_path, monkeypatch):
-        """When simple-mhl is not found, _verify_legacy returns 127."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: None)
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        rc = mhlver._verify_legacy(mhl, verbose=False, schema=False, report_file=None)
-        assert rc == 127
-
-    def test_verbose_with_schema_does_not_add_v_flag(self, tmp_path, monkeypatch):
-        """With verbose=True and schema=True, -v must NOT be appended
-        (xsd-schema-check has no per-file output)."""
-        captured_cmd = {}
-
-        def _stub(cmd, cwd=None, **kwargs):
-            captured_cmd["cmd"] = cmd
-            return mhlver.StepResult(exit_code=0, output="")
-
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
-        monkeypatch.setattr(mhlver, "_run_step", _stub)
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        mhlver._verify_legacy(mhl, verbose=True, schema=True, report_file=None)
-        assert "-v" not in captured_cmd["cmd"]
-        assert "xsd-schema-check" in captured_cmd["cmd"]
-
-    def test_verbose_without_schema_adds_v_flag(self, tmp_path, monkeypatch):
-        """With verbose=True and schema=False, -v IS appended."""
-        captured_cmd = {}
-
-        def _stub(cmd, cwd=None, **kwargs):
-            captured_cmd["cmd"] = cmd
-            return mhlver.StepResult(exit_code=0, output="")
-
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
-        monkeypatch.setattr(mhlver, "_run_step", _stub)
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        mhlver._verify_legacy(mhl, verbose=True, schema=False, report_file=None)
-        assert "-v" in captured_cmd["cmd"]
-
-    def test_schema_uses_legacy_schema_results_table(self, tmp_path, monkeypatch, capsys):
-        """With schema=True, exit 60 is looked up in _LEGACY_SCHEMA_RESULTS
-        (which has a specific message) not _LEGACY_RESULTS (which doesn't)."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
-        monkeypatch.setattr(mhlver, "_run_step", lambda cmd, **kw: mhlver.StepResult(60, ""))
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        rc = mhlver._verify_legacy(mhl, verbose=False, schema=True, report_file=None)
-        assert rc == 60
-        captured = capsys.readouterr()
-        assert "schema" in (captured.out + captured.err).lower()
-
-
-# =============================================================================
-# TestVerifyAscmhlExtended
-# =============================================================================
-# Covers lcommand-not-found (127), suite_dir warning, and schema dispatch.
-
-
-class TestVerifyAscmhlExtended:
-    """Additional _verify_ascmhl branch coverage."""
-
-    def test_command_not_found_returns_127(self, ascmhl_setup, monkeypatch):
-        """When ascmhl-debug is not found, _verify_ascmhl returns 127."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: None)
-        rc = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False, report_file=None)
-        assert rc == 127
-
-    def test_schema_true_dispatches_to_ascmhl_schema_check(self, ascmhl_setup, monkeypatch):
-        """With schema=True, _verify_ascmhl calls _ascmhl_schema_check."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
-        called = {}
-
-        def _stub_schema_check(target, cmd_path, cwd, verbose, report_file, **kw):
-            called["yes"] = True
-            return 0
-
-        monkeypatch.setattr(mhlver, "_ascmhl_schema_check", _stub_schema_check)
-        rc = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=True, report_file=None)
-        assert called.get("yes") is True
-        assert rc == 0
-
-
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestVerifyItem
-# =============================================================================
-# Covers verify_item dispatching to the ASC-MHL path.
+# ---------------------------------------------------------------------------
 
 
 class TestVerifyItem:
@@ -1423,9 +1325,9 @@ class TestVerifyItem:
         assert called.get("legacy") is True
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestMhlTotalBytes
-# =============================================================================
+# ---------------------------------------------------------------------------
 
 
 class TestMhlTotalBytes:
@@ -1466,55 +1368,40 @@ class TestMhlTotalBytes:
         assert mhlver._mhl_total_bytes(mhl) == 50
 
     def test_legacy_mhl_from_shotputpro(self, tmp_path, load_fixture_mhl):
-        """ShotPutPro legacy MHL 1.1: <size> as child element of <hash>, path in <file>.
-
-        Legacy MHL 1.x stores size as a <size> child element rather than a
-        path/@size attribute as in ASC-MHL 2.0. ShotPutPro produces hashlist
-        version="1.1" with no XML namespace. The structure is flat — there is
-        no <directoryhash> equivalent.
-
-        Representative subset of three files (two MXF clips + sidecar XML)
-        matching the real ShotPutPro legacy output structure.
+        """ShotPutPro legacy MHL
 
         Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919_466
         """
-        mhl = load_fixture_mhl(tmp_path, "shotputpro_legacymhl.mhl")
+        mhl = load_fixture_mhl(tmp_path, "shotputpro_legacymhl_example.mhl")
+        assert mhlver._mhl_total_bytes(mhl) == 2246896176 + 4170 + 15758019120
+
+    def test_legacy_mhl_from_silverstack(self, tmp_path, load_fixture_mhl):
+        """ShotPutPro legacy MHL
+
+        Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919_466
+        """
+        mhl = load_fixture_mhl(tmp_path, "silverstack_legacymhl_example.mhl")
         assert mhlver._mhl_total_bytes(mhl) == 2246896176 + 4170 + 15758019120
 
     def test_legacy_mhl_from_ocopy(self, tmp_path, load_fixture_mhl):
-        """o/COPY legacy MHL 1.1: structurally identical to ShotPutPro but with
-        single-quoted XML declaration and UTC Z-suffix dates.
+        """o/COPY legacy MHL
 
-        o/COPY writes <?xml version='1.0' encoding='utf-8'?> (single quotes)
-        and uses Zulu timestamps (e.g. 2026-05-31T02:09:06Z) rather than
-        explicit UTC offsets. lxml handles both transparently — this test
-        confirms neither quirk causes a parse failure or size miscount.
-
-        Expected total: 436085 + 2775033 + 161713671 = 164_924_789
+        Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919,466
         """
-        mhl = load_fixture_mhl(tmp_path, "ocopy_legacymhl.mhl")
-        assert mhlver._mhl_total_bytes(mhl) == 436085 + 2775033 + 161713671
+        mhl = load_fixture_mhl(tmp_path, "ocopy_legacymhl_example.mhl")
+        assert mhlver._mhl_total_bytes(mhl) == 18_004_919_466
 
     def test_legacy_mhl_from_offshoot(self, tmp_path, load_fixture_mhl):
-        """OffShoot legacy MHL 1.1: vendor <hedge> block and dual hash elements per entry.
-
-        OffShoot extends the MHL 1.1 format in two ways: it prepends a <hedge>
-        block containing a <rootPath> element before <creatorinfo>, and each
-        <hash> entry carries both <xxhash64be> and <xxhash64> child elements.
-        Neither extension introduces a <size> element, so the total must be
-        unaffected. The <hedge> block is the meaningful structural difference
-        to pin — a future OffShoot version adding a <size> inside <hedge>
-        would be picked up by the wildcard iterfind and inflate the total.
-
-        Expected total: 436085 + 2775033 + 161713671 = 164_924_789
+        """OffShoot legacy MHL
+        Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919,466
         """
-        mhl = load_fixture_mhl(tmp_path, "offshoot_legacymhl.mhl")
-        assert mhlver._mhl_total_bytes(mhl) == 436085 + 2775033 + 161713671
+        mhl = load_fixture_mhl(tmp_path, "offshoot_legacymhl_example.mhl")
+        assert mhlver._mhl_total_bytes(mhl) == 18_004_919_466
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestOpenReport
-# =============================================================================
+# ---------------------------------------------------------------------------
 
 
 class TestOpenReport:
@@ -1546,11 +1433,9 @@ class TestOpenReport:
         assert rp.parent == tmp_path
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestRun
-# =============================================================================
-# Covers _run with file input, dir input (no-progress path), empty dir, and the
-# success/failure summary lines.
+# ---------------------------------------------------------------------------
 
 
 class TestRun:
@@ -1638,15 +1523,9 @@ class TestRun:
         assert "---" in buf.getvalue()
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestRunStep
-# =============================================================================
-# Covers _run_step with on_poll set during subprocess execution.
-#
-# The on_poll event is the signal the progress bar thread waits on to trigger
-# a Live refresh. If _run_step never calls on_poll.set() the bar freezes for
-# the duration of the subprocess. We verify it is set at least once for a
-# real (fast) subprocess.
+# ---------------------------------------------------------------------------
 
 
 class TestRunStep:
@@ -1679,16 +1558,9 @@ class TestRunStep:
         assert result.exit_code == 0
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestRunWithProgress
-# =============================================================================
-# Covers the use_progress=True branch of _run.
-#
-# We monkeypatch sys.stdout.isatty → True to activate the branch, then
-# replace _build_live with a no-op stub so the test never touches a real
-# terminal. The stub returns objects with the minimal interface _run uses:
-# a Live context manager, a Progress with add_task/advance/update, a Text
-# label, and a Console.
+# ---------------------------------------------------------------------------
 
 
 class TestRunWithProgress:
@@ -1765,37 +1637,9 @@ class TestRunWithProgress:
         assert "---" in buf.getvalue()
 
 
-# =============================================================================
-# mhlver_cli fixture and TestMain
-# =============================================================================
-# The fixture mirrors mhl_cli in conftest.py: it runs main() in-process,
-# captures stdout/stderr, and returns (exit_code, out, err).  We stub _run
-# so tests don't touch the filesystem beyond what they set up themselves.
-
-
-@pytest.fixture
-def mhlver_cli(monkeypatch):
-    """Run mhlver.main() in-process and return (exit_code, stdout, stderr)."""
-
-    def _run_main(argv):
-        str_argv = [str(a) for a in argv]
-        old_argv = sys.argv
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.argv = ["mhlver", *str_argv]
-        out, err = io.StringIO(), io.StringIO()
-        sys.stdout, sys.stderr = out, err
-        exit_code = 0
-        try:
-            try:
-                mhlver.main()
-            except SystemExit as e:
-                exit_code = e.code if e.code is not None else 0
-        finally:
-            sys.argv = old_argv
-            sys.stdout, sys.stderr = old_out, old_err
-        return exit_code, out.getvalue(), err.getvalue()
-
-    return _run_main
+# ---------------------------------------------------------------------------
+# TestMain
+# ---------------------------------------------------------------------------
 
 
 class TestMain:

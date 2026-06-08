@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from mhl_suite import simple_mhl
+from mhl_suite import mhlver, simple_mhl
 
 # ---------------------------------------------------------------------------
 # Fixture file location
@@ -94,6 +94,42 @@ def load_fixture_mhl():
         return dest
 
     return _load
+
+
+@pytest.fixture
+def ascmhl_setup(tmp_path):
+    """Set up the layout ascmhl-debug expects and return the manifest path."""
+    pkg = tmp_path / "pkg"
+    ascdir = pkg / "ascmhl"
+    ascdir.mkdir(parents=True)
+    manifest = ascdir / "0001.mhl"
+    manifest.write_text("<dummy/>")
+    return manifest
+
+
+@pytest.fixture
+def mhlver_cli():
+    """Run mhlver.main() in-process and return (exit_code, stdout, stderr)."""
+
+    def _run_main(argv):
+        str_argv = [str(a) for a in argv]
+        old_argv = sys.argv
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.argv = ["mhlver", *str_argv]
+        out, err = io.StringIO(), io.StringIO()
+        sys.stdout, sys.stderr = out, err
+        exit_code = 0
+        try:
+            try:
+                mhlver.main()
+            except SystemExit as e:
+                exit_code = e.code if e.code is not None else 0
+        finally:
+            sys.argv = old_argv
+            sys.stdout, sys.stderr = old_out, old_err
+        return exit_code, out.getvalue(), err.getvalue()
+
+    return _run_main
 
 
 @pytest.fixture

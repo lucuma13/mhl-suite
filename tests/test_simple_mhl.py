@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Test suite for simple_mhl.py core functionality and stress testing.
-
-Covers:
-  - Correctness: seal/verify round-trips with multiple algorithms
-  - Edge cases: hidden files, unicode names, nested dirs, empty files
-  - Failure modes: corrupted files, missing files, malformed XML, schema errors
-  - Security: path traversal blocking (normpath-based)
-  - Stress: large files, thousands of files, pathological naming conventions
-"""
+"""Test suite for simple_mhl.py."""
 
 import hashlib
 import os
@@ -15,6 +7,7 @@ import random
 import re
 import sys
 import time
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -44,6 +37,56 @@ def seal_helper(mhl_cli, path: Path, algo="md5"):
     rc, _, _ = mhl_cli(["seal", str(path), "-a", algo])
     assert rc == 0
     return next(path.glob("*.mhl"))
+
+
+def make_mhl_with_size(dest_dir: Path, filename: str, content: bytes, size_override: str | None = None) -> Path:
+    """Write a file and a matching MHL, optionally overriding the <size> value.
+
+    Uses xxhash64 (the tool's default algorithm) for the digest so tests
+    exercise the primary production code path.
+    """
+    filepath = dest_dir / filename
+    filepath.write_bytes(content)
+
+    digest = xxhash.xxh64(content).hexdigest()
+    actual_size = str(len(content))
+    recorded_size = size_override if size_override is not None else actual_size
+
+    root = etree.Element("hashlist", version="1.1")
+    h = etree.SubElement(root, "hash")
+    etree.SubElement(h, "file").text = filename
+    etree.SubElement(h, "size").text = recorded_size
+    etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+    etree.SubElement(h, "xxhash64be").text = digest
+    etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+
+    mhl = dest_dir / "test.mhl"
+    etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+    return mhl
+
+
+def make_mhl(dest_dir: Path, entries: list[dict]) -> Path:
+    """Write a minimal MHL referencing the given entries.
+
+    Each entry dict must contain 'file', 'size', and 'md5'.
+    Used by symlink tests that build manifests by hand.
+    """
+    root = etree.Element("hashlist", version="1.1")
+    for e in entries:
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = e["file"]
+        etree.SubElement(h, "size").text = e["size"]
+        etree.SubElement(h, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
+        etree.SubElement(h, "md5").text = e["md5"]
+        etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
+    mhl = dest_dir / "manual.mhl"
+    etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+    return mhl
+
+
+# ---------------------------------------------------------------------------
+# TestSeal
+# ---------------------------------------------------------------------------
 
 
 class TestSeal:
@@ -139,14 +182,9 @@ class TestSeal:
         assert rc == 2
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestSealUnsupportedAlgorithm
-# =============================================================================
-# Covers lines 270-271: the algorithm guard inside seal().
-# argparse's choices= catches unknown algorithms before seal() is reached via
-# the CLI (test_seal_invalid_algorithm above exercises that path). These tests
-# call seal() directly, bypassing argparse, to exercise the defence-in-depth
-# guard that also lives inside the function.
+# ---------------------------------------------------------------------------
 
 
 class TestSealUnsupportedAlgorithm:
@@ -167,6 +205,11 @@ class TestSealUnsupportedAlgorithm:
         with pytest.raises(SystemExit):
             simple_mhl.seal(str(tmp_path), "blake3", dont_reseal=False)
         assert "blake3" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# TestVerify
+# ---------------------------------------------------------------------------
 
 
 class TestVerify:
@@ -340,6 +383,11 @@ class TestVerify:
         assert rc == 0
 
 
+# ---------------------------------------------------------------------------
+# TestRoundTrip
+# ---------------------------------------------------------------------------
+
+
 class TestRoundTrip:
     """End-to-end seal+verify with various tree shapes and sizes."""
 
@@ -396,6 +444,11 @@ class TestSchemaCheck:
         rc, _, err = mhl_cli(["xsd-schema-check", str(bad_mhl)])
         assert rc == 10
         assert "schema error" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# TestStressAndEdgeCases
+# ---------------------------------------------------------------------------
 
 
 class TestStressAndEdgeCases:
@@ -539,24 +592,9 @@ class TestStressAndEdgeCases:
         assert rc == 0
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestSealAtomicCollision
-# =============================================================================
-# Tests for the O_EXCL-based collision handling added in the race-condition fix.
-# The logic under test lives in seal() around the os.open(..., O_CREAT|O_EXCL)
-# loop:
-#
-#   - If the chosen path already exists AND --dont-reseal is set → exit 0.
-#   - If the chosen path already exists AND --dont-reseal is NOT set → seal
-#     lands on a _1.mhl suffix (and continues incrementing if needed).
-#   - Two concurrent seal() calls for the same timestamp must not clobber each
-#     other; we simulate this by injecting a pre-existing file and checking
-#     that the second seal writes to a distinct path.
-#
-# We cannot easily test actual concurrent processes in a unit test, so instead
-# we inject the collision condition by pre-creating the expected filename before
-# seal() runs. This exercises the exact FileExistsError → suffix branch that
-# the fix introduced.
+# ---------------------------------------------------------------------------
 
 
 class TestSealAtomicCollision:
@@ -669,11 +707,9 @@ class TestSealAtomicCollision:
         assert collider.read_text() == "placeholder"
 
 
-# =============================================================================
-# TestGetXsdPath / TestValidateSchemaExits60
-# =============================================================================
-# Covers the FileNotFoundError raise in get_xsd_path() and the corresponding
-# catch → stderr → sys.exit(60) in validate_schema() (fix #3).
+# ---------------------------------------------------------------------------
+# TestValidateSchemaXsdNotFound
+# ---------------------------------------------------------------------------
 
 
 class TestValidateSchemaXsdNotFound:
@@ -711,14 +747,9 @@ class TestValidateSchemaXsdNotFound:
         assert rc in (20, 1)  # 1 if the dir check fires first
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestGetXsdPathFallbackPaths
-# =============================================================================
-# Covers lines 119-127: get_xsd_path fallback paths.
-# TestValidateSchemaXsdNotFound patches get_xsd_path itself to raise,
-# bypassing the function body. These tests let the body run by patching one
-# level lower — at importlib.resources.files — while redirecting the local
-# xsd/ fallback lookup via __file__.
+# ---------------------------------------------------------------------------
 
 
 class TestGetXsdPathFallbackPaths:
@@ -781,15 +812,6 @@ class TestGetXsdPathFallbackPaths:
             pytest.raises(FileNotFoundError, match=r"MediaHashList_v1_1\.xsd"),
         ):
             simple_mhl.get_xsd_path()
-
-
-# =============================================================================
-# TestVerifyEdgeCases — coverage for uncovered verify() branches
-# =============================================================================
-
-
-class TestVerifyEdgeCases:
-    """Covers branches in verify() not hit by existing tests."""
 
     def test_verify_file_not_found_exits_1(self, mhl_cli, tmp_path):
         """verify on a nonexistent .mhl file must exit 1."""
@@ -909,9 +931,9 @@ class TestVerifyEdgeCases:
         assert "cannot verify" in out
 
 
-# =============================================================================
-# TestWalkEdgeCases — coverage for _iter_files_for_seal OSError paths
-# =============================================================================
+# ---------------------------------------------------------------------------
+# TestWalkEdgeCases
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(
@@ -949,29 +971,25 @@ class TestWalkEdgeCases:
             locked.chmod(0o755)  # restore so tmp_path cleanup can proceed
 
 
-# =============================================================================
-# TestSymlinkCycleProtection
-# =============================================================================
-# Documents and pins the behaviour that prevents _iter_files_for_seal from
-# looping indefinitely when the directory tree contains symlink cycles.
-#
-# Protection works in two layers:
-#   1. is_dir(follow_symlinks=False) — a symlink to a directory is not descended
-#   2. is_file(follow_symlinks=False) — a symlink to a file also returns False,
-#      so symlinks are excluded from the seal entirely
-#
-# This means cycles are impossible by exclusion: symlinks are never walked or
-# yielded, regardless of what they point to. These tests document and pin that
-# guarantee so a future refactor cannot silently remove the follow_symlinks=False
-# calls without breaking them.
+# ---------------------------------------------------------------------------
+# TestSymlinks
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="symlinks require elevated privileges on Windows",
 )
-class TestSymlinkCycleProtection:
-    """_iter_files_for_seal excludes symlinks entirely, making cycles impossible."""
+class TestSymlinks:
+    """Symlink handling for both seal and verify.
+
+    seal() excludes symlinks entirely (follow_symlinks=False on both is_dir and
+    is_file), making directory-cycle traversal impossible by exclusion. verify()
+    follows symlinks when named in a third-party manifest, hashing their targets.
+
+    Protection layers pinned here so a future refactor cannot silently remove
+    the follow_symlinks=False calls without a test failure.
+    """
 
     def test_symlink_to_parent_is_excluded_from_seal(self, mhl_cli, tmp_path):
         """A symlink pointing back to its own parent directory must be silently
@@ -1016,49 +1034,6 @@ class TestSymlinkCycleProtection:
         assert "b.bin" not in text
         assert text.count("<hash>") == 1
 
-
-# =============================================================================
-# TestVerifySymlinkManifestEntries
-# =============================================================================
-# Covers what happens when a third-party manifest names a symlink on disk.
-# seal() excludes symlinks, so our own manifests never reference them —
-# but a manifest produced by another tool could. Three cases:
-#
-#   1. Symlink resolves to a real file inside the tree:
-#      verify follows the symlink, hashes the target, and reports correctly.
-#
-#   2. Same, but wrong digest → mismatch detected → exit 40.
-#
-#   3. Mutual symlinks (a → b, b → a) named in a manifest:
-#      os.path.exists() follows the chain and returns False when it cannot
-#      resolve — the existence check fires before get_hash is called, so
-#      both entries are reported as missing files → exit 30. No loop, no crash.
-
-
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="symlinks require elevated privileges on Windows",
-)
-class TestVerifySymlinkManifestEntries:
-    """verify() handles manifests that reference symlinks on disk."""
-
-    def _make_mhl(self, pkg: Path, entries: list[dict]) -> Path:
-        """Write a minimal MHL referencing the given entries.
-
-        Each entry dict must contain 'file', 'size', and 'md5'.
-        """
-        root = etree.Element("hashlist", version="1.1")
-        for e in entries:
-            h = etree.SubElement(root, "hash")
-            etree.SubElement(h, "file").text = e["file"]
-            etree.SubElement(h, "size").text = e["size"]
-            etree.SubElement(h, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
-            etree.SubElement(h, "md5").text = e["md5"]
-            etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
-        mhl = pkg / "manual.mhl"
-        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
-        return mhl
-
     def test_symlink_to_file_inside_tree_verifies_correctly(self, mhl_cli, tmp_path):
         """verify follows a symlink that resolves inside the tree and hashes its
         target. A correct digest → exit 0."""
@@ -1074,7 +1049,7 @@ class TestVerifySymlinkManifestEntries:
             pytest.skip("symlinks not supported on this filesystem")
 
         correct_md5 = hashlib.md5(b"payload").hexdigest()
-        mhl = self._make_mhl(
+        mhl = make_mhl(
             pkg,
             [
                 {"file": "link.bin", "size": "7", "md5": correct_md5},
@@ -1097,7 +1072,7 @@ class TestVerifySymlinkManifestEntries:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks not supported on this filesystem")
 
-        mhl = self._make_mhl(
+        mhl = make_mhl(
             pkg,
             [
                 {"file": "link.bin", "size": "7", "md5": "0" * 32},
@@ -1123,7 +1098,7 @@ class TestVerifySymlinkManifestEntries:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks not supported on this filesystem")
 
-        mhl = self._make_mhl(
+        mhl = make_mhl(
             pkg,
             [
                 {"file": "a.bin", "size": "0", "md5": "0" * 32},
@@ -1139,13 +1114,18 @@ class TestVerifySymlinkManifestEntries:
         assert "missing file: b.bin" in out
 
 
-# =============================================================================
-# Robustness and security tests
-# =============================================================================
+# ---------------------------------------------------------------------------
+# TestAdversarialXML
+# ---------------------------------------------------------------------------
 
 
-class TestXXEInjection:
-    """XML External Entity injection must be rejected gracefully."""
+class TestAdversarialXML:
+    """Adversarial and malformed XML inputs must never crash the tool.
+
+    Covers XXE injection (lxml rejects external entities as XMLSyntaxError →
+    exit 20) and structural anomalies (Comment/PI nodes with callable .tag
+    attributes that would break naive tag-name lookups).
+    """
 
     def test_xxe_entity_payload_exits_20(self, mhl_cli, tmp_path):
         """A manifest containing an XXE <!ENTITY> payload must exit 20 (malformed XML)
@@ -1174,10 +1154,6 @@ class TestXXEInjection:
         for stream in (out, err):
             assert "root:" not in stream, "Potential XXE exfiltration detected in output"
             assert "/bin/" not in stream, "Potential XXE exfiltration detected in output"
-
-
-class TestXMLStructuralAnomalies:
-    """Adversarial XML structures must not crash the tool."""
 
     def test_comment_and_pi_nodes_inside_hash_do_not_crash(self, mhl_cli, tmp_path):
         """lxml Comment and ProcessingInstruction nodes carry a callable (not a string)
@@ -1226,6 +1202,11 @@ class TestXMLStructuralAnomalies:
         assert "no supported hash found" in out
 
 
+# ---------------------------------------------------------------------------
+# TestTOCTOURaceCondition
+# ---------------------------------------------------------------------------
+
+
 class TestTOCTOURaceCondition:
     """Files deleted between os.path.exists() and the next filesystem call must be handled gracefully.
 
@@ -1252,7 +1233,7 @@ class TestTOCTOURaceCondition:
         Manifest includes a <size> element so the size pre-check block is entered.
         os.path.getsize is patched to raise OSError for the target file only.
         """
-        mhl = _make_mhl_with_size(tmp_path, "vanishing.bin", b"data")
+        mhl = make_mhl_with_size(tmp_path, "vanishing.bin", b"data")
 
         real_getsize = os.path.getsize
 
@@ -1303,8 +1284,19 @@ class TestTOCTOURaceCondition:
         assert "ERROR: cannot verify vanishing.bin" in out
 
 
-class TestMutationFuzz:
-    """Mutation-based fuzz testing: the tool must never crash on corrupted manifests."""
+# ---------------------------------------------------------------------------
+# TestRobustness
+# ---------------------------------------------------------------------------
+
+
+class TestRobustness:
+    """The tool must never crash or regress on unusual inputs.
+
+    Covers mutation-based fuzz resilience (random byte-level corruption of valid
+    manifests must always produce a defined exit code) and memory behaviour
+    (verify() must use iterparse, not parse, to keep peak memory bounded for
+    large manifests tracking hundreds of thousands of frames).
+    """
 
     def test_verify_pure_garbage_bytes_exits_cleanly(self, mhl_cli, tmp_path):
         """A file filled with random bytes must produce a defined exit code, never a traceback."""
@@ -1354,10 +1346,6 @@ class TestMutationFuzz:
             rc, _, _ = mhl_cli(["verify", str(manifest)])
             assert rc in (0, 1, 20, 30, 40, 70), f"Unexpected exit code {rc} on mutation iteration {i}"
 
-
-class TestLargeManifestMemory:
-    """verify() must parse large manifests with bounded memory via iterparse."""
-
     def test_large_manifest_uses_iterparse_not_parse(self, mhl_cli, tmp_path, monkeypatch):
         """Confirm verify() calls etree.iterparse() rather than etree.parse().
 
@@ -1404,9 +1392,9 @@ class TestLargeManifestMemory:
         assert iterparse_calls, "etree.iterparse() was never called"
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # TestSmartDispatch
-# =============================================================================
+# ---------------------------------------------------------------------------
 
 
 class TestSmartDispatch:
@@ -1493,36 +1481,27 @@ class TestSmartDispatch:
         rc, _, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 0
 
+    def test_bare_non_mhl_file_falls_through_to_argparse_error(self, mhl_cli, tmp_path):
+        """A bare path that is neither a directory nor a .mhl file must fall
+        through the dispatch block unmodified and let argparse reject it.
 
-# =============================================================================
+        The path is passed as the first argument with no subcommand, so it
+        lands in argparse as an unrecognised subcommand → exit 2.
+        This covers the fall-through branch (673→679) in main().
+        """
+        plain = tmp_path / "plain_text_file.txt"
+        plain.write_text("data")
+
+        rc, _, err = mhl_cli([str(plain)])
+
+        assert rc == 2, f"Expected exit 2 from argparse, got {rc}"
+        # argparse writes usage/error to stderr for unrecognised subcommands.
+        assert err.strip() != "", "Expected argparse error on stderr, got silence"
+
+
+# ---------------------------------------------------------------------------
 # TestSizePreCheck
-# =============================================================================
-
-
-def _make_mhl_with_size(dest_dir: Path, filename: str, content: bytes, size_override: str | None = None) -> Path:
-    """Write a file and a matching MHL, optionally overriding the <size> value.
-
-    Uses xxhash64 (the tool's default algorithm) for the digest so tests
-    exercise the primary production code path.
-    """
-    filepath = dest_dir / filename
-    filepath.write_bytes(content)
-
-    digest = xxhash.xxh64(content).hexdigest()
-    actual_size = str(len(content))
-    recorded_size = size_override if size_override is not None else actual_size
-
-    root = etree.Element("hashlist", version="1.1")
-    h = etree.SubElement(root, "hash")
-    etree.SubElement(h, "file").text = filename
-    etree.SubElement(h, "size").text = recorded_size
-    etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
-    etree.SubElement(h, "xxhash64be").text = digest
-    etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
-
-    mhl = dest_dir / "test.mhl"
-    etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
-    return mhl
+# ---------------------------------------------------------------------------
 
 
 class TestSizePreCheck:
@@ -1547,7 +1526,7 @@ class TestSizePreCheck:
         size=9999 in the manifest, then verify.  The size pre-check must catch
         this without needing to hash the file.
         """
-        mhl = _make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="9999")
+        mhl = make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="9999")
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
 
@@ -1573,7 +1552,7 @@ class TestSizePreCheck:
 
         monkeypatch.setattr(simple_mhl, "get_hash", spy_get_hash)
 
-        mhl = _make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="9999")
+        mhl = make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="9999")
 
         rc, _, _ = mhl_cli(["verify", str(mhl)])
 
@@ -1592,7 +1571,7 @@ class TestSizePreCheck:
         """
         # Embed a superscript-two (U+00B2) mid-string — exactly the pattern
         # seen in the BGR2_20260426 fixture that triggered this requirement.
-        mhl = _make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="2\xb246896176")
+        mhl = make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="2\xb246896176")
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
 
@@ -1618,7 +1597,7 @@ class TestSizePreCheck:
         correct_digest = xxhash.xxh64(content).hexdigest()
 
         # Record the correct digest but a wrong size.
-        mhl = _make_mhl_with_size(tmp_path, "clip.bin", content, size_override="9999")
+        mhl = make_mhl_with_size(tmp_path, "clip.bin", content, size_override="9999")
 
         # Ensure get_hash would return the correct digest if ever called,
         # so the only thing that can trigger the failure is the size check.
@@ -1640,7 +1619,7 @@ class TestSizePreCheck:
         file.  A file with a matching size but a wrong hash must still exit 40.
         """
         content = b"original"
-        mhl = _make_mhl_with_size(tmp_path, "clip.bin", content)
+        mhl = make_mhl_with_size(tmp_path, "clip.bin", content)
 
         # Overwrite with same-size content that has a different hash.
         (tmp_path / "clip.bin").write_bytes(b"ORIGINAL")  # same 8 bytes, different content
@@ -1648,4 +1627,175 @@ class TestSizePreCheck:
         rc, out, _ = mhl_cli(["verify", str(mhl)])
 
         assert rc == 40, f"Expected exit 40 for hash mismatch after size matches, got {rc}"
+        assert "hash mismatch" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# TestUnicodeNormalisation
+# ---------------------------------------------------------------------------
+
+
+class TestUnicodeNormalisation:
+    """NFC normalisation of accented filenames at seal and verify time.
+
+    macOS HFS+/APFS returns filenames in NFD (decomposed) form — e.g. the
+    single codepoint é (U+00E9) is decomposed to e (U+0065) + combining acute
+    (U+0301).  Linux ext4 does byte-exact filename matching, so an NFD path
+    from the manifest would silently fail os.path.exists() against an NFC file
+    on disk.
+
+    simple_mhl normalises to NFC at two points:
+      1. seal — rel_path_posix is normalised before writing the <file> element
+      2. verify — rel_path from the manifest is normalised before constructing
+                  the candidate path
+
+    These tests construct NFD filenames explicitly so the behaviour is
+    deterministic regardless of what the host OS normalises at mkdir/write time.
+    """
+
+    # NFD forms used across tests:
+    #   NFC: "Ré.txt"  = R + U+00E9 (precomposed é)
+    #   NFD: "Ré.txt"  = R + e + U+0301 (combining acute)
+    _NFC_NAME = "R\u00e9.txt"  # R + precomposed é
+    _NFD_NAME = "Re\u0301.txt"  # R + e + combining acute
+
+    def test_seal_writes_nfc_for_nfd_filesystem_path(self, mhl_cli, tmp_path, monkeypatch):
+        """seal() must write NFC <file> entries even when the filesystem returns NFD paths.
+
+        We monkeypatch _iter_files_for_seal to yield a path whose string
+        representation is NFD, simulating what macOS HFS+/APFS returns.
+        The manifest must contain the NFC form so it is portable to Linux.
+        """
+
+        nfc_path = tmp_path / self._NFC_NAME
+        nfc_path.write_bytes(b"data")
+
+        real_iter = simple_mhl._iter_files_for_seal
+
+        def nfd_iter(root, mhl_path):
+            for p, stat_result in real_iter(root, mhl_path):
+                # Yield a (Path, stat_result) tuple whose path is the NFD form,
+                # simulating what macOS HFS+/APFS returns from the filesystem.
+                nfd_str = unicodedata.normalize("NFD", str(p))
+                yield Path(nfd_str), stat_result
+
+        monkeypatch.setattr(simple_mhl, "_iter_files_for_seal", nfd_iter)
+
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        assert rc == 0
+
+        text = next(tmp_path.glob("*.mhl")).read_text(encoding="utf-8")
+        # The <file> element must contain the NFC form.
+        assert self._NFC_NAME in text, (
+            f"Expected NFC name {self._NFC_NAME!r} in manifest, "
+            f"got NFD or other form. Manifest snippet: {text[text.find('<file>') : text.find('</file>') + 7]!r}"
+        )
+        # The NFD form must NOT appear as raw bytes in the manifest.
+        raw = next(tmp_path.glob("*.mhl")).read_bytes()
+        assert self._NFD_NAME.encode("utf-8") not in raw, (
+            "NFD byte sequence found in manifest — NFC normalisation did not fire"
+        )
+
+    def test_seal_nfc_is_idempotent_for_already_nfc_paths(self, mhl_cli, tmp_path):
+        """NFC normalisation of an already-NFC path must produce the same result.
+
+        Regression guard: applying NFC to a path that is already NFC must not
+        corrupt the filename or produce a different string.
+        """
+        nfc_path = tmp_path / self._NFC_NAME
+        nfc_path.write_bytes(b"data")
+
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        assert rc == 0
+
+        text = next(tmp_path.glob("*.mhl")).read_text(encoding="utf-8")
+        assert self._NFC_NAME in text
+
+    def test_verify_nfc_manifest_finds_nfc_file(self, mhl_cli, tmp_path):
+        """verify() must find a file when both the manifest and disk use NFC.
+
+        This is the baseline happy path for NFC filenames — seal then verify
+        on the same OS must always work.
+        """
+        make_tree(tmp_path, {self._NFC_NAME: b"data"})
+        mhl = seal_helper(mhl_cli, tmp_path)
+
+        rc, _, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0
+
+    def test_verify_normalises_nfd_manifest_path_to_find_nfc_file(self, mhl_cli, tmp_path):
+        """verify() must find an NFC file on disk even when the manifest contains an NFD path.
+
+        This is the cross-platform scenario: manifest sealed on macOS (NFD paths)
+        verified on Linux (NFC files, byte-exact matching). We construct the
+        manifest by hand with an NFD <file> entry pointing at an NFC file on disk.
+        """
+
+        # Create the file with an NFC name.
+        nfc_path = tmp_path / self._NFC_NAME
+        nfc_path.write_bytes(b"data")
+        digest = simple_mhl.get_hash(str(nfc_path), "md5")
+
+        # Write a manifest with the NFD form of the same name.
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = self._NFD_NAME  # NFD — simulates macOS seal
+        etree.SubElement(h, "size").text = str(len(b"data"))
+        etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+        etree.SubElement(h, "md5").text = digest
+        etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+        mhl = tmp_path / "test.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+
+        assert rc == 0, f"verify() failed to find NFC file via NFD manifest path. Exit {rc}, output: {out!r}"
+
+    def test_verify_nfd_manifest_path_correct_hash_passes(self, mhl_cli, tmp_path):
+        """Complement to the above: NFD manifest + correct digest = clean verify.
+
+        Confirms the normalisation does not break the hash check that follows.
+        """
+
+        nfc_path = tmp_path / self._NFC_NAME
+        content = b"accented content"
+        nfc_path.write_bytes(content)
+        digest = simple_mhl.get_hash(str(nfc_path), "md5")
+
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = self._NFD_NAME
+        etree.SubElement(h, "size").text = str(len(content))
+        etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+        etree.SubElement(h, "md5").text = digest
+        etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+        mhl = tmp_path / "test.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, _, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0
+
+    def test_verify_nfd_manifest_path_wrong_hash_still_fails(self, mhl_cli, tmp_path):
+        """NFD normalisation must not suppress a genuine hash mismatch.
+
+        Regression guard: the normalisation step must not interfere with the
+        hash check. A correct NFC path resolution followed by a wrong digest
+        must still exit 40.
+        """
+        nfc_path = tmp_path / self._NFC_NAME
+        nfc_path.write_bytes(b"original")
+
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = self._NFD_NAME
+        etree.SubElement(h, "size").text = str(len(b"original"))
+        etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+        etree.SubElement(h, "md5").text = "0" * 32  # wrong digest
+        etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+        mhl = tmp_path / "test.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+
+        assert rc == 40
         assert "hash mismatch" in out.lower()
