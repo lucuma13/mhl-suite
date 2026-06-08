@@ -1662,20 +1662,29 @@ class TestUnicodeNormalisation:
     def test_seal_writes_nfc_for_nfd_filesystem_path(self, mhl_cli, tmp_path, monkeypatch):
         """seal() must write NFC <file> entries even when the filesystem returns NFD paths.
 
-        We monkeypatch _iter_files_for_seal to yield a path whose string
-        representation is NFD, simulating what macOS HFS+/APFS returns.
-        The manifest must contain the NFC form so it is portable to Linux.
+        We write the file under its NFD name (so get_hash can open it on any OS,
+        since the path we hand to seal must actually exist on disk) and patch
+        _iter_files_for_seal to yield that NFD path — simulating what macOS
+        HFS+/APFS returns from rglob.  The manifest must contain the NFC form.
+
+        On macOS, HFS+/APFS treats NFC and NFD as the same file, so both names
+        resolve to the same inode.  On Linux ext4, filenames are byte-exact, so
+        we must create the file with the NFD name to allow get_hash to open it.
+        Either way, the assertion is the same: the manifest entry must be NFC.
         """
 
-        nfc_path = tmp_path / self._NFC_NAME
-        nfc_path.write_bytes(b"data")
+        # Create the file with the NFD name — openable on all platforms.
+        nfd_path = tmp_path / self._NFD_NAME
+        nfd_path.write_bytes(b"data")
 
         real_iter = simple_mhl._iter_files_for_seal
 
         def nfd_iter(root, mhl_path):
             for p, stat_result in real_iter(root, mhl_path):
-                # Yield a (Path, stat_result) tuple whose path is the NFD form,
-                # simulating what macOS HFS+/APFS returns from the filesystem.
+                # Yield the path as-is; real_iter already found the NFD file.
+                # Normalise to NFD explicitly in case the OS returned NFC
+                # (e.g. on a case-insensitive macOS volume that normalises on
+                # readback), ensuring the test exercises the NFC fix on all OSes.
                 nfd_str = unicodedata.normalize("NFD", str(p))
                 yield Path(nfd_str), stat_result
 
@@ -1684,15 +1693,16 @@ class TestUnicodeNormalisation:
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
 
-        text = next(tmp_path.glob("*.mhl")).read_text(encoding="utf-8")
-        # The <file> element must contain the NFC form.
+        mhl = next(tmp_path.glob("*.mhl"))
+        text = mhl.read_text(encoding="utf-8")
+        # The <file> element must contain the NFC form regardless of what was
+        # on disk or what the iterator yielded.
         assert self._NFC_NAME in text, (
-            f"Expected NFC name {self._NFC_NAME!r} in manifest, "
-            f"got NFD or other form. Manifest snippet: {text[text.find('<file>') : text.find('</file>') + 7]!r}"
+            f"Expected NFC name {self._NFC_NAME!r} in manifest. "
+            f"Manifest snippet: {text[text.find('<file>') : text.find('</file>') + 7]!r}"
         )
-        # The NFD form must NOT appear as raw bytes in the manifest.
-        raw = next(tmp_path.glob("*.mhl")).read_bytes()
-        assert self._NFD_NAME.encode("utf-8") not in raw, (
+        # The NFD byte sequence must not appear in the raw manifest bytes.
+        assert self._NFD_NAME.encode("utf-8") not in mhl.read_bytes(), (
             "NFD byte sequence found in manifest — NFC normalisation did not fire"
         )
 
