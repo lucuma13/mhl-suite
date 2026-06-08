@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0">
+  <creatorinfo>
+    <creationdate>2026-06-07T19:21:48+01:00</creationdate>
+    <hostname>Hostname.local</hostname>
+    <tool version="0.9.2">o/COPY</tool>
+    <author>Author</author>
+  </creatorinfo>
+  <processinfo>
+    <process>in-place</process>
+    <ignore>
+      <pattern>.DS_Store</pattern>
+      <pattern>ascmhl</pattern>
+      <pattern>ascmhl/</pattern>
+      <pattern>.DocumentRevisions-V100</pattern>
+      <pattern>.SD_PROJECT</pattern>
+      <pattern>.Spotlight</pattern>
+      <pattern>.Spotlight-V100</pattern>
+      <pattern>.TemporaryItems</pattern>
+      <pattern>.Trashes</pattern>
+      <pattern>.VolumeIcon.icns</pattern>
+      <pattern>._.TemporaryItems</pattern>
+      <pattern>._.Trashes</pattern>
+      <pattern>.com.apple.timemachine.donotpresent</pattern>
+      <pattern>.fseventsd</pattern>
+      <pattern>.ocopy-checkpoint</pattern>
+      <pattern>Backups.backupdb</pattern>
+      <pattern>SDINFO.TXT</pattern>
+      <pattern>SONYCARD.IND</pattern>
+      <pattern>System Volume Information</pattern>
+    </ignore>
+  </processinfo>
+  <hashes>
+    <hash>
+      <path size="436085"
+            lastmodificationdate="2026-01-01T00:00:00+00:00"
+      >aaaaaaaa-0000-0000-0000-aaaaaaaaaaaa.JPG</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00.000001+00:00">e8142245c45a9730</xxh64>
+    </hash>
+    <hash>
+      <path size="2775033" lastmodificationdate="2026-01-01T00:00:00+00:00">A001.HEIC</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00.000002+00:00">cbb243888a8034de</xxh64>
+    </hash>
+    <hash>
+      <path size="161713671" lastmodificationdate="2026-01-01T00:00:00+00:00">A002.MOV</path>
+      <xxh64 action="original" hashdate="2026-01-01T00:00:00.000003+00:00">fe53d4b59c94d282</xxh64>
+    </hash>
+    <directoryhash>
+      <path lastmodificationdate="2026-01-01T00:00:00+00:00">subfolder</path>
+      <content/>
+      <structure/>
+    </directoryhash>
+  </hashes>
+</hashlist>

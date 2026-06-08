@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hashlist version="1.1">
+
+  <creatorinfo>
+    <name>Name</name>
+    <username>Username</username>
+<hostname>Hostname</hostname>
+    <tool>mhl ver. 0.2.0</tool>
+    <startdate>2026-06-08T19:20:47Z</startdate>
+    <finishdate>2026-06-08T19:20:47Z</finishdate>
+  </creatorinfo>
+
+  <hash>
+    <file>Card/Clip/A001/A001C001.mxf</file>
+    <size>2246896176</size>
+    <lastmodificationdate>2026-06-08T19:20:24Z</lastmodificationdate>
+    <xxhash64be>d4b2ab4a3e2619c6</xxhash64be>
+    <hashdate>2026-06-08T19:20:47Z</hashdate>
+  </hash>
+
+  <hash>
+    <file>Card/Clip/A001/A001C001M01.xml</file>
+    <size>4170</size>
+    <lastmodificationdate>2026-06-08T19:20:24Z</lastmodificationdate>
+    <xxhash64be>e292aa48da83f894</xxhash64be>
+    <hashdate>2026-06-08T19:20:47Z</hashdate>
+  </hash>
+
+  <hash>
+    <file>Card/Clip/A002/A002C001.mxf</file>
+    <size>15758019120</size>
+    <lastmodificationdate>2026-06-08T19:20:24Z</lastmodificationdate>
+    <xxhash64be>e543afeac2f1b7f1</xxhash64be>
+    <hashdate>2026-06-08T19:20:47Z</hashdate>
+  </hash>
+
+</hashlist>

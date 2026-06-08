@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0">
+  <creatorinfo>
+    <creationdate>2026-06-07T02:32:02-07:00</creationdate>
+    <hostname>Hostname.local</hostname>
+    <tool version="9.2.3">Pomfort Silverstack Lab</tool>
+    <author role="User Account">Author</author>
+    <author role="DIT">Author</author>
+    <comment>backup of [/Volumes/A001/] to /Volumes/DRIVE01/ (simultaneous backup to /Volumes/DRIVE02/)</comment>
+  </creatorinfo>
+  <processinfo>
+    <process>transfer</process>
+    <ignore>
+      <pattern>.DS_Store</pattern>
+      <pattern>ascmhl</pattern>
+      <pattern>ascmhl/</pattern>
+      <pattern>*.app</pattern>
+      <pattern>*.background</pattern>
+      <pattern>*.hotfiles.btree</pattern>
+      <pattern>*.localized</pattern>
+      <pattern>*.pfncopy</pattern>
+      <pattern>.DocumentRevisions-V100</pattern>
+      <pattern>.MobileBackups</pattern>
+      <pattern>.Spotlight-V100</pattern>
+      <pattern>.TemporaryItems</pattern>
+      <pattern>.Trashes</pattern>
+      <pattern>.VolumeIcon.icns</pattern>
+      <pattern>.apdisk</pattern>
+      <pattern>.fseventsd</pattern>
+    </ignore>
+  </processinfo>
+  <hashes>
+    <hash>
+      <path lastmodificationdate="2026-06-07T02:18:26-07:00">Card/Clip/A001/A001C001.mxf</path>
+      <xxh64  size="2246896176" action="original" hashdate="2026-06-07T02:32:02.169057-07:00">d4b2ab4a3e2619c6</xxh64>
+    </hash>
+    <hash>
+      <path size="4170" lastmodificationdate="2026-06-07T02:18:26-07:00">Card/Clip/A001/A001C001M01.xml</path>
+      <xxh64 action="original" hashdate="2026-06-07T02:32:02.169172-07:00">e292aa48da83f894</xxh64>
+    </hash>
+    <hash>
+      <path size="15758019120" lastmodificationdate="2026-06-07T02:18:26-07:00">Card/Clip/A002/A002C001.mxf</path>
+      <xxh64 action="original" hashdate="2026-06-07T02:32:02.169227-07:00">e543afeac2f1b7f1</xxh64>
+    </hash>
+  </hashes>
+</hashlist>

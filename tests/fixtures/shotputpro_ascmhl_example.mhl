@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0">
+    <creatorinfo>
+        <creationdate>2026-06-07T19:05:13+01:00</creationdate>
+        <hostname>ComputerName</hostname>
+        <tool version="2026.2.4">ShotPutPro</tool>
+    </creatorinfo>
+    <processinfo>
+        <process>transfer</process>
+        <roothash>
+            <content>
+                <xxh64 hashdate="2026-06-07T19:05:13+01:00">372f07f55b3c532e</xxh64>
+            </content>
+            <structure>
+                <xxh64 hashdate="2026-06-07T19:05:13+01:00">8fd5f69c2988a882</xxh64>
+            </structure>
+        </roothash>
+        <ignore>
+            <pattern>ascmhl</pattern>
+            <pattern>ascmhl/</pattern>
+        </ignore>
+    </processinfo>
+    <hashes>
+        <hash>
+            <path size="2246896176" lastmodificationdate="2026-01-01T00:00:00Z">Card/Clip/A001/A001C001.mxf</path>
+            <xxh64 action="original" hashdate="2026-06-07T19:05:13+01:00">d4b2ab4a3e2619c6</xxh64>
+        </hash>
+        <hash>
+            <path size="4170" lastmodificationdate="2026-01-01T00:00:00Z">Card/Clip/A001/A001C001M01.xml</path>
+            <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">fb5ba52fd1791f62</xxh64>
+        </hash>
+        <directoryhash>
+            <path lastmodificationdate="2026-01-01T00:00:00Z">Card/Clip/A001</path>
+            <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">3995de7ad212a6f6</xxh64></content>
+        </directoryhash>
+        <hash>
+            <path size="15758019120" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A002/A002C001.mxf</path>
+            <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">958a6c5a73c506bf</xxh64>
+        </hash>
+        <hash>
+            <path size="4172" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A002/A002C001M01.xml</path>
+            <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">cde877e7e0079f3d</xxh64>
+        </hash>
+        <directoryhash>
+            <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A002</path>
+            <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">92ff6973ff1159b6</xxh64></content>
+        </directoryhash>
+        <directoryhash>
+            <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card</path>
+            <content><xxh64 hashdate="2026-01-01T00:00:00+00:00">bf9d9533d19dc938</xxh64></content>
+        </directoryhash>
+    </hashes>
+</hashlist>
