@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 permissions: {} # deny all by default; each job grants only what it needs
 jobs:
-  # JOB 0: Run the full CI suite (lint + audit + test matrix) as a safety gate
+  # JOB 0: Run the full CI suite as a safety gate
   ci:
     name: CI
     uses: ./.github/workflows/ci.yml
