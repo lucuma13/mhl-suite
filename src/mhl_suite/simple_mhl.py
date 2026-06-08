@@ -24,6 +24,7 @@ import importlib.resources
 import os
 import platform
 import sys
+import unicodedata
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -325,6 +326,13 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
         # Windows, os.path.relpath returns backslashes; replace them so the
         # manifest is portable between operating systems.
         rel_path_posix = rel_path.replace(os.sep, "/") if os.sep != "/" else rel_path
+        # Normalise to NFC so accented filenames are stored as precomposed
+        # codepoints (e.g. é = U+00E9) rather than the NFD decomposed form
+        # (e = U+0065 + combining acute U+0301) that macOS HFS+/APFS returns
+        # from the filesystem. A consistent NFC manifest round-trips correctly
+        # on Linux (byte-exact path matching) and Windows, both of which use
+        # NFC natively.
+        rel_path_posix = unicodedata.normalize("NFC", rel_path_posix)
 
         h = etree.SubElement(doc, "hash")
         etree.SubElement(h, "file").text = rel_path_posix
@@ -473,6 +481,14 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
             rel_path = file_el.text
             if os.sep != "/":
                 rel_path = rel_path.replace("/", os.sep)
+            # Normalise to NFC before constructing the candidate path.
+            # Manifests sealed on macOS by older tools (or any tool that writes
+            # what the filesystem returns verbatim) may contain NFD paths.
+            # Linux ext4 does byte-exact filename matching, so NFD in the
+            # manifest would silently fail to find NFC files on disk.
+            # Normalising here makes verify correct regardless of which OS
+            # produced the manifest.
+            rel_path = unicodedata.normalize("NFC", rel_path)
 
             # --- Path traversal guard -----------------------------------
             # Collapse '..' and '.' via normpath, then check the result is
