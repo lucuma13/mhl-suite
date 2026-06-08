@@ -13,6 +13,8 @@ jobs:
   ci:
     name: CI
     uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
   # JOB 1: Read project metadata from pyproject.toml
   read-metadata:
     name: Read pyproject.toml metadata
