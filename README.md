@@ -1,8 +1,7 @@
 # mhl-suite
 
 [![PyPI Version](https://img.shields.io/pypi/v/mhl-suite.svg)](https://pypi.org/project/mhl-suite/)
-![Operating Systems](https://img.shields.io/pypi/os_platform/mhl-suite.svg)
-![Python Versions](https://img.shields.io/pypi/pyversions/mhl-suite.svg)
+![OS](https://img.shields.io/badge/OS-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![ty](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ty/main/assets/badge/v0.json)](https://github.com/astral-sh/ty)
 [![CI](https://github.com/lucuma13/mhl-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/lucuma13/mhl-suite/actions/workflows/ci.yml)
