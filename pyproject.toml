@@ -61,7 +61,7 @@ managed = true
 [tool.ruff]
 line-length = 120
 src = [ "src", "tests" ]
-lint.select = [ "ANN", "B", "BLE", "C4", "C90", "E", "F", "I", "PL", "PT", "RUF", "SIM", "UP", "W" ]
+lint.select = [ "ANN", "B", "BLE", "C", "E", "F", "FURB", "I", "PL", "PT", "RUF", "SIM", "UP", "W" ]
 lint.ignore = [
   "PLR0912", # too many branches — independent dispatch arms, not nested complexity
   "PLR0913", # too many arguments — internal pipeline functions, dataclass would add noise
