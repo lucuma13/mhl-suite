@@ -1,5 +1,13 @@
 # mhl-suite
 
+[![PyPI Version](https://img.shields.io/pypi/v/mhl-suite.svg)](https://pypi.org/project/mhl-suite/)
+![Operating Systems](https://img.shields.io/pypi/os_platform/mhl-suite.svg)
+![Python Versions](https://img.shields.io/pypi/pyversions/mhl-suite.svg)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![ty](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ty/main/assets/badge/v0.json)](https://github.com/astral-sh/ty)
+[![CI](https://github.com/lucuma13/mhl-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/lucuma13/mhl-suite/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/github/lucuma13/mhl-suite/graph/badge.svg?token=X6Z7IRDZ6U)](https://codecov.io/github/lucuma13/mhl-suite)
+
 `mhl-suite` is a toolkit for sealing and verifying MHL files. It consists of two primary executables:
 
 * `mhlver`: one tool to verify them all. A wrapper that verifies MHLs recursively in a directory, with optional XSD schema validation and reporting. It delegates to `simple-mhl` for legacy flat MHLs and to [ascmhl](https://github.com/ascmitc/mhl) for ASC-MHL.
