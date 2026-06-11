@@ -44,17 +44,13 @@ dev = [
 
 [tool.hatch]
 build.targets.wheel.packages = [ "src/mhl_suite" ]
-build.targets.sdist.include = [
-  "src/mhl_suite/",
-  "tests/",
-]
+build.targets.sdist.include = [ "src/mhl_suite/", "tests/" ]
 
 [tool.uv]
 managed = true
 
 [tool.ruff]
 line-length = 120
-src = [ "src", "tests" ]
 lint.select = [ "ANN", "B", "BLE", "C", "E", "F", "FURB", "I", "PL", "PT", "RUF", "SIM", "UP", "W" ]
 lint.ignore = [
   "PLR0912", # too many branches — independent dispatch arms, not nested complexity
@@ -67,10 +63,5 @@ lint.per-file-ignores."tests/*.py" = [
   "PLR2004", # exact values in assertions are the point
 ]
 
-[tool.ty]
-src.include = [ "src", "tests" ]
-
 [tool.pytest]
-ini_options.testpaths = [ "tests" ]
-ini_options.pythonpath = [ "src" ]
-ini_options.addopts = "--strict-markers --cov=src --cov-branch --cov-report=xml"
+ini_options.addopts = "--strict-markers --cov=src --cov-branch --cov-report=term-missing --cov-report=xml"
