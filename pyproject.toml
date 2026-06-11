@@ -32,20 +32,14 @@ scripts.simple-mhl = "mhl_suite.simple_mhl:main"
 
 [dependency-groups]
 dev = [
-  "check-jsonschema",
   "hypothesis",
   "lxml-stubs",
   "pre-commit",
-  "pyproject-fmt",
   "pytest",
   "pytest-cov",
   "ruff",
   "taplo",
   "ty",
-  "typos",
-  "validate-pyproject",
-  "yamllint",
-  "zizmor"
 ]
 
 [tool.hatch]
