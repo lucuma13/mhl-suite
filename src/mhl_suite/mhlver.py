@@ -36,11 +36,7 @@ from typing import Any, TextIO
 from lxml import etree
 from rich.console import Console, Group
 from rich.live import Live
-from rich.progress import (
-    BarColumn,
-    Progress,
-    TextColumn,
-)
+from rich.progress import BarColumn, Progress, TextColumn
 from rich.text import Text
 
 # -----------------------------------------------------------------------------
