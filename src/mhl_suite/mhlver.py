@@ -20,7 +20,6 @@
 # =============================================================================
 
 import argparse
-import contextlib
 import importlib.metadata
 import shutil
 import subprocess
@@ -31,7 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Protocol, TextIO
 
 from lxml import etree
 from rich.console import Console, Group
@@ -161,10 +160,23 @@ class StepResult:
     output: str  # stdout + stderr combined and stripped
 
 
+class _PollEvent(Protocol):
+    """Structural type for the on_poll argument accepted by _run_step.
+
+    Only set() is called by the ticker thread, so any object that provides
+    it satisfies the contract — threading.Event, a counting shim in tests,
+    or any other compatible type.  Using a Protocol rather than the concrete
+    threading.Event keeps the annotation honest and lets test doubles pass
+    the type-checker without a cast.
+    """
+
+    def set(self) -> None: ...
+
+
 def _run_step(
     cmd: list[str],
     cwd: Path | None = None,
-    on_poll: "threading.Event | None" = None,
+    on_poll: "_PollEvent | None" = None,
 ) -> StepResult:
     """
     Run `cmd` and return its exit code plus combined stdout+stderr.
@@ -177,9 +189,21 @@ def _run_step(
     files via relative paths. For simple-mhl we pass cwd=None since it
     locates its XSD via importlib.resources.
 
-    `on_poll` is a threading.Event that is set() each time the polling loop
-    ticks (every ~100 ms) while the subprocess is running. The progress bar
-    uses this to animate without blocking the main thread on subprocess.run().
+    `on_poll` is any object satisfying _PollEvent (typically a threading.Event)
+    that is set() each time the ticker thread fires (every ~100 ms) while the
+    subprocess is running. The progress bar uses this to animate.
+
+    IMPORTANT — why we do NOT poll+wait before calling communicate():
+    Popen with stdout=PIPE and stderr=PIPE gives the child two kernel pipe
+    buffers (default 64 KB each on macOS/Linux). If the child writes more
+    than that before the parent reads, the child blocks on its next write()
+    and can never exit — while the parent's poll loop spins forever waiting
+    for the child to exit. Classic deadlock.
+
+    communicate() avoids this by draining both pipes concurrently with
+    internal reader threads. We therefore call it immediately and drive
+    on_poll ticks from a separate lightweight timer thread so the progress
+    bar continues animating without touching the pipe-draining path.
     """
     proc = subprocess.Popen(
         cmd,
@@ -188,12 +212,31 @@ def _run_step(
         stderr=subprocess.PIPE,
         text=True,
     )
-    while proc.poll() is None:
-        if on_poll is not None:
-            on_poll.set()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=0.1)  # still running if it raises — expected
-    stdout, stderr = proc.communicate()
+
+    # Fire on_poll ticks from a background thread so the main thread can sit
+    # in communicate() uninterrupted. The stop flag is a threading.Event
+    # rather than a plain bool so the ticker sleeps efficiently (wait() with
+    # a timeout) instead of busy-looping with time.sleep().
+    stop_ticking = threading.Event()
+
+    def _ticker() -> None:
+        while not stop_ticking.is_set():
+            if on_poll is not None:
+                on_poll.set()
+            stop_ticking.wait(timeout=0.1)
+
+    ticker_thread: threading.Thread | None = None
+    if on_poll is not None:
+        ticker_thread = threading.Thread(target=_ticker, daemon=True)
+        ticker_thread.start()
+
+    try:
+        stdout, stderr = proc.communicate()
+    finally:
+        stop_ticking.set()
+        if ticker_thread is not None:
+            ticker_thread.join()
+
     combined = ((stdout or "") + (stderr or "")).strip()
     return StepResult(exit_code=proc.returncode, output=combined)
 
@@ -459,6 +502,7 @@ def verify_item(
             report_file,
             console=console,
             progress_active=progress_active,
+            poll_event=poll_event,
         )
     return _verify_legacy(
         target,
@@ -467,6 +511,7 @@ def verify_item(
         report_file,
         console=console,
         progress_active=progress_active,
+        poll_event=poll_event,
     )
 
 
@@ -502,7 +547,7 @@ def _verify_legacy(
         cmd.append("-v")
     _verbose_announce(cmd, cwd=None, verbose=verbose, report_file=report_file, console=console)
 
-    step = _run_step(cmd, on_poll=poll_event)
+    step = _run_step(cmd, on_poll=poll_event)  # poll_event drives progress-bar animation
 
     # simple-mhl is a tool we control. Its per-file output uses structured
     # `ERROR: <category>: <path>` and `OK: <path>` prefixes that stand
@@ -557,6 +602,7 @@ def _verify_ascmhl(
             report_file,
             console=console,
             progress_active=progress_active,
+            poll_event=poll_event,
         )
     return _ascmhl_verify(
         target,
@@ -566,6 +612,7 @@ def _verify_ascmhl(
         report_file,
         console=console,
         progress_active=progress_active,
+        poll_event=poll_event,
     )
 
 

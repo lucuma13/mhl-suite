@@ -1557,6 +1557,85 @@ class TestRunStep:
         )
         assert result.exit_code == 0
 
+    def test_large_stderr_output_does_not_deadlock(self):
+        """_run_step must not deadlock when the child writes > 64 KB to stderr.
+
+        The kernel pipe buffer is 64 KB on macOS/Linux. The old implementation
+        called proc.wait() in a loop before proc.communicate(), so the child
+        would block on its first write() that exceeded the buffer cap and the
+        parent would spin forever waiting for it to exit — a classic deadlock.
+
+        The fix calls proc.communicate() immediately (which drains both pipes
+        via internal reader threads) and drives on_poll ticks from a separate
+        ticker thread. This test encodes that contract: if the deadlock ever
+        regresses, the test will hang and pytest-timeout will report a failure
+        rather than letting the suite stall silently, which mirrors exactly
+        how `mhlver --report --verbose` stalled before the fix.
+
+        128 KB is chosen as double the pipe buffer so the test catches any
+        single-stream overflow regardless of platform-specific buffer sizes.
+        """
+        # Write 128 KB to stderr — well past the 64 KB pipe-buffer ceiling.
+        large_stderr_script = "import sys; sys.stderr.write('x' * 128 * 1024); sys.stderr.flush()"
+        result = mhlver._run_step(
+            cmd=["python3", "-c", large_stderr_script],
+            cwd=None,
+            on_poll=None,
+        )
+        # The subprocess exits cleanly; we just need it to finish at all.
+        assert result.exit_code == 0
+        # communicate() merges stdout+stderr into result.output, so the 'x'
+        # flood must appear there and must be at least 128 KB in total.
+        assert len(result.output) >= 128 * 1024
+
+    def test_on_poll_ticker_fires_multiple_times(self):
+        """The _ticker thread inside _run_step must call on_poll.set() on every
+        iteration of its loop, not just once.
+
+        This directly exercises the branch at lines 211-213:
+
+            def _ticker() -> None:
+                while not stop_ticking.is_set():
+                    if on_poll is not None:   # <- line 211
+                        on_poll.set()         # <- line 212 (the branch under test)
+                    stop_ticking.wait(timeout=0.1)
+
+        We replace the threading.Event with a counting shim so we can observe
+        how many times set() is called. The subprocess sleeps for 0.4 s;
+        with a 100 ms ticker interval that is at least 3 ticks. We assert >= 2
+        to give one tick of headroom for scheduling jitter on slow CI hosts.
+        """
+
+        class _CountingEvent:
+            """Drop-in threading.Event replacement that counts set() calls."""
+
+            def __init__(self):
+                self._real = threading.Event()
+                self.set_count = 0
+
+            def set(self):
+                self.set_count += 1
+                self._real.set()
+
+            def is_set(self):
+                return self._real.is_set()
+
+            def wait(self, timeout=None):
+                return self._real.wait(timeout=timeout)
+
+        counter = _CountingEvent()
+        result = mhlver._run_step(
+            cmd=["python3", "-c", "import time; time.sleep(0.4)"],
+            cwd=None,
+            on_poll=counter,
+        )
+        assert result.exit_code == 0
+        assert counter.set_count >= 2, (
+            f"Expected _ticker to fire on_poll.set() at least twice in 0.4 s "
+            f"(100 ms interval), but it fired {counter.set_count} time(s). "
+            "The 'if on_poll is not None: on_poll.set()' branch may not be looping."
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestRunWithProgress
