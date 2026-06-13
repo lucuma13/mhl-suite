@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# simple-mhl — Modern verification and sealing tool for legacy MHL (1.x) files
+# simple-mhl — Modern verification and sealing tool for classic MHL (1.x) files
 # =============================================================================
 # This is a focused rewrite of the original simple-mhl tool. It produces and
 # verifies MediaHashList v1.1 XML manifests for film/TV media offloads.
@@ -32,6 +32,11 @@ from typing import Protocol, cast, runtime_checkable
 
 import xxhash
 from lxml import etree
+
+from mhl_suite._internal.unicodepaths import (
+    normalization_variant_on_disk,
+    resolve_on_disk,
+)
 
 # -----------------------------------------------------------------------------
 # Version
@@ -89,8 +94,9 @@ ALGO_MAP: dict[str, tuple[Callable[[], _Hasher], str]] = cast(
 
 # Tags recognised when reading a manifest — superset of the algorithms we can
 # *write*. We can verify an old manifest that uses xxhash128 or xxhash3_64
-# even if we don't offer those for sealing. "null" means "presence-only check"
-# (the file is listed but no digest is recorded).
+# even if we don't offer those for sealing. "null" records no digest, so
+# verification falls back to existence + file-size check (per the v1.1 schema:
+# <null> means "no hash, only use file size verification").
 SUPPORTED_HASH_TAGS = frozenset(ALGO_MAP) | {"xxhash128", "xxhash3_64", "null"}
 
 
@@ -162,7 +168,11 @@ def get_hash(filepath: str, algo_key: str) -> str:
 # -----------------------------------------------------------------------------
 
 
-def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.stat_result]]:
+def _iter_files_for_seal(  # noqa: C901 — flat walk with several independent skip cases
+    root: str,
+    mhl_path: str,
+    on_skip: "Callable[[str, str, bool], None] | None" = None,
+) -> Iterator[tuple[str, os.stat_result]]:
     """
     Walk `root` recursively and yield (absolute_path, stat_result) for every
     file that should appear in the manifest, in deterministic sorted order.
@@ -171,6 +181,11 @@ def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.sta
       - hidden files and directories (names starting with '.')
       - the manifest file itself (so we don't hash what we're writing)
       - entries that disappear or stat-fail mid-walk
+
+    `on_skip`, if given, is called as on_skip(path, reason, is_warning) for each
+    skipped entry (except the manifest itself). is_warning is True for an
+    unreadable directory — a silently-dropped directory means media missing
+    from the manifest, so the caller surfaces it regardless of verbosity.
 
     Implementation note: we use os.scandir rather than os.walk because
     DirEntry caches the stat() info from getdents64, saving a syscall per
@@ -193,9 +208,12 @@ def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.sta
             # scandir returns DirEntry objects whose .stat() is satisfied
             # from the readdir cache (no extra syscall) on most filesystems.
             entries = list(os.scandir(current))
-        except OSError:
-            # Permission or vanished-directory; skip it silently to mirror
-            # os.walk's onerror=None behaviour.
+        except OSError as exc:
+            # Permission or vanished-directory. Unlike os.walk's silent
+            # onerror=None, we report it: a dropped directory means its files
+            # are absent from the manifest and therefore unprotected.
+            if on_skip is not None:
+                on_skip(current, f"unreadable: {exc.strerror or exc}", True)
             continue
 
         # Sort by name within the directory for deterministic output order.
@@ -207,12 +225,16 @@ def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.sta
         subdirs: list[str] = []
         for entry in entries:
             if entry.name.startswith("."):
+                if on_skip is not None:
+                    on_skip(entry.path, "hidden", False)
                 continue
             try:
                 if entry.is_dir(follow_symlinks=False):
                     subdirs.append(entry.path)
                     continue
                 if not entry.is_file(follow_symlinks=False):
+                    if on_skip is not None:
+                        on_skip(entry.path, "not a regular file", False)
                     continue
                 # Skip the manifest we're currently writing.
                 if entry.path == mhl_path:
@@ -220,6 +242,8 @@ def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.sta
                 yield entry.path, entry.stat(follow_symlinks=False)
             except OSError:
                 # File vanished between scandir and stat — skip it.
+                if on_skip is not None:
+                    on_skip(entry.path, "vanished", False)
                 continue
 
         # Push subdirs in reverse so popping gives lexicographic order.
@@ -245,7 +269,7 @@ def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree
     return info
 
 
-def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
+def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) -> None:  # noqa: C901
     """
     Walk `root`, hash every non-hidden file, and write a dated MHL manifest
     at the root of the directory.
@@ -268,7 +292,11 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
 
     root = os.path.abspath(root)
     if not os.path.isdir(root):
-        sys.stderr.write(f"Error: '{root}' is not a directory\n")
+        msg = f"Error: '{root}' is not a directory\n"
+        variant = normalization_variant_on_disk(root)
+        if variant is not None and os.path.isdir(variant):
+            msg += f"  A directory with a different Unicode normalization exists — did you mean:\n    {variant}\n"
+        sys.stderr.write(msg)
         sys.exit(2)
 
     base_name = os.path.basename(root)
@@ -319,8 +347,17 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
 
     xml_tag = ALGO_MAP[algorithm][1]
 
+    def _on_skip(path: str, reason: str, is_warning: bool) -> None:
+        rel = os.path.relpath(path, root)
+        rel_posix = rel.replace(os.sep, "/") if os.sep != "/" else rel
+        if is_warning:
+            # Always shown: a dropped directory leaves files unprotected.
+            sys.stderr.write(f"[WARNING] skipped: {rel_posix} ({reason})\n")
+        elif verbose:
+            print(f"[SKIP] {rel_posix} ({reason})")
+
     # Walk and hash.
-    for filepath, stat_result in _iter_files_for_seal(root, mhl_path):
+    for filepath, stat_result in _iter_files_for_seal(root, mhl_path, on_skip=_on_skip):
         rel_path = os.path.relpath(filepath, root)
         # The MHL spec requires forward slashes regardless of platform. On
         # Windows, os.path.relpath returns backslashes; replace them so the
@@ -339,7 +376,10 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
         etree.SubElement(h, "size").text = str(stat_result.st_size)
         mtime = datetime.fromtimestamp(stat_result.st_mtime, UTC)
         etree.SubElement(h, "lastmodificationdate").text = mtime.strftime("%Y-%m-%dT%H:%M:%SZ")
-        etree.SubElement(h, xml_tag).text = get_hash(filepath, algorithm)
+        digest = get_hash(filepath, algorithm)
+        if verbose:
+            print(f"[OK] {rel_path_posix}  {xml_tag}: {digest}")
+        etree.SubElement(h, xml_tag).text = digest
         etree.SubElement(h, "hashdate").text = iso_now
 
     # Update finishdate to reflect actual completion; useful for auditing
@@ -354,6 +394,9 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
     # we never re-open the file by path (which would be another race window).
     with os.fdopen(fd, "wb") as fh:
         etree.ElementTree(doc).write(fh, xml_declaration=True, encoding="UTF-8", pretty_print=True)
+
+    if verbose:
+        print(f"Created MHL: {mhl_path}")
 
 
 # -----------------------------------------------------------------------------
@@ -387,7 +430,12 @@ def _validate_mhl_path(mhl_file: str) -> None:
       - path lacks a .mhl extension
     """
     if not os.path.exists(mhl_file):
-        sys.stderr.write(f"Verification Error: {mhl_file} not found\n")
+        msg = f"Verification Error: {mhl_file} not found\n"
+        variant = normalization_variant_on_disk(mhl_file)
+        if variant is not None:
+            shown = variant if os.path.isabs(mhl_file) else os.path.relpath(variant)
+            msg += f"  A path with a different Unicode normalization exists — did you mean:\n    {shown}\n"
+        sys.stderr.write(msg)
         sys.exit(1)
     if os.path.isdir(mhl_file):
         if os.path.basename(os.path.normpath(mhl_file)) == "ascmhl":
@@ -425,12 +473,12 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
       * Malformed XML exits 20 with no further output.
 
     Output format:
-      OK: <path>                                  (verbose only, success)
-      ERROR: hash mismatch: <path>                (verify failure)
-      ERROR: missing file: <path>                 (file not on disk)
-      ERROR: blocked traversal attempt: <path>    (security)
-      ERROR: no supported hash found: <path>      (manifest malformed)
-      ERROR: cannot verify <path>: <reason>       (algorithm not available)
+      [OK] <path>                                  (verbose only, success)
+      [ERROR] hash mismatch: <path>                (verify failure)
+      [ERROR] missing file: <path>                 (file not on disk)
+      [ERROR] blocked traversal attempt: <path>    (security)
+      [ERROR] no supported hash found: <path>      (manifest malformed)
+      [ERROR] cannot verify <path>: <reason>       (algorithm not available)
 
     Exit codes:
        0 = clean
@@ -455,6 +503,10 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
     # so the final output loop can be a simple iteration.
     missing: list[str] = []
     mismatches: list[str] = []
+
+    # Per-call cache of directory listings ({dir: {NFC(name): real_name}}),
+    # populated lazily by resolve_on_disk when a literal path lookup misses.
+    dir_index: dict[str, dict[str, str]] = {}
 
     # iterparse yields each <hash> element as soon as its closing tag is
     # read, then we immediately free it — keeping peak memory proportional
@@ -481,23 +533,31 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
             rel_path = file_el.text
             if os.sep != "/":
                 rel_path = rel_path.replace("/", os.sep)
-            # Normalise to NFC before constructing the candidate path.
-            # Manifests sealed on macOS by older tools (or any tool that writes
-            # what the filesystem returns verbatim) may contain NFD paths.
-            # Linux ext4 does byte-exact filename matching, so NFD in the
-            # manifest would silently fail to find NFC files on disk.
-            # Normalising here makes verify correct regardless of which OS
-            # produced the manifest.
-            rel_path = unicodedata.normalize("NFC", rel_path)
 
             # --- Path traversal guard -----------------------------------
             # Collapse '..' and '.' via normpath, then check the result is
             # inside mhl_dir. This blocks attacks where a malicious manifest
             # contains entries like "../../etc/passwd" — without the guard,
             # we'd happily read and report on files outside the offload tree.
-            candidate = os.path.normpath(os.path.join(mhl_dir, rel_path))
-            if candidate != mhl_dir and not candidate.startswith(mhl_dir_with_sep):
-                mismatches.append(f"ERROR: blocked traversal attempt: {rel_path}")
+            # Containment is a byte-structural property, independent of Unicode
+            # normalization, so we guard the literal path (no NFC coercion).
+            jailed = os.path.normpath(os.path.join(mhl_dir, rel_path))
+            if jailed != mhl_dir and not jailed.startswith(mhl_dir_with_sep):
+                mismatches.append(f"[ERROR] blocked traversal attempt: {rel_path}")
+                h.clear()
+                continue
+
+            # --- Resolve to the real on-disk path -----------------------
+            # Match the manifest path against actual directory entries across
+            # Unicode normalization forms, rather than synthesising an NFC path
+            # and assuming the filesystem will match it for us (only true on
+            # normalization-*insensitive* volumes like HFS+/APFS). Existence
+            # falls out of resolution: a None result means the file is genuinely
+            # absent. normpath above has already collapsed '..'/'.', so the
+            # relative path handed to the resolver is clean.
+            candidate = resolve_on_disk(mhl_dir, os.path.relpath(jailed, mhl_dir), dir_index)
+            if candidate is None:
+                missing.append(f"[ERROR] missing file: {rel_path}")
                 h.clear()
                 continue
 
@@ -513,27 +573,12 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
                     break
 
             if hash_node is None:
-                mismatches.append(f"ERROR: no supported hash found: {rel_path}")
+                mismatches.append(f"[ERROR] no supported hash found: {rel_path}")
                 h.clear()
                 continue
 
             tag = _localname(hash_node.tag)
             expected = (hash_node.text or "").strip()
-
-            # 'null' tag = manifest acknowledges the file's existence but
-            # records no digest. Verify reduces to a presence check.
-            if tag == "null":
-                if not os.path.exists(candidate):
-                    missing.append(f"ERROR: missing file: {rel_path}")
-                elif verbose:
-                    print(f"OK: {rel_path}")
-                h.clear()
-                continue
-
-            if not os.path.exists(candidate):
-                missing.append(f"ERROR: missing file: {rel_path}")
-                h.clear()
-                continue
 
             # --- File size pre-check ------------------------------------
             # Compare the manifest's <size> against the file on disk before
@@ -552,23 +597,39 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
             if size_el is not None and size_el.text is not None:
                 size_text = size_el.text.strip()
                 if not size_text.isdecimal():
-                    mismatches.append(f"ERROR: malformed size field: {rel_path}")
+                    mismatches.append(f"[ERROR] malformed size field: {rel_path}")
                     h.clear()
                     continue
                 try:
                     manifest_size = int(size_text)
                     actual_size = os.path.getsize(candidate)
                     if manifest_size != actual_size:
-                        mismatches.append(f"ERROR: size mismatch: {rel_path}")
+                        if verbose:
+                            mismatches.append(
+                                f"[ERROR] size mismatch: {rel_path}\n"
+                                f"        (calc size: {actual_size} | stored size: {manifest_size})"
+                            )
+                        else:
+                            mismatches.append(f"[ERROR] size mismatch: {rel_path}")
                         h.clear()
                         continue
                 except OSError:
-                    # File vanished between the existence check above and
-                    # getsize(); treat as missing to give a consistent
-                    # message rather than a bare OSError traceback.
-                    missing.append(f"ERROR: missing file: {rel_path}")
+                    # File vanished between resolution above and getsize();
+                    # treat as missing to give a consistent message rather
+                    # than a bare OSError traceback.
+                    missing.append(f"[ERROR] missing file: {rel_path}")
                     h.clear()
                     continue
+
+            # 'null' tag records no digest: per the v1.1 schema it means
+            # "no hash, only use file size verification". The existence and
+            # <size> checks above are therefore the whole verification — there
+            # is nothing to hash, so report OK and move on.
+            if tag == "null":
+                if verbose:
+                    print(f"[OK] {rel_path}")
+                h.clear()
+                continue
 
             # Tags we accept-on-read but cannot recompute (xxhash128, xxhash3_64)
             # raise ValueError inside get_hash; surface this as a mismatch
@@ -576,11 +637,11 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
             try:
                 calculated = get_hash(candidate, tag)
             except (ValueError, OSError) as e:
-                mismatches.append(f"ERROR: cannot verify {rel_path}: {e}")
+                mismatches.append(f"[ERROR] cannot verify {rel_path}: {e}")
                 h.clear()
                 continue
 
-            # Some legacy MHL files stored xxhash as a *decimal integer* rather
+            # Some classic MHL files stored xxhash as a *decimal integer* rather
             # than the modern big-endian hex. Detect that case and compare
             # numerically, otherwise compare hex case-insensitively (uppercase
             # hex appears in some third-party tool output).
@@ -590,9 +651,15 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
                 ok = calculated.lower() == expected.lower()
 
             if not ok:
-                mismatches.append(f"ERROR: hash mismatch: {rel_path}")
+                if verbose:
+                    mismatches.append(
+                        f"[ERROR] hash mismatch: {rel_path}\n"
+                        f"        (calc {tag}: {calculated} | stored {tag}: {expected})"
+                    )
+                else:
+                    mismatches.append(f"[ERROR] hash mismatch: {rel_path}")
             elif verbose:
-                print(f"OK: {rel_path}")
+                print(f"[OK] {rel_path}")
 
             # Free this element and all already-processed siblings. Each
             # cleared element becomes an empty shell with no children or
@@ -694,7 +761,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="simple-mhl",
-        description="Modern verification and sealing tool for legacy MHL files",
+        description="Modern verification and sealing tool for classic MHL files",
     )
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -718,7 +785,13 @@ def main() -> None:
         action="store_true",
         help="abort silently if an MHL with the same timestamp already exists",
     )
-    seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal))
+    seal_p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="print each file's hash as it is sealed, and skipped files",
+    )
+    seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal, a.verbose))
 
     # verify subcommand
     verify_p = subparsers.add_parser("verify", help="verify an MHL file")

@@ -75,13 +75,13 @@ def stub_run_step(monkeypatch, exit_code: int, output: str = ""):
 def call_verify(manifest):
     """Invoke _ascmhl_verify with sane defaults and return its exit code."""
 
-    return mhlver._ascmhl_verify(
+    rc, _mr = mhlver._ascmhl_verify(
         target=manifest,
         cmd_path="/fake/ascmhl-debug",
         cwd=None,
         verbose=False,
-        report_file=None,
     )
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +117,6 @@ class TestMhlver:
         selected = mhlver._select_mhl_files(tmp_path)
         # Expected: 1 from pkg1 ascmhl, 1 from pkg2 ascmhl, 1 loose = 3
         assert len(selected) == 3
-
-    def test_format_duration(self):
-        """Duration formatter renders correctly across magnitudes."""
-        assert mhlver._format_duration(0.5) == "0.5s"
-        assert mhlver._format_duration(45.7) == "45.7s"
-        assert mhlver._format_duration(125) == "2m 5s"
-        assert mhlver._format_duration(3725) == "1h 2m 5s"
 
     def test_dot_underscore_filter_applies_only_to_filename_not_parent_dir(self, tmp_path):
         """Files inside a directory named '._hidden' must NOT be excluded.
@@ -265,39 +258,39 @@ class TestSelectMhlFiles:
                 )
 
     @given(
-        legacy_names=strategies.lists(_filename_stem, min_size=1, max_size=6, unique=True),
+        mhl_names=strategies.lists(_filename_stem, min_size=1, max_size=6, unique=True),
     )
     @settings(max_examples=60, suppress_health_check=[HealthCheck.too_slow])
-    def test_loose_legacy_files_are_never_deduplicated_against_each_other(self, legacy_names):
+    def test_loose_mhl_files_are_never_deduplicated_against_each_other(self, mhl_names):
         """Each distinct loose .mhl file must appear exactly once in the output.
 
-        Legacy MHL files (not inside an ascmhl/ folder) each use their own
+        Classic MHL files (not inside an ascmhl/ folder) each use their own
         path as their deduplication key, so N distinct loose files must yield
         N results.
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for name in legacy_names:
+            for name in mhl_names:
                 (root / f"{name}.mhl").write_text("")
 
             selected = mhlver._select_mhl_files(root)
-            assert len(selected) == len(legacy_names), (
-                f"Expected {len(legacy_names)} loose files, got {len(selected)}: {[p.name for p in selected]}"
+            assert len(selected) == len(mhl_names), (
+                f"Expected {len(mhl_names)} loose files, got {len(selected)}: {[p.name for p in selected]}"
             )
 
     @given(
         pkg_names=strategies.lists(_filename_stem, min_size=1, max_size=3, unique=True),
-        legacy_names=strategies.lists(_filename_stem, min_size=1, max_size=3, unique=True),
+        mhl_names=strategies.lists(_filename_stem, min_size=1, max_size=3, unique=True),
         gen_counts=strategies.lists(_generations_per_pkg, min_size=1, max_size=3),
     )
     @settings(max_examples=60, suppress_health_check=[HealthCheck.too_slow])
-    def test_output_count_never_exceeds_input_count(self, pkg_names, legacy_names, gen_counts):
+    def test_output_count_never_exceeds_input_count(self, pkg_names, mhl_names, gen_counts):
         """Total selected files ≤ total .mhl files on disk.
 
         Deduplication can only reduce the count; it must never invent new
         files or duplicate existing ones.
         """
-        assume(not (set(pkg_names) & set(legacy_names)))
+        assume(not (set(pkg_names) & set(mhl_names)))
         counts = (gen_counts + [1] * len(pkg_names))[: len(pkg_names)]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -311,7 +304,7 @@ class TestSelectMhlFiles:
                     (ascdir / f"{i:04d}.mhl").write_text("")
                     total_files += 1
 
-            for name in legacy_names:
+            for name in mhl_names:
                 (root / f"{name}.mhl").write_text("")
                 total_files += 1
 
@@ -380,11 +373,11 @@ class TestSelectMhlFiles:
 
 
 # ---------------------------------------------------------------------------
-# TestAscmhlTotalBytes
+# TestAscMhlTotalBytes
 # ---------------------------------------------------------------------------
 
 
-class TestAscmhlTotalBytes:
+class TestAscMhlTotalBytes:
     """Unit tests for _ascmhl_total_bytes — byte-weight pre-read for ASC-MHL."""
 
     def test_single_generation_sums_all_sizes(self, tmp_path, write_mhl):
@@ -719,11 +712,11 @@ class TestAscmhlTotalBytes:
 
 
 # ---------------------------------------------------------------------------
-# TestAscmhlDispatch
+# TestAscMhlDispatch
 # ---------------------------------------------------------------------------
 
 
-class TestAscmhlDispatch:
+class TestAscMhlDispatch:
     """ASC-MHL exit-code translation, schema dispatch, schema=False routing,
     output visibility, and command-not-found (127).
     """
@@ -772,7 +765,6 @@ class TestAscmhlDispatch:
             cmd_path="/fake/ascmhl-debug",
             cwd=None,
             verbose=False,
-            report_file=None,
         )
         assert rc == 0
 
@@ -794,7 +786,6 @@ class TestAscmhlDispatch:
             cmd_path="/fake/ascmhl-debug",
             cwd=None,
             verbose=False,
-            report_file=None,
         )
         assert rc == 11
 
@@ -816,7 +807,6 @@ class TestAscmhlDispatch:
             cmd_path="/fake/ascmhl-debug",
             cwd=None,
             verbose=False,
-            report_file=None,
         )
 
         captured = capsys.readouterr()
@@ -831,26 +821,10 @@ class TestAscmhlDispatch:
             cmd_path="/fake/ascmhl-debug",
             cwd=None,
             verbose=True,
-            report_file=None,
         )
 
         captured = capsys.readouterr()
         assert "ERROR: no MHL history found" in captured.err
-
-    def test_ascmhl_backend_output_always_in_report_file(self, ascmhl_setup, monkeypatch):
-        """Report file always captures backend output, regardless of verbose."""
-        stub_run_step(monkeypatch, 30, "ERROR: no MHL history found at /pkg")
-        report = io.StringIO()
-
-        mhlver._ascmhl_verify(
-            target=ascmhl_setup,
-            cmd_path="/fake/ascmhl-debug",
-            cwd=None,
-            verbose=False,
-            report_file=report,
-        )
-
-        assert "ERROR: no MHL history found" in report.getvalue()
 
     def test_schema_false_dispatches_to_ascmhl_verify(self, ascmhl_setup, monkeypatch):
         """schema=False routes to _ascmhl_verify; _ascmhl_schema_check is never called."""
@@ -858,18 +832,18 @@ class TestAscmhlDispatch:
 
         called = {}
 
-        def _stub_verify(target, cmd_path, cwd, verbose, report_file, **kw):
+        def _stub_verify(target, cmd_path, cwd, verbose, **kw):
             called["verify"] = True
-            return 0
+            return 0, None
 
-        def _stub_schema(target, cmd_path, cwd, verbose, report_file, **kw):
+        def _stub_schema(target, cmd_path, cwd, verbose, **kw):
             called["schema"] = True
             return 0
 
         monkeypatch.setattr(mhlver, "_ascmhl_verify", _stub_verify)
         monkeypatch.setattr(mhlver, "_ascmhl_schema_check", _stub_schema)
 
-        rc = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False, report_file=None)
+        rc, _mr = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False)
 
         assert called.get("verify") is True, "_ascmhl_verify was not called"
         assert "schema" not in called, "_ascmhl_schema_check must not be called"
@@ -878,14 +852,14 @@ class TestAscmhlDispatch:
     def test_schema_false_return_value_is_propagated(self, ascmhl_setup, monkeypatch):
         """The exit code from _ascmhl_verify is returned unchanged."""
         monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
-        monkeypatch.setattr(mhlver, "_ascmhl_verify", lambda *a, **kw: 11)
-        rc = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False, report_file=None)
+        monkeypatch.setattr(mhlver, "_ascmhl_verify", lambda *a, **kw: (11, None))
+        rc, _mr = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False)
         assert rc == 11
 
     def test_command_not_found_returns_127(self, ascmhl_setup, monkeypatch):
         """When ascmhl-debug is not found, _verify_ascmhl returns 127."""
         monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: None)
-        rc = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False, report_file=None)
+        rc, _mr = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False)
         assert rc == 127
 
     def test_schema_true_dispatches_to_ascmhl_schema_check(self, ascmhl_setup, monkeypatch):
@@ -893,124 +867,118 @@ class TestAscmhlDispatch:
         monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
         called = {}
 
-        def _stub_schema_check(target, cmd_path, cwd, verbose, report_file, **kw):
+        def _stub_schema_check(target, cmd_path, cwd, verbose, **kw):
             called["yes"] = True
             return 0
 
         monkeypatch.setattr(mhlver, "_ascmhl_schema_check", _stub_schema_check)
-        rc = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=True, report_file=None)
+        rc, _mr = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=True)
         assert called.get("yes") is True
         assert rc == 0
 
 
 # ---------------------------------------------------------------------------
-# TestLegacyDispatch
+# TestClassicMhlDispatch
 # ---------------------------------------------------------------------------
 
 
-class TestLegacyDispatch:
+class TestClassicMhlDispatch:
     """MHL v1 exit-code translation, verbose/schema flags, dispatch table, and command-not-found.
 
     Both get_command_path and _run_step are patched so no real subprocess
     is spawned and tests are independent of the installed environment.
     """
 
-    def test_verify_legacy_clean_returns_zero(self, tmp_path, monkeypatch):
-        """Exit 0 from simple-mhl -> _verify_legacy returns 0."""
+    def test_verify_classicmhl_clean_returns_zero(self, tmp_path, monkeypatch):
+        """Exit 0 from simple-mhl -> _verify_classicmhl returns 0."""
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
         monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
         stub_run_step(monkeypatch, 0)
-        rc = mhlver._verify_legacy(
+        rc, _mr = mhlver._verify_classicmhl(
             target=mhl,
             verbose=False,
             schema=False,
-            report_file=None,
         )
         assert rc == 0
 
-    def test_verify_legacy_invalid_argument_propagates_1(self, tmp_path, monkeypatch):
-        """Exit 1 from simple-mhl (bad argument) -> _verify_legacy returns 1."""
+    def test_verify_classicmhl_invalid_argument_propagates_1(self, tmp_path, monkeypatch):
+        """Exit 1 from simple-mhl (bad argument) -> _verify_classicmhl returns 1."""
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
         monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
         stub_run_step(monkeypatch, 1, "Verification Error: not an MHL file")
-        rc = mhlver._verify_legacy(
+        rc, _mr = mhlver._verify_classicmhl(
             target=mhl,
             verbose=False,
             schema=False,
-            report_file=None,
         )
         assert rc == 1
 
-    def test_verify_legacy_malformed_xml_propagates_20(self, tmp_path, monkeypatch):
-        """Exit 20 from simple-mhl (malformed XML) -> _verify_legacy returns 20."""
+    def test_verify_classicmhl_malformed_xml_propagates_20(self, tmp_path, monkeypatch):
+        """Exit 20 from simple-mhl (malformed XML) -> _verify_classicmhl returns 20."""
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
         monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
         stub_run_step(monkeypatch, 20, "Malformed XML")
-        rc = mhlver._verify_legacy(
+        rc, _mr = mhlver._verify_classicmhl(
             target=mhl,
             verbose=False,
             schema=False,
-            report_file=None,
         )
         assert rc == 20
 
-    def test_verify_legacy_missing_files_propagates_30(self, tmp_path, monkeypatch):
-        """Exit 30 from simple-mhl (missing files) -> _verify_legacy returns 30."""
+    def test_verify_classicmhl_missing_files_propagates_30(self, tmp_path, monkeypatch):
+        """Exit 30 from simple-mhl (missing files) -> _verify_classicmhl returns 30."""
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
         monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
         stub_run_step(monkeypatch, 30)
-        rc = mhlver._verify_legacy(
+        rc, _mr = mhlver._verify_classicmhl(
             target=mhl,
             verbose=False,
             schema=False,
-            report_file=None,
         )
         assert rc == 30
 
-    def test_verify_legacy_hash_mismatch_propagates_40(self, tmp_path, monkeypatch):
-        """Exit 40 from simple-mhl (hash mismatch) -> _verify_legacy returns 40."""
+    def test_verify_classicmhl_hash_mismatch_propagates_40(self, tmp_path, monkeypatch):
+        """Exit 40 from simple-mhl (hash mismatch) -> _verify_classicmhl returns 40."""
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
         monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
         stub_run_step(monkeypatch, 40)
-        rc = mhlver._verify_legacy(
+        rc, _mr = mhlver._verify_classicmhl(
             target=mhl,
             verbose=False,
             schema=False,
-            report_file=None,
         )
         assert rc == 40
 
-    def test_verify_legacy_both_failures_propagates_70(self, tmp_path, monkeypatch):
-        """Exit 70 from simple-mhl (missing + mismatch) -> _verify_legacy returns 70."""
+    def test_verify_classicmhl_both_failures_propagates_70(self, tmp_path, monkeypatch):
+        """Exit 70 from simple-mhl (missing + mismatch) -> _verify_classicmhl returns 70."""
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
         monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
         stub_run_step(monkeypatch, 70)
-        rc = mhlver._verify_legacy(
+        rc, _mr = mhlver._verify_classicmhl(
             target=mhl,
             verbose=False,
             schema=False,
-            report_file=None,
         )
         assert rc == 70
 
-    def test_verify_legacy_dispatch_table_covers_all_known_codes(self):
-        """_LEGACY_RESULTS must cover every exit code simple-mhl can emit."""
+    def test_verify_classicmhl_dispatch_table_covers_all_known_codes(self):
+        """_CLASSICMHL_RESULTS must cover every exit code simple-mhl can emit."""
         documented_codes = {0, 1, 20, 30, 40, 70, 127}
-        missing = documented_codes - set(mhlver._LEGACY_RESULTS.keys())
+        missing = documented_codes - set(mhlver._CLASSICMHL_RESULTS.keys())
         assert missing == set(), f"Dispatch table missing codes: {missing}"
 
     def test_command_not_found_returns_127(self, tmp_path, monkeypatch):
-        """When simple-mhl is not found, _verify_legacy returns 127."""
+        """When simple-mhl is not found, _verify_classicmhl returns 127."""
         monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: None)
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
-        rc = mhlver._verify_legacy(mhl, verbose=False, schema=False, report_file=None)
+        rc, _mr = mhlver._verify_classicmhl(mhl, verbose=False, schema=False)
         assert rc == 127
 
     def test_verbose_with_schema_does_not_add_v_flag(self, tmp_path, monkeypatch):
@@ -1026,7 +994,7 @@ class TestLegacyDispatch:
         monkeypatch.setattr(mhlver, "_run_step", _stub)
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
-        mhlver._verify_legacy(mhl, verbose=True, schema=True, report_file=None)
+        mhlver._verify_classicmhl(mhl, verbose=True, schema=True)
         assert "-v" not in captured_cmd["cmd"]
         assert "xsd-schema-check" in captured_cmd["cmd"]
 
@@ -1042,17 +1010,17 @@ class TestLegacyDispatch:
         monkeypatch.setattr(mhlver, "_run_step", _stub)
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
-        mhlver._verify_legacy(mhl, verbose=True, schema=False, report_file=None)
+        mhlver._verify_classicmhl(mhl, verbose=True, schema=False)
         assert "-v" in captured_cmd["cmd"]
 
-    def test_schema_uses_legacy_schema_results_table(self, tmp_path, monkeypatch, capsys):
-        """With schema=True, exit 60 is looked up in _LEGACY_SCHEMA_RESULTS
-        (which has a specific message) not _LEGACY_RESULTS (which doesn't)."""
+    def test_schema_uses_classicmhl_schema_results_table(self, tmp_path, monkeypatch, capsys):
+        """With schema=True, exit 60 is looked up in _CLASSICMHL_SCHEMA_RESULTS
+        (which has a specific message) not _CLASSICMHL_RESULTS (which doesn't)."""
         monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
         monkeypatch.setattr(mhlver, "_run_step", lambda cmd, **kw: mhlver.StepResult(60, ""))
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
-        rc = mhlver._verify_legacy(mhl, verbose=False, schema=True, report_file=None)
+        rc, _mr = mhlver._verify_classicmhl(mhl, verbose=False, schema=True)
         assert rc == 60
         captured = capsys.readouterr()
         assert "schema" in (captured.out + captured.err).lower()
@@ -1079,7 +1047,6 @@ class TestLogHelpers:
             "hello",
             colour="",
             stream=None,
-            report_file=None,
             console=FakeConsole(),
         )
         assert "hello" in console_out.getvalue()
@@ -1088,16 +1055,9 @@ class TestLogHelpers:
         assert "hello" not in captured.out
         assert "hello" not in captured.err
 
-    def test_log_writes_to_report_file(self):
-        """_log always writes a timestamped line to report_file."""
-
-        buf = io.StringIO()
-        mhlver._log("audit line", colour="", stream=None, report_file=buf)
-        assert "audit line" in buf.getvalue()
-
     def test_emit_step_output_success_prints_to_stdout(self, capsys):
         """On exit_code==0 with show_on_terminal, output goes to stdout."""
-        mhlver._emit_step_output("OK: file.bin", 0, None, show_on_terminal=True)
+        mhlver._emit_step_output("OK: file.bin", 0, show_on_terminal=True)
         captured = capsys.readouterr()
         assert "OK: file.bin" in captured.out
 
@@ -1110,7 +1070,7 @@ class TestLogHelpers:
             def print(self, msg, **kwargs):
                 console_out.write(msg + "\n")
 
-        mhlver._emit_step_output("OK: file.bin", 0, None, show_on_terminal=True, console=FakeConsole())
+        mhlver._emit_step_output("OK: file.bin", 0, show_on_terminal=True, console=FakeConsole())
         assert "OK: file.bin" in console_out.getvalue()
 
     def test_emit_step_output_failure_via_console(self, capsys):
@@ -1122,35 +1082,35 @@ class TestLogHelpers:
             def print(self, msg, **kwargs):
                 console_out.write(msg + "\n")
 
-        mhlver._emit_step_output("ERR: file.bin", 1, None, show_on_terminal=True, console=FakeConsole())
+        mhlver._emit_step_output("ERR: file.bin", 1, show_on_terminal=True, console=FakeConsole())
         assert "ERR: file.bin" in console_out.getvalue()
         # Nothing should have leaked to real stderr.
         assert "ERR: file.bin" not in capsys.readouterr().err
 
     def test_emit_step_output_empty_is_noop(self, capsys):
         """Empty output string produces no output at all."""
-        mhlver._emit_step_output("", 1, None, show_on_terminal=True)
+        mhlver._emit_step_output("", 1, show_on_terminal=True)
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == ""
 
-    def test_emit_step_output_always_writes_report_file(self):
-        """Report file always gets the output regardless of show_on_terminal."""
-
-        buf = io.StringIO()
-        mhlver._emit_step_output("detail", 0, buf, show_on_terminal=False)
-        assert "detail" in buf.getvalue()
+    def test_emit_step_output_suppressed_is_silent(self, capsys):
+        """show_on_terminal=False produces no terminal output."""
+        mhlver._emit_step_output("detail", 0, show_on_terminal=False)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
 
     def test_verbose_announce_with_cwd_includes_cwd(self, capsys):
         """_verbose_announce includes (cwd=...) when cwd is not None."""
         cwd = Path("/some/dir")
-        mhlver._verbose_announce(["/bin/cmd", "arg"], cwd=cwd, verbose=True, report_file=None)
+        mhlver._verbose_announce(["/bin/cmd", "arg"], cwd=cwd, verbose=True)
         captured = capsys.readouterr()
         assert f"cwd={cwd}" in captured.err
 
     def test_verbose_announce_without_cwd_omits_cwd(self, capsys):
         """_verbose_announce omits cwd when it is None."""
-        mhlver._verbose_announce(["/bin/cmd"], cwd=None, verbose=True, report_file=None)
+        mhlver._verbose_announce(["/bin/cmd"], cwd=None, verbose=True)
         captured = capsys.readouterr()
         assert "cwd" not in captured.err
 
@@ -1167,27 +1127,16 @@ class TestLogHelpers:
             ["/bin/cmd"],
             cwd=None,
             verbose=True,
-            report_file=None,
             console=FakeConsole(),
         )
         assert "running:" in console_out.getvalue()
 
-    def test_verbose_announce_writes_report_file(self):
-        """_verbose_announce mirrors the command line to the report file."""
-
-        buf = io.StringIO()
-        mhlver._verbose_announce(["/bin/cmd", "arg"], cwd=None, verbose=True, report_file=buf)
-        assert "running:" in buf.getvalue()
-
     def test_verbose_announce_noop_when_not_verbose(self, capsys):
         """_verbose_announce produces no output when verbose=False."""
-
-        buf = io.StringIO()
-        mhlver._verbose_announce(["/bin/cmd"], cwd=None, verbose=False, report_file=buf)
+        mhlver._verbose_announce(["/bin/cmd"], cwd=None, verbose=False)
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == ""
-        assert buf.getvalue() == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1198,36 +1147,14 @@ class TestLogHelpers:
 class TestReportViaTable:
     """Tests for _report_via_table edge cases."""
 
-    def test_suppressed_success_still_writes_report_file(self, capsys):
-        """When show_status_on_terminal=False and exit=0, the success line must
-        still be written to the report file (the silent-progress-bar path)."""
-
-        buf = io.StringIO()
+    def test_suppressed_success_is_silent(self, capsys):
+        """When show_status_on_terminal=False and exit=0, the success line is
+        suppressed entirely (the silent-progress-bar path)."""
         mhlver._report_via_table(
-            mhlver._LEGACY_RESULTS,
+            mhlver._CLASSICMHL_RESULTS,
             0,
             "manifest.mhl",
             "",
-            buf,
-            show_backend_output=False,
-            show_status_on_terminal=False,
-        )
-        assert "manifest.mhl" in buf.getvalue()
-        # But nothing on terminal.
-        captured = capsys.readouterr()
-        assert "manifest.mhl" not in captured.out
-        assert "manifest.mhl" not in captured.err
-
-    def test_suppressed_success_no_report_file_does_not_raise(self, capsys):
-        """When show_status_on_terminal=False, severity==success, and report_file
-        is None, the elif branch is skipped entirely — nothing is written and
-        no exception is raised."""
-        mhlver._report_via_table(
-            mhlver._LEGACY_RESULTS,
-            0,
-            "manifest.mhl",
-            "",
-            None,
             show_backend_output=False,
             show_status_on_terminal=False,
         )
@@ -1239,11 +1166,10 @@ class TestReportViaTable:
         """Errors must always appear on the terminal regardless of
         show_status_on_terminal, because operators need immediate visibility."""
         mhlver._report_via_table(
-            mhlver._LEGACY_RESULTS,
+            mhlver._CLASSICMHL_RESULTS,
             40,
             "bad.mhl",
             "",
-            None,
             show_backend_output=False,
             show_status_on_terminal=False,
         )
@@ -1298,7 +1224,7 @@ class TestVerifyItem:
         """A path containing 'ascmhl' in its parts routes to _verify_ascmhl."""
         called = {}
 
-        def _stub(target, verbose, schema, report_file, **kw):
+        def _stub(target, verbose, schema, **kw):
             called["ascmhl"] = True
             return 0
 
@@ -1307,22 +1233,22 @@ class TestVerifyItem:
         ascmhl_dir.mkdir(parents=True)
         manifest = ascmhl_dir / "0001.mhl"
         manifest.write_text("")
-        mhlver.verify_item(manifest, verbose=False, schema=False, report_file=None)
+        mhlver.verify_item(manifest, verbose=False, schema=False)
         assert called.get("ascmhl") is True
 
-    def test_dispatches_to_legacy_for_plain_mhl(self, tmp_path, monkeypatch):
-        """A plain .mhl path routes to _verify_legacy."""
+    def test_dispatches_to_classicmhl_for_plain_mhl(self, tmp_path, monkeypatch):
+        """A plain .mhl path routes to _verify_classicmhl."""
         called = {}
 
-        def _stub(target, verbose, schema, report_file, **kw):
-            called["legacy"] = True
+        def _stub(target, verbose, schema, **kw):
+            called["classicmhl"] = True
             return 0
 
-        monkeypatch.setattr(mhlver, "_verify_legacy", _stub)
+        monkeypatch.setattr(mhlver, "_verify_classicmhl", _stub)
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
-        mhlver.verify_item(mhl, verbose=False, schema=False, report_file=None)
-        assert called.get("legacy") is True
+        mhlver.verify_item(mhl, verbose=False, schema=False)
+        assert called.get("classicmhl") is True
 
 
 # ---------------------------------------------------------------------------
@@ -1367,35 +1293,35 @@ class TestMhlTotalBytes:
         )
         assert mhlver._mhl_total_bytes(mhl) == 50
 
-    def test_legacy_mhl_from_shotputpro(self, tmp_path, load_fixture_mhl):
-        """ShotPutPro legacy MHL
+    def test_classicmhl_from_shotputpro(self, tmp_path, load_fixture_mhl):
+        """ShotPutPro classic MHL
 
         Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919_466
         """
-        mhl = load_fixture_mhl(tmp_path, "shotputpro_legacymhl_example.mhl")
+        mhl = load_fixture_mhl(tmp_path, "shotputpro_classicmhl_example.mhl")
         assert mhlver._mhl_total_bytes(mhl) == 2246896176 + 4170 + 15758019120
 
-    def test_legacy_mhl_from_silverstack(self, tmp_path, load_fixture_mhl):
-        """ShotPutPro legacy MHL
+    def test_classicmhl_from_silverstack(self, tmp_path, load_fixture_mhl):
+        """ShotPutPro classic MHL
 
         Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919_466
         """
-        mhl = load_fixture_mhl(tmp_path, "silverstack_legacymhl_example.mhl")
+        mhl = load_fixture_mhl(tmp_path, "silverstack_classicmhl_example.mhl")
         assert mhlver._mhl_total_bytes(mhl) == 2246896176 + 4170 + 15758019120
 
-    def test_legacy_mhl_from_ocopy(self, tmp_path, load_fixture_mhl):
-        """o/COPY legacy MHL
+    def test_classicmhl_from_ocopy(self, tmp_path, load_fixture_mhl):
+        """o/COPY classic MHL
 
         Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919,466
         """
-        mhl = load_fixture_mhl(tmp_path, "ocopy_legacymhl_example.mhl")
+        mhl = load_fixture_mhl(tmp_path, "ocopy_classicmhl_example.mhl")
         assert mhlver._mhl_total_bytes(mhl) == 18_004_919_466
 
-    def test_legacy_mhl_from_offshoot(self, tmp_path, load_fixture_mhl):
-        """OffShoot legacy MHL
+    def test_classicmhl_from_offshoot(self, tmp_path, load_fixture_mhl):
+        """OffShoot classic MHL
         Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919,466
         """
-        mhl = load_fixture_mhl(tmp_path, "offshoot_legacymhl_example.mhl")
+        mhl = load_fixture_mhl(tmp_path, "offshoot_classicmhl_example.mhl")
         assert mhlver._mhl_total_bytes(mhl) == 18_004_919_466
 
 
@@ -1408,13 +1334,14 @@ class TestOpenReport:
     """Tests for _open_report context manager."""
 
     def test_creates_report_file_with_header(self, tmp_path):
-        """Report file is created, contains a header, and is closed after the block."""
+        """Report file is created, is writable inside the block, and closed after."""
         with mhlver._open_report(tmp_path) as (fh, rp):
             assert rp.exists()
             assert not fh.closed
+            fh.write("mhlver\n")
             fh.write("test line\n")
         assert fh.closed
-        content = rp.read_text()
+        content = rp.read_text(encoding="utf-8")
         assert "mhlver" in content
         assert "test line" in content
 
@@ -1442,14 +1369,14 @@ class TestRun:
     """Tests for the _run orchestration function."""
 
     def _stub_verify_item(self, monkeypatch, return_code: int):
-        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: return_code)
+        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (return_code, None))
 
     def test_run_with_single_file_success(self, tmp_path, monkeypatch, capsys):
         """_run with a file path calls verify_item and returns 0 on success."""
         self._stub_verify_item(monkeypatch, 0)
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
-        rc = mhlver._run(mhl, verbose=False, schema=False, report_file=None)
+        rc, _ = mhlver._run(mhl, verbose=False, schema=False)
         assert rc == 0
         assert "successfully verified" in capsys.readouterr().out
 
@@ -1458,7 +1385,7 @@ class TestRun:
         self._stub_verify_item(monkeypatch, 40)
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
-        rc = mhlver._run(mhl, verbose=False, schema=False, report_file=None)
+        rc, _ = mhlver._run(mhl, verbose=False, schema=False)
         assert rc == 40
         assert "failed" in capsys.readouterr().err.lower()
 
@@ -1466,7 +1393,7 @@ class TestRun:
         """_run on a dir with no MHL files logs a warning and returns 0."""
         # Force use_progress=False so we stay in the simple branch.
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
-        rc = mhlver._run(tmp_path, verbose=False, schema=False, report_file=None)
+        rc, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         assert rc == 0
         captured = capsys.readouterr()
         assert "no mhl" in (captured.out + captured.err).lower()
@@ -1475,19 +1402,19 @@ class TestRun:
         """First non-zero exit code is returned; subsequent failures don't override."""
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
         results = iter([30, 40])
-        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: next(results))
+        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (next(results), None))
         for name in ["a.mhl", "b.mhl"]:
             (tmp_path / name).write_text("")
-        rc = mhlver._run(tmp_path, verbose=False, schema=False, report_file=None)
+        rc, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         assert rc == 30
 
     def test_run_directory_all_pass(self, tmp_path, monkeypatch, capsys):
         """All manifests passing returns 0 with the success summary."""
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
-        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: 0)
+        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, None))
         (tmp_path / "a.mhl").write_text("")
         (tmp_path / "b.mhl").write_text("")
-        rc = mhlver._run(tmp_path, verbose=False, schema=False, report_file=None)
+        rc, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         assert rc == 0
         assert "successfully verified" in capsys.readouterr().out
 
@@ -1499,27 +1426,29 @@ class TestRun:
         pipe = tmp_path / "fifo.mhl"
         os.mkfifo(pipe)
         # verify_item is never called — exit_status stays 0.
-        rc = mhlver._run(pipe, verbose=False, schema=False, report_file=None)
+        rc, _ = mhlver._run(pipe, verbose=False, schema=False)
         assert rc == 0
 
     def test_run_writes_to_report_file(self, tmp_path, monkeypatch):
-        """_run mirrors output to the report file when one is provided."""
+        """_render_report writes a structured report with a summary line."""
 
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
-        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: 0)
+        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, None))
         (tmp_path / "a.mhl").write_text("")
+        rc, mrs = mhlver._run(tmp_path, verbose=False, schema=False)
         buf = io.StringIO()
-        mhlver._run(tmp_path, verbose=False, schema=False, report_file=buf)
-        assert "successfully verified" in buf.getvalue()
+        mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mrs, rc)
+        assert "PASSED" in buf.getvalue()
 
     def test_run_with_report_file_includes_separator(self, tmp_path, monkeypatch):
-        """Each manifest verification is separated by '---' in the report."""
+        """_render_report includes separator lines in its output."""
 
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
-        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: 0)
+        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, None))
         (tmp_path / "a.mhl").write_text("")
+        rc, mrs = mhlver._run(tmp_path, verbose=False, schema=False)
         buf = io.StringIO()
-        mhlver._run(tmp_path, verbose=False, schema=False, report_file=buf)
+        mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mrs, rc)
         assert "---" in buf.getvalue()
 
 
@@ -1674,12 +1603,12 @@ class TestRunWithProgress:
         def _counting_verify(*a, **kw):
             nonlocal call_count
             call_count += 1
-            return 0
+            return 0, None
 
         monkeypatch.setattr(mhlver, "verify_item", _counting_verify)
         (tmp_path / "a.mhl").write_text("")
         (tmp_path / "b.mhl").write_text("")
-        rc = mhlver._run(tmp_path, verbose=False, schema=False, report_file=None)
+        rc, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         assert rc == 0
         assert call_count == 2
 
@@ -1687,32 +1616,33 @@ class TestRunWithProgress:
         """First non-zero exit code is preserved; a later one does not override it."""
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: True)
         self._stub_build_live(monkeypatch)
-        results = iter([30, 40])
+        results = iter([(30, None), (40, None)])
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: next(results))
         (tmp_path / "a.mhl").write_text("")
         (tmp_path / "b.mhl").write_text("")
-        rc = mhlver._run(tmp_path, verbose=False, schema=False, report_file=None)
+        rc, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         assert rc == 30
 
     def test_progress_branch_advances_bar_per_manifest(self, tmp_path, monkeypatch):
         """progress.advance() is called once per manifest with its byte weight."""
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: True)
         progress = self._stub_build_live(monkeypatch)
-        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: 0)
+        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, None))
         (tmp_path / "a.mhl").write_text("")
         (tmp_path / "b.mhl").write_text("")
-        mhlver._run(tmp_path, verbose=False, schema=False, report_file=None)
+        mhlver._run(tmp_path, verbose=False, schema=False)
         assert progress.advance.call_count == 2
 
     def test_progress_branch_writes_separator_to_report(self, tmp_path, monkeypatch):
-        """Each manifest is preceded by '---' in the report file."""
+        """_render_report includes separator lines in its output."""
 
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: True)
         self._stub_build_live(monkeypatch)
-        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: 0)
+        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, None))
         (tmp_path / "a.mhl").write_text("")
+        rc, mrs = mhlver._run(tmp_path, verbose=False, schema=False)
         buf = io.StringIO()
-        mhlver._run(tmp_path, verbose=False, schema=False, report_file=buf)
+        mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mrs, rc)
         assert "---" in buf.getvalue()
 
 
@@ -1730,13 +1660,31 @@ class TestMain:
         assert rc == 2
         assert "file or directory" in err.lower() or "exist" in err.lower()
 
+    def test_nonexistent_path_suggests_normalization_variant(self, mhlver_cli, monkeypatch):
+        """When the typed path is missing but a Unicode-normalization variant
+        exists, mhlver appends a 'did you mean' hint — parity with simple-mhl
+        via the shared unicodepaths helper. The helper is stubbed here; its own
+        resolution logic is covered by the simple-mhl test suite."""
+        monkeypatch.setattr(mhlver, "normalization_variant_on_disk", lambda p: "/vol/café_nfd.mhl")
+        rc, _, err = mhlver_cli(["/vol/café_nfc.mhl"])
+        assert rc == 2
+        assert "did you mean" in err.lower()
+        assert "café_nfd.mhl" in err
+
+    def test_nonexistent_path_no_variant_is_plain_error(self, mhlver_cli, monkeypatch):
+        """A genuine typo (no normalization variant) gives the plain error, no hint."""
+        monkeypatch.setattr(mhlver, "normalization_variant_on_disk", lambda p: None)
+        rc, _, err = mhlver_cli(["/vol/ghost.mhl"])
+        assert rc == 2
+        assert "did you mean" not in err.lower()
+
     def test_default_path_is_cwd(self, mhlver_cli, monkeypatch, tmp_path):
         """Omitting the path argument defaults to the current directory."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema, report_file):
+        def _stub_run(src, verbose, schema):
             called_with["src"] = src
-            return 0
+            return 0, []
 
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(mhlver, "_run", _stub_run)
@@ -1748,9 +1696,9 @@ class TestMain:
         """An explicit path is resolved and forwarded to _run."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema, report_file):
+        def _stub_run(src, verbose, schema):
             called_with["src"] = src
-            return 0
+            return 0, []
 
         monkeypatch.setattr(mhlver, "_run", _stub_run)
         mhl = tmp_path / "manifest.mhl"
@@ -1763,9 +1711,9 @@ class TestMain:
         """--verbose is passed through to _run."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema, report_file):
+        def _stub_run(src, verbose, schema):
             called_with["verbose"] = verbose
-            return 0
+            return 0, []
 
         monkeypatch.setattr(mhlver, "_run", _stub_run)
         mhl = tmp_path / "manifest.mhl"
@@ -1777,9 +1725,9 @@ class TestMain:
         """--xsd-schema-check is passed through to _run."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema, report_file):
+        def _stub_run(src, verbose, schema):
             called_with["schema"] = schema
-            return 0
+            return 0, []
 
         monkeypatch.setattr(mhlver, "_run", _stub_run)
         mhl = tmp_path / "manifest.mhl"
@@ -1789,7 +1737,7 @@ class TestMain:
 
     def test_exit_code_propagated_from_run(self, mhlver_cli, monkeypatch, tmp_path):
         """The exit code returned by _run becomes mhlver's exit code."""
-        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: 40)
+        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (40, []))
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
         rc, _, _ = mhlver_cli([str(mhl)])
@@ -1797,7 +1745,7 @@ class TestMain:
 
     def test_report_flag_creates_report_file(self, mhlver_cli, monkeypatch, tmp_path):
         """--report causes a report file to be created and its path printed."""
-        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: 0)
+        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (0, []))
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
         rc, out, _ = mhlver_cli(["--report", str(mhl)])
@@ -1809,26 +1757,47 @@ class TestMain:
         assert "report saved to" in out
 
     def test_report_file_contains_exit_status(self, mhlver_cli, monkeypatch, tmp_path):
-        """The report file includes the final exit status line."""
-        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: 0)
+        """The report file includes the overall PASSED/FAILED status."""
+        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (0, []))
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
         mhlver_cli(["--report", str(mhl)])
         report = next(tmp_path.glob("mhlver_report_*.log"))
-        assert "exit status: 0" in report.read_text()
+        assert "PASSED" in report.read_text(encoding="utf-8")
 
     def test_report_flag_with_failure_records_nonzero_exit(self, mhlver_cli, monkeypatch, tmp_path):
-        """A non-zero exit from _run is written to the report file."""
-        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: 40)
+        """A non-zero exit from _run is reflected as FAILED in the report file."""
+        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (40, []))
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
         rc, _, _ = mhlver_cli(["--report", str(mhl)])
         assert rc == 40
         report = next(tmp_path.glob("mhlver_report_*.log"))
-        assert "exit status: 40" in report.read_text()
+        assert "FAILED" in report.read_text(encoding="utf-8")
 
     def test_version_flag_exits_0(self, mhlver_cli):
         """--version prints the version string and exits 0."""
         rc, out, _ = mhlver_cli(["--version"])
         assert rc == 0
         assert out.strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# TestRunStepRobustness
+# ---------------------------------------------------------------------------
+
+
+class TestRunStepRobustness:
+    """_run_step must survive non-UTF-8 bytes in a backend's output (e.g. a
+    legacy Latin-1 on-disk filename echoed by ascmhl-debug) rather than crashing
+    the whole verify on a UnicodeDecodeError."""
+
+    def test_invalid_utf8_output_does_not_crash(self):
+        """A child emitting an invalid UTF-8 byte is decoded leniently."""
+        # os.write bypasses stdout's text encoding so we emit the raw 0xff byte.
+        cmd = [sys.executable, "-c", r"import os; os.write(1, b'ok \xff bad\n')"]
+        result = mhlver._run_step(cmd)
+        assert result.exit_code == 0
+        assert "ok" in result.output
+        assert "bad" in result.output
+        assert "�" in result.output  # the 0xff became a replacement char
