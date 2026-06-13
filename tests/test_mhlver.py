@@ -1341,7 +1341,7 @@ class TestOpenReport:
             fh.write("mhlver\n")
             fh.write("test line\n")
         assert fh.closed
-        content = rp.read_text()
+        content = rp.read_text(encoding="utf-8")
         assert "mhlver" in content
         assert "test line" in content
 
@@ -1763,7 +1763,7 @@ class TestMain:
         mhl.write_text("")
         mhlver_cli(["--report", str(mhl)])
         report = next(tmp_path.glob("mhlver_report_*.log"))
-        assert "PASSED" in report.read_text()
+        assert "PASSED" in report.read_text(encoding="utf-8")
 
     def test_report_flag_with_failure_records_nonzero_exit(self, mhlver_cli, monkeypatch, tmp_path):
         """A non-zero exit from _run is reflected as FAILED in the report file."""
@@ -1773,7 +1773,7 @@ class TestMain:
         rc, _, _ = mhlver_cli(["--report", str(mhl)])
         assert rc == 40
         report = next(tmp_path.glob("mhlver_report_*.log"))
-        assert "FAILED" in report.read_text()
+        assert "FAILED" in report.read_text(encoding="utf-8")
 
     def test_version_flag_exits_0(self, mhlver_cli):
         """--version prints the version string and exits 0."""

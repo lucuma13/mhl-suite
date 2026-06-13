@@ -2075,6 +2075,10 @@ def _patch_sensitive(monkeypatch, files, dirs):
     monkeypatch.setattr(os, "scandir", scandir)
     monkeypatch.setattr(os.path, "exists", lambda p: p in all_paths)
     monkeypatch.setattr(os.path, "isdir", lambda p: p in dirs)
+    # The fabricated paths are already absolute and drive-less; keep abspath an
+    # identity so it doesn't prepend the current drive on Windows (D:\vol\...)
+    # and stop matching the fake filesystem's \vol\... entries.
+    monkeypatch.setattr(os.path, "abspath", lambda p: p)
 
 
 class TestNormalizationVariantHint:
