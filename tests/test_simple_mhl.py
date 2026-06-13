@@ -18,6 +18,7 @@ import xxhash
 from lxml import etree
 
 from mhl_suite import simple_mhl
+from mhl_suite._internal import unicodepaths
 
 
 def make_tree(root: Path, spec: dict):
@@ -231,7 +232,7 @@ class TestVerify:
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 30
-        assert "ERROR: missing file: a.bin" in out
+        assert "[ERROR] missing file: a.bin" in out
 
     def test_verify_modified_file(self, mhl_cli, tmp_path):
         """A modified file should produce exit 40.
@@ -248,7 +249,7 @@ class TestVerify:
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 40
         assert "a.bin" in out
-        assert "ERROR:" in out
+        assert "[ERROR]" in out
 
     def test_verify_missing_and_modified(self, mhl_cli, tmp_path):
         """If BOTH missing and mismatch occur, exit 70 (combined failure)."""
@@ -259,10 +260,10 @@ class TestVerify:
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 70
-        assert "ERROR: missing file: a.bin" in out
+        assert "[ERROR] missing file: a.bin" in out
         # "world" (5 bytes) → "changed" (7 bytes): size pre-check fires first.
         assert "b.bin" in out
-        assert "ERROR:" in out
+        assert "[ERROR]" in out
 
     def test_verify_clean_is_silent(self, mhl_cli, tmp_path):
         """A clean verify must produce no stdout at all (exit 0 only)."""
@@ -281,8 +282,8 @@ class TestVerify:
 
         rc, out, _err = mhl_cli(["verify", "-v", str(mhl)])
         assert rc == 0
-        assert "OK: a.bin" in out
-        assert "OK: sub/b.bin" in out.replace(os.sep, "/")
+        assert "[OK] a.bin" in out
+        assert "[OK] sub/b.bin" in out.replace(os.sep, "/")
 
     def test_verify_verbose_with_failures_shows_both(self, mhl_cli, tmp_path):
         """--verbose plus failures: OK for clean files, ERROR for failed."""
@@ -292,10 +293,10 @@ class TestVerify:
 
         rc, out, _ = mhl_cli(["verify", "-v", str(mhl)])
         assert rc == 40
-        assert "OK: good.bin" in out
+        assert "[OK] good.bin" in out
         # "world" (5 bytes) → "changed" (7 bytes): size pre-check fires first.
         assert "bad.bin" in out
-        assert "ERROR:" in out
+        assert "[ERROR]" in out
 
     def test_verify_directory_argument(self, mhl_cli, tmp_path):
         """Passing a directory to verify should exit 1 with an error on stderr."""
@@ -352,7 +353,7 @@ class TestVerify:
         finally:
             outside.unlink(missing_ok=True)
 
-    def test_verify_legacy_decimal_xxhash(self, mhl_cli, tmp_path):
+    def test_verify_classicmhl_decimal_xxhash(self, mhl_cli, tmp_path):
         """Old MHL files stored xxhash as decimal int — must verify correctly."""
         make_tree(tmp_path, {"a.bin": b"x"})
 
@@ -376,7 +377,7 @@ class TestVerify:
         etree.SubElement(h_el, "xxhash").text = decimal_digest
         etree.SubElement(h_el, "hashdate").text = "2025-01-01T00:00:00Z"
 
-        mhl = tmp_path / "legacy.mhl"
+        mhl = tmp_path / "classic.mhl"
         etree.ElementTree(doc).write(str(mhl), xml_declaration=True, encoding="UTF-8")
 
         rc, _, _ = mhl_cli(["verify", str(mhl)])
@@ -894,7 +895,7 @@ class TestGetXsdPathFallbackPaths:
 
         rc, out, _ = mhl_cli(["verify", "-v", str(mhl)])
         assert rc == 0
-        assert "OK: x.bin" in out
+        assert "[OK] x.bin" in out
 
     def test_null_tag_missing_file_reports_error(self, mhl_cli, tmp_path):
         """A <null> entry for a file that does NOT exist must exit 30."""
@@ -910,7 +911,30 @@ class TestGetXsdPathFallbackPaths:
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 30
-        assert "ERROR: missing file: ghost.bin" in out
+        assert "[ERROR] missing file: ghost.bin" in out
+
+    def test_null_tag_size_mismatch_reports_error(self, mhl_cli, tmp_path):
+        """A <null> entry whose file exists but whose size differs from the
+        manifest <size> must fail with a size mismatch (exit 40).
+
+        The v1.1 schema defines <null> as "no hash, only use file size
+        verification", so a truncated/corrupted file must not pass on
+        existence alone.
+        """
+        (tmp_path / "x.bin").write_bytes(b"xxxx")  # 4 bytes on disk
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "x.bin"
+        etree.SubElement(h, "size").text = "1"  # manifest claims 1 byte
+        etree.SubElement(h, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
+        etree.SubElement(h, "null")
+        etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
+        mhl = tmp_path / "null_size_mismatch.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 40
+        assert "[ERROR] size mismatch: x.bin" in out
 
     def test_unsupported_read_only_algorithm_reports_cannot_verify(self, mhl_cli, tmp_path):
         """An xxhash128 digest (accepted for reading, not writable) must produce
@@ -1247,7 +1271,7 @@ class TestTOCTOURaceCondition:
         rc, out, _ = mhl_cli(["verify", str(mhl)])
 
         assert rc == 30, f"Expected exit 30 (missing file), got {rc}"
-        assert "ERROR: missing file: vanishing.bin" in out
+        assert "[ERROR] missing file: vanishing.bin" in out
 
     def test_file_deleted_during_get_hash(self, mhl_cli, tmp_path, monkeypatch):
         """Race window 2: file disappears after getsize() but before get_hash() opens it.
@@ -1281,7 +1305,7 @@ class TestTOCTOURaceCondition:
         rc, out, _ = mhl_cli(["verify", str(mhl)])
 
         assert rc == 40, f"Expected exit 40 (cannot verify), got {rc}"
-        assert "ERROR: cannot verify vanishing.bin" in out
+        assert "[ERROR] cannot verify vanishing.bin" in out
 
 
 # ---------------------------------------------------------------------------
@@ -1465,7 +1489,7 @@ class TestSmartDispatch:
         rc, out, _ = mhl_cli([str(mhl)])
 
         assert rc == 40, f"Expected exit 40 from implicit verify of corrupt file, got {rc}"
-        assert "ERROR: hash mismatch: a.bin" in out
+        assert "[ERROR] hash mismatch: a.bin" in out
 
     def test_explicit_subcommand_not_intercepted(self, mhl_cli, tmp_path):
         """An explicit 'seal' or 'verify' subcommand must pass through unchanged.
@@ -1644,10 +1668,14 @@ class TestUnicodeNormalisation:
     from the manifest would silently fail os.path.exists() against an NFC file
     on disk.
 
-    simple_mhl normalises to NFC at two points:
-      1. seal — rel_path_posix is normalised before writing the <file> element
-      2. verify — rel_path from the manifest is normalised before constructing
-                  the candidate path
+    simple_mhl reconciles normalisation forms at two points:
+      1. seal — rel_path_posix is normalised to NFC before writing the <file>
+                element, so manifests are written in canonical NFC.
+      2. verify — unicodepaths.resolve_on_disk() matches the manifest path against real
+                  directory entries across normalisation forms (literal bytes
+                  first, NFC-keyed index as fallback) so it finds the file
+                  whatever form it is stored in, without assuming the
+                  filesystem normalises for us.
 
     These tests construct NFD filenames explicitly so the behaviour is
     deterministic regardless of what the host OS normalises at mkdir/write time.
@@ -1809,3 +1837,278 @@ class TestUnicodeNormalisation:
 
         assert rc == 40
         assert "hash mismatch" in out.lower()
+
+    def test_verify_nfc_manifest_finds_nfd_file_on_disk(self, mhl_cli, tmp_path):
+        """Scenario 3 (end-to-end): manifest path is NFC, the file on disk is NFD.
+
+        Mirror of test_verify_normalises_nfd_manifest_path_to_find_nfc_file.
+        On a normalization-*sensitive* filesystem (ext4/exFAT/NTFS — e.g. Linux
+        CI) the literal NFC lookup misses and resolution scans the directory and
+        matches on NFC; on an *insensitive* volume (APFS/HFS+ — e.g. macOS dev)
+        the literal lookup already succeeds. Either way verify must find and
+        check the file, so this passes regardless of host filesystem.
+        """
+        nfd_path = tmp_path / self._NFD_NAME
+        content = b"data"
+        nfd_path.write_bytes(content)
+        digest = simple_mhl.get_hash(str(nfd_path), "md5")
+
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = self._NFC_NAME  # NFC manifest path
+        etree.SubElement(h, "size").text = str(len(content))
+        etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+        etree.SubElement(h, "md5").text = digest
+        etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+        mhl = tmp_path / "test.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0, f"verify failed to resolve NFC manifest to NFD disk file: {rc}, {out!r}"
+
+
+# ---------------------------------------------------------------------------
+# unicodepaths.resolve_on_disk — normalization-insensitive path resolution
+# ---------------------------------------------------------------------------
+
+
+class _FakeEntry:
+    """Minimal stand-in for os.DirEntry — only .name is read by the resolver."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+def _sensitive_fs(existing: set[str]):
+    """Build (lexists, scandir) callables modelling a normalization-sensitive,
+    byte-exact filesystem (exFAT/ext4/NTFS) from a set of absolute paths.
+
+    lexists is exact-string membership, so an NFC name and its NFD equivalent
+    are distinct entries (the behaviour that cannot be reproduced on the APFS
+    host). scandir returns the immediate children of a path and raises OSError
+    when the path has none (modelling a file or a missing directory).
+    """
+
+    def lexists(p: str) -> bool:
+        return p in existing
+
+    def scandir(d: str):
+        prefix = d.rstrip(os.sep) + os.sep
+        names: list[str] = []
+        for p in existing:
+            if p.startswith(prefix):
+                name = p[len(prefix) :].split(os.sep, 1)[0]
+                if name and name not in names:
+                    names.append(name)
+        if not names:
+            raise OSError(20, "Not a directory", d)
+        return [_FakeEntry(n) for n in names]
+
+    return lexists, scandir
+
+
+class TestResolveOnDisk:
+    """Unit tests for unicodepaths.resolve_on_disk against a simulated
+    normalization-sensitive filesystem.
+
+    The host filesystem on dev machines (APFS) is normalization-*insensitive*
+    and cannot host coexisting NFC + NFD entries, so the sensitive-FS behaviour
+    — the entire reason the resolver exists — must be exercised with patched
+    lexists/scandir rather than real files.
+    """
+
+    _BASE = os.path.join(os.sep, "vol")
+    _NFC = "caf\u00e9"  # café: c a f + precomposed é (U+00E9)
+    _NFD = "cafe\u0301"  # café: c a f e + combining acute (U+0301); same NFC key
+
+    def _patch(self, monkeypatch, existing):
+        lexists, scandir = _sensitive_fs(set(existing))
+        monkeypatch.setattr(os.path, "lexists", lexists)
+        monkeypatch.setattr(os, "scandir", scandir)
+
+    def test_fast_path_literal_hit_does_not_scandir(self, monkeypatch):
+        """When the literal path exists, resolution returns it without scanning
+        — the common case, and the only correct choice when forms coexist."""
+        nfc_file = os.path.join(self._BASE, self._NFC, "text.txt")
+        existing = {self._BASE, os.path.join(self._BASE, self._NFC), nfc_file}
+        lexists, real_scandir = _sensitive_fs(existing)
+        calls: list[str] = []
+        monkeypatch.setattr(os.path, "lexists", lexists)
+        monkeypatch.setattr(os, "scandir", lambda d: calls.append(d) or real_scandir(d))
+
+        result = unicodepaths.resolve_on_disk(self._BASE, os.path.join(self._NFC, "text.txt"), {})
+        assert result == nfc_file
+        assert calls == []  # never scanned
+
+    def test_scenario3_nfc_query_resolves_to_nfd_on_disk(self, monkeypatch):
+        """Scenario 3: NFC manifest path, NFD name on a sensitive filesystem.
+        The literal NFC lookup misses; the NFC-keyed index resolves the real
+        NFD entry."""
+        nfd_file = os.path.join(self._BASE, self._NFD, "text.txt")
+        self._patch(
+            monkeypatch,
+            {self._BASE, os.path.join(self._BASE, self._NFD), nfd_file},
+        )
+        result = unicodepaths.resolve_on_disk(self._BASE, os.path.join(self._NFC, "text.txt"), {})
+        assert result == nfd_file
+
+    def test_scenario2_coexisting_forms_resolve_distinctly(self, monkeypatch):
+        """Scenario 2: NFC and NFD café/ both exist (sensitive FS). Each query
+        resolves to its own distinct directory via the literal fast path — the
+        two forms never collapse onto one."""
+        nfc_file = os.path.join(self._BASE, self._NFC, "text.txt")
+        nfd_file = os.path.join(self._BASE, self._NFD, "text.txt")
+        self._patch(
+            monkeypatch,
+            {
+                self._BASE,
+                os.path.join(self._BASE, self._NFC),
+                nfc_file,
+                os.path.join(self._BASE, self._NFD),
+                nfd_file,
+            },
+        )
+        assert unicodepaths.resolve_on_disk(self._BASE, os.path.join(self._NFC, "text.txt"), {}) == nfc_file
+        assert unicodepaths.resolve_on_disk(self._BASE, os.path.join(self._NFD, "text.txt"), {}) == nfd_file
+
+    def test_intermediate_directory_normalization_mismatch(self, monkeypatch):
+        """Normalization can differ on a non-leaf component: an ASCII parent, an
+        NFD middle directory on disk addressed by an NFC manifest path, then an
+        ASCII leaf. The resolver must reconcile the middle component."""
+        real_file = os.path.join(self._BASE, "sub", self._NFD, "text.txt")
+        self._patch(
+            monkeypatch,
+            {
+                self._BASE,
+                os.path.join(self._BASE, "sub"),
+                os.path.join(self._BASE, "sub", self._NFD),
+                real_file,
+            },
+        )
+        result = unicodepaths.resolve_on_disk(self._BASE, os.path.join("sub", self._NFC, "text.txt"), {})
+        assert result == real_file
+
+    def test_genuinely_missing_returns_none(self, monkeypatch):
+        """A name that matches in no normalization form resolves to None."""
+        self._patch(monkeypatch, {self._BASE, os.path.join(self._BASE, "other.txt")})
+        assert unicodepaths.resolve_on_disk(self._BASE, "ghost.txt", {}) is None
+
+    def test_unreadable_directory_returns_none(self, monkeypatch):
+        """When an intermediate component is not a scannable directory, scandir
+        raises OSError and resolution returns None (treated as missing)."""
+        # 'sub' exists as a leaf (file), so scandir(base/sub) raises OSError.
+        self._patch(monkeypatch, {self._BASE, os.path.join(self._BASE, "sub")})
+        assert unicodepaths.resolve_on_disk(self._BASE, os.path.join("sub", "child.txt"), {}) is None
+
+    def test_dir_index_caches_scandir_per_directory(self, monkeypatch):
+        """Two files in the same NFD directory, addressed via NFC, must scan
+        that directory only once (cached in dir_index across resolutions)."""
+        f1 = os.path.join(self._BASE, self._NFD, "a.txt")
+        f2 = os.path.join(self._BASE, self._NFD, "b.txt")
+        existing = {self._BASE, os.path.join(self._BASE, self._NFD), f1, f2}
+        lexists, real_scandir = _sensitive_fs(existing)
+        calls: list[str] = []
+        monkeypatch.setattr(os.path, "lexists", lexists)
+        monkeypatch.setattr(os, "scandir", lambda d: calls.append(d) or real_scandir(d))
+
+        index: dict[str, dict[str, str]] = {}
+        r1 = unicodepaths.resolve_on_disk(self._BASE, os.path.join(self._NFC, "a.txt"), index)
+        r2 = unicodepaths.resolve_on_disk(self._BASE, os.path.join(self._NFC, "b.txt"), index)
+        assert r1 == f1
+        assert r2 == f2
+        assert calls == [self._BASE]  # scanned once; leaves hit the literal fast path
+
+
+# ---------------------------------------------------------------------------
+# "did you mean" hint for typed CLI paths with a normalization mismatch
+# ---------------------------------------------------------------------------
+
+
+def _patch_sensitive(monkeypatch, files, dirs):
+    """Patch exists/isdir/lexists/scandir to model a normalization-sensitive,
+    byte-exact filesystem from explicit file and directory path sets."""
+    files = set(files)
+    dirs = set(dirs)
+    all_paths = files | dirs
+    lexists, scandir = _sensitive_fs(all_paths)
+    monkeypatch.setattr(os.path, "lexists", lexists)
+    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr(os.path, "exists", lambda p: p in all_paths)
+    monkeypatch.setattr(os.path, "isdir", lambda p: p in dirs)
+
+
+class TestNormalizationVariantHint:
+    """The typed CLI path (verify's .mhl, seal's root) is left to the OS, but a
+    not-found error suggests a real on-disk path that differs only in Unicode
+    normalization. Simulated on a sensitive filesystem (the only place the
+    mismatch is observable)."""
+
+    _VOL = os.path.join(os.sep, "vol")
+    _NFC = "caf\u00e9"  # café: precomposed é (U+00E9)
+    _NFD = "cafe\u0301"  # café: e + combining acute (U+0301); same NFC key
+
+    def test_variant_helper_finds_differently_normalized_path(self, monkeypatch):
+        nfd_mhl = os.path.join(self._VOL, self._NFD, "m.mhl")
+        _patch_sensitive(
+            monkeypatch,
+            files={nfd_mhl},
+            dirs={os.sep, self._VOL, os.path.join(self._VOL, self._NFD)},
+        )
+        typed = os.path.join(self._VOL, self._NFC, "m.mhl")  # NFC, not on disk
+        assert unicodepaths.normalization_variant_on_disk(typed) == nfd_mhl
+
+    def test_variant_helper_returns_none_for_genuine_typo(self, monkeypatch):
+        _patch_sensitive(
+            monkeypatch,
+            files={os.path.join(self._VOL, "real.mhl")},
+            dirs={os.sep, self._VOL},
+        )
+        assert unicodepaths.normalization_variant_on_disk(os.path.join(self._VOL, "ghost.mhl")) is None
+
+    def test_variant_helper_returns_none_when_path_exists_as_typed(self, monkeypatch):
+        typed = os.path.join(self._VOL, "m.mhl")
+        _patch_sensitive(monkeypatch, files={typed}, dirs={os.sep, self._VOL})
+        assert unicodepaths.normalization_variant_on_disk(typed) is None
+
+    def test_verify_not_found_suggests_variant(self, monkeypatch, capsys):
+        nfd_mhl = os.path.join(self._VOL, self._NFD, "m.mhl")
+        _patch_sensitive(
+            monkeypatch,
+            files={nfd_mhl},
+            dirs={os.sep, self._VOL, os.path.join(self._VOL, self._NFD)},
+        )
+        typed = os.path.join(self._VOL, self._NFC, "m.mhl")
+        with pytest.raises(SystemExit) as exc:
+            simple_mhl._validate_mhl_path(typed)
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "did you mean" in err
+        assert nfd_mhl in err
+
+    def test_verify_not_found_no_variant_is_plain_error(self, monkeypatch, capsys):
+        _patch_sensitive(
+            monkeypatch,
+            files={os.path.join(self._VOL, "real.mhl")},
+            dirs={os.sep, self._VOL},
+        )
+        with pytest.raises(SystemExit) as exc:
+            simple_mhl._validate_mhl_path(os.path.join(self._VOL, "ghost.mhl"))
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "not found" in err
+        assert "did you mean" not in err
+
+    def test_seal_not_a_directory_suggests_variant(self, monkeypatch, capsys):
+        nfd_dir = os.path.join(self._VOL, self._NFD)
+        _patch_sensitive(
+            monkeypatch,
+            files=set(),
+            dirs={os.sep, self._VOL, nfd_dir},
+        )
+        typed = os.path.join(self._VOL, self._NFC)  # NFC dir, not on disk
+        with pytest.raises(SystemExit) as exc:
+            simple_mhl.seal(typed, "md5", dont_reseal=False)
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "did you mean" in err
+        assert nfd_dir in err

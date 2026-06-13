@@ -53,6 +53,7 @@ managed = true
 line-length = 120
 lint.select = [ "ANN", "B", "BLE", "C", "E", "F", "FURB", "I", "PL", "PT", "RUF", "SIM", "UP", "W" ]
 lint.ignore = [
+  "PLR0911", # too many return statements — flat status dispatch, not real complexity
   "PLR0912", # too many branches — independent dispatch arms, not nested complexity
   "PLR0913", # too many arguments — internal pipeline functions, dataclass would add noise
   "PLR0915", # too many statements — procedural orchestration, not real complexity
