@@ -168,7 +168,11 @@ def get_hash(filepath: str, algo_key: str) -> str:
 # -----------------------------------------------------------------------------
 
 
-def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.stat_result]]:
+def _iter_files_for_seal(  # noqa: C901 — flat walk with several independent skip cases
+    root: str,
+    mhl_path: str,
+    on_skip: "Callable[[str, str, bool], None] | None" = None,
+) -> Iterator[tuple[str, os.stat_result]]:
     """
     Walk `root` recursively and yield (absolute_path, stat_result) for every
     file that should appear in the manifest, in deterministic sorted order.
@@ -177,6 +181,11 @@ def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.sta
       - hidden files and directories (names starting with '.')
       - the manifest file itself (so we don't hash what we're writing)
       - entries that disappear or stat-fail mid-walk
+
+    `on_skip`, if given, is called as on_skip(path, reason, is_warning) for each
+    skipped entry (except the manifest itself). is_warning is True for an
+    unreadable directory — a silently-dropped directory means media missing
+    from the manifest, so the caller surfaces it regardless of verbosity.
 
     Implementation note: we use os.scandir rather than os.walk because
     DirEntry caches the stat() info from getdents64, saving a syscall per
@@ -199,9 +208,12 @@ def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.sta
             # scandir returns DirEntry objects whose .stat() is satisfied
             # from the readdir cache (no extra syscall) on most filesystems.
             entries = list(os.scandir(current))
-        except OSError:
-            # Permission or vanished-directory; skip it silently to mirror
-            # os.walk's onerror=None behaviour.
+        except OSError as exc:
+            # Permission or vanished-directory. Unlike os.walk's silent
+            # onerror=None, we report it: a dropped directory means its files
+            # are absent from the manifest and therefore unprotected.
+            if on_skip is not None:
+                on_skip(current, f"unreadable: {exc.strerror or exc}", True)
             continue
 
         # Sort by name within the directory for deterministic output order.
@@ -213,12 +225,16 @@ def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.sta
         subdirs: list[str] = []
         for entry in entries:
             if entry.name.startswith("."):
+                if on_skip is not None:
+                    on_skip(entry.path, "hidden", False)
                 continue
             try:
                 if entry.is_dir(follow_symlinks=False):
                     subdirs.append(entry.path)
                     continue
                 if not entry.is_file(follow_symlinks=False):
+                    if on_skip is not None:
+                        on_skip(entry.path, "not a regular file", False)
                     continue
                 # Skip the manifest we're currently writing.
                 if entry.path == mhl_path:
@@ -226,6 +242,8 @@ def _iter_files_for_seal(root: str, mhl_path: str) -> Iterator[tuple[str, os.sta
                 yield entry.path, entry.stat(follow_symlinks=False)
             except OSError:
                 # File vanished between scandir and stat — skip it.
+                if on_skip is not None:
+                    on_skip(entry.path, "vanished", False)
                 continue
 
         # Push subdirs in reverse so popping gives lexicographic order.
@@ -251,7 +269,7 @@ def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree
     return info
 
 
-def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
+def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) -> None:  # noqa: C901
     """
     Walk `root`, hash every non-hidden file, and write a dated MHL manifest
     at the root of the directory.
@@ -329,8 +347,17 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
 
     xml_tag = ALGO_MAP[algorithm][1]
 
+    def _on_skip(path: str, reason: str, is_warning: bool) -> None:
+        rel = os.path.relpath(path, root)
+        rel_posix = rel.replace(os.sep, "/") if os.sep != "/" else rel
+        if is_warning:
+            # Always shown: a dropped directory leaves files unprotected.
+            sys.stderr.write(f"[WARNING] skipped: {rel_posix} ({reason})\n")
+        elif verbose:
+            print(f"[SKIP] {rel_posix} ({reason})")
+
     # Walk and hash.
-    for filepath, stat_result in _iter_files_for_seal(root, mhl_path):
+    for filepath, stat_result in _iter_files_for_seal(root, mhl_path, on_skip=_on_skip):
         rel_path = os.path.relpath(filepath, root)
         # The MHL spec requires forward slashes regardless of platform. On
         # Windows, os.path.relpath returns backslashes; replace them so the
@@ -349,7 +376,10 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
         etree.SubElement(h, "size").text = str(stat_result.st_size)
         mtime = datetime.fromtimestamp(stat_result.st_mtime, UTC)
         etree.SubElement(h, "lastmodificationdate").text = mtime.strftime("%Y-%m-%dT%H:%M:%SZ")
-        etree.SubElement(h, xml_tag).text = get_hash(filepath, algorithm)
+        digest = get_hash(filepath, algorithm)
+        if verbose:
+            print(f"[OK] {rel_path_posix}  {xml_tag}: {digest}")
+        etree.SubElement(h, xml_tag).text = digest
         etree.SubElement(h, "hashdate").text = iso_now
 
     # Update finishdate to reflect actual completion; useful for auditing
@@ -364,6 +394,9 @@ def seal(root: str, algorithm: str, dont_reseal: bool) -> None:
     # we never re-open the file by path (which would be another race window).
     with os.fdopen(fd, "wb") as fh:
         etree.ElementTree(doc).write(fh, xml_declaration=True, encoding="UTF-8", pretty_print=True)
+
+    if verbose:
+        print(f"Created MHL: {mhl_path}")
 
 
 # -----------------------------------------------------------------------------
@@ -752,7 +785,13 @@ def main() -> None:
         action="store_true",
         help="abort silently if an MHL with the same timestamp already exists",
     )
-    seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal))
+    seal_p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="print each file's hash as it is sealed, and skipped files",
+    )
+    seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal, a.verbose))
 
     # verify subcommand
     verify_p = subparsers.add_parser("verify", help="verify an MHL file")

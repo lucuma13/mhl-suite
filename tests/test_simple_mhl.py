@@ -184,6 +184,42 @@ class TestSeal:
 
 
 # ---------------------------------------------------------------------------
+# TestSealVerbose
+# ---------------------------------------------------------------------------
+
+
+class TestSealVerbose:
+    """seal -v streams per-file hashes, skipped files, and a completion line."""
+
+    def test_verbose_prints_per_file_hash(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"clip.mxf": b"data"})
+        rc, out, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "-v"])
+        assert rc == 0
+        assert "[OK] clip.mxf" in out
+        assert "md5:" in out  # the algorithm tag and digest are shown
+
+    def test_verbose_prints_skip_for_hidden(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"clip.mxf": b"data", ".DS_Store": b"junk"})
+        rc, out, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "-v"])
+        assert rc == 0
+        assert "[SKIP] .DS_Store (hidden)" in out
+
+    def test_hidden_skip_silent_without_verbose(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"clip.mxf": b"data", ".DS_Store": b"junk"})
+        rc, out, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        assert rc == 0
+        assert "[SKIP]" not in out
+        assert "[OK]" not in out
+
+    def test_verbose_prints_completion_line(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"clip.mxf": b"data"})
+        rc, out, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "-v"])
+        assert rc == 0
+        assert "Created MHL:" in out
+        assert ".mhl" in out
+
+
+# ---------------------------------------------------------------------------
 # TestSealUnsupportedAlgorithm
 # ---------------------------------------------------------------------------
 
@@ -971,10 +1007,11 @@ class TestWalkEdgeCases:
         getattr(os, "getuid", lambda: 1)() == 0,
         reason="root bypasses permission checks",
     )
-    def test_unreadable_subdir_is_silently_skipped(self, mhl_cli, tmp_path):
-        """A subdirectory that cannot be scanned (mode 000) must be silently
-        skipped — the seal must still succeed and include the files that
-        ARE accessible."""
+    def test_unreadable_subdir_is_skipped_with_warning(self, mhl_cli, tmp_path):
+        """A subdirectory that cannot be scanned (mode 000) is skipped, but the
+        seal must surface a WARNING (always, not just under -v) — a dropped
+        directory means its files are absent from the manifest. The seal still
+        succeeds and includes the files that ARE accessible."""
         make_tree(
             tmp_path,
             {
@@ -985,12 +1022,15 @@ class TestWalkEdgeCases:
         locked = tmp_path / "locked"
         locked.chmod(0o000)
         try:
-            rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+            rc, _, err = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
             assert rc == 0
             mhl = next(tmp_path.glob("*.mhl"))
             text = mhl.read_text()
             assert "accessible.bin" in text
             assert "secret.bin" not in text
+            # Surfaced even without -v.
+            assert "WARNING" in err
+            assert "locked" in err
         finally:
             locked.chmod(0o755)  # restore so tmp_path cleanup can proceed
 
@@ -1707,8 +1747,8 @@ class TestUnicodeNormalisation:
 
         real_iter = simple_mhl._iter_files_for_seal
 
-        def nfd_iter(root, mhl_path):
-            for p, stat_result in real_iter(root, mhl_path):
+        def nfd_iter(root, mhl_path, on_skip=None):
+            for p, stat_result in real_iter(root, mhl_path, on_skip=on_skip):
                 # Yield the path as-is; real_iter already found the NFD file.
                 # Normalise to NFD explicitly in case the OS returned NFC
                 # (e.g. on a case-insensitive macOS volume that normalises on
