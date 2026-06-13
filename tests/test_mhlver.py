@@ -1780,3 +1780,24 @@ class TestMain:
         rc, out, _ = mhlver_cli(["--version"])
         assert rc == 0
         assert out.strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# TestRunStepRobustness
+# ---------------------------------------------------------------------------
+
+
+class TestRunStepRobustness:
+    """_run_step must survive non-UTF-8 bytes in a backend's output (e.g. a
+    legacy Latin-1 on-disk filename echoed by ascmhl-debug) rather than crashing
+    the whole verify on a UnicodeDecodeError."""
+
+    def test_invalid_utf8_output_does_not_crash(self):
+        """A child emitting an invalid UTF-8 byte is decoded leniently."""
+        # os.write bypasses stdout's text encoding so we emit the raw 0xff byte.
+        cmd = [sys.executable, "-c", r"import os; os.write(1, b'ok \xff bad\n')"]
+        result = mhlver._run_step(cmd)
+        assert result.exit_code == 0
+        assert "ok" in result.output
+        assert "bad" in result.output
+        assert "�" in result.output  # the 0xff became a replacement char

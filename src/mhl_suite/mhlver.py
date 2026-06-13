@@ -394,7 +394,11 @@ def _run_step(
         cwd=str(cwd) if cwd else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        # Backends echo on-disk filenames that may not be valid UTF-8 (legacy
+        # Latin-1 names, cross-encoding mojibake). Decode leniently so a stray
+        # byte yields a replacement char instead of crashing the whole verify.
+        encoding="utf-8",
+        errors="replace",
     )
 
     # Fire on_poll ticks from a background thread so the main thread can sit
@@ -416,6 +420,12 @@ def _run_step(
 
     try:
         stdout, stderr = proc.communicate()
+    except BaseException:
+        # Interrupt (e.g. Ctrl-C mid-hash): don't orphan the backend — kill
+        # and reap it before propagating, so no stray hashing process lingers.
+        proc.kill()
+        proc.wait()
+        raise
     finally:
         stop_ticking.set()
         if ticker_thread is not None:
