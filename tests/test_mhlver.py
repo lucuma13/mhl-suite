@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Test suite for mhlver.py orchestrator and ASC-MHL dispatch."""
 
 import io
@@ -6,12 +5,14 @@ import os
 import sys
 import tempfile
 import threading
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 from hypothesis import HealthCheck, assume, given, settings, strategies
+from lxml import etree
 
 from mhl_suite import mhlver
 
@@ -25,18 +26,47 @@ _ASCMHL_NAMESPACE = "urn:ASC:MHL:v2.0"
 # e.g. CON.mhl on Windows raises PermissionError / FileNotFoundError.
 _WINDOWS_RESERVED_NAMES = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "LPT1", "LPT2"]
 
-# Hypothesis strategy for valid filename stems: ASCII letters and digits only,
-# no leading dots (avoids the ._ resource-fork filter), no path separators.
+# Hypothesis strategy for valid filename stems: Unicode letters, digits and
+# symbols (including emoji), plus "_-". Path separators can't occur: they're
+# punctuation (outside the whitelisted categories.
+# We keep only NFC-normalised stems so two "distinct" names can't
+# collapse onto the same file on a normalisation-insensitive filesystem
+# (APFS/HFS+), which would otherwise under-create files and flake the count
+# invariants. Also skip leading "._" (the resource-fork filter) and blank names.
 _filename_stem = strategies.text(
     alphabet=strategies.characters(
-        whitelist_categories=("Ll", "Lu", "Nd"),
+        whitelist_categories=("Ll", "Lu", "Nd", "So"),
         whitelist_characters="_-",
     ),
     min_size=1,
     max_size=20,
-).filter(lambda s: not s.startswith("._") and s.strip())
+).filter(lambda s: not s.startswith("._") and s.strip() and unicodedata.is_normalized("NFC", s))
 
 _generations_per_pkg = strategies.integers(min_value=1, max_value=4)
+
+# All vendor example fixtures (classic + ASC-MHL) are deliberately aligned to
+# this total so each parser can be checked against the same known value.
+_ALIGNED_FIXTURE_TOTAL_BYTES = 18_004_919_466
+
+#: Directory containing real-tool MHL fixture files used by the suite. Each file
+#: is a verbatim (anonymised) MHL output from a specific transfer tool, named
+#: <tool>_<format>.mhl (e.g. shotputpro_ascmhl.mhl).
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+# Templates for the write_mhl fixture's minimal ASC-MHL 2.0 generation files.
+_MHL_TMPL = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0">
+  <hashes>
+{entries}  </hashes>
+</hashlist>"""
+
+_HASH_ENTRY = """\
+    <hash>
+      <path size="{size}">{path}</path>
+      <xxh64 action="{action}" hashdate="2026-05-30T12:00:00+00:00">{digest}</xxh64>
+    </hash>
+"""
 
 
 def _write_ascmhl(path: Path, entries: list[dict]) -> None:
@@ -44,8 +74,8 @@ def _write_ascmhl(path: Path, entries: list[dict]) -> None:
 
     Each entry dict must have "path", "size", "action", and "digest" keys.
     Used by the Unicode-guard tests that need to craft specific size attributes
-    without going through the write_mhl conftest fixture (which only writes
-    well-formed decimal sizes).
+    without going through the write_mhl fixture (which only writes well-formed
+    decimal sizes).
     """
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -82,6 +112,114 @@ def call_verify(manifest):
         verbose=False,
     )
     return rc
+
+
+class FakeConsole:
+    """Minimal stand-in for rich.Console: records what would be printed instead
+    of emitting it, so tests can assert on routed output without touching the
+    real stdout/stderr."""
+
+    def __init__(self):
+        self._out = io.StringIO()
+
+    def print(self, msg, **kwargs):
+        self._out.write(msg + "\n")
+
+    def getvalue(self) -> str:
+        return self._out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def write_mhl():
+    """Factory fixture that writes a minimal ASC-MHL 2.0 generation file.
+
+    Usage::
+
+        def test_something(tmp_path, write_mhl):
+            ascdir = tmp_path / "ascmhl"
+            ascdir.mkdir()
+            write_mhl(ascdir, "0001.mhl", [
+                {"path": "clip.mov", "size": "1000000",
+                 "action": "original", "digest": "aabbccdd"},
+            ])
+
+    Each entry dict must contain ``path``, ``size``, ``action``, and
+    ``digest``.  Returns the :class:`~pathlib.Path` of the written file.
+    """
+
+    def _write(ascdir: Path, name: str, entries: list[dict]) -> Path:
+        body = "".join(_HASH_ENTRY.format(**e) for e in entries)
+        mhl = ascdir / name
+        mhl.write_text(_MHL_TMPL.format(entries=body))
+        return mhl
+
+    return _write
+
+
+@pytest.fixture
+def load_fixture_mhl():
+    """Factory fixture that copies a fixture MHL file into a test directory.
+
+    Usage::
+
+        def test_something(tmp_path, load_fixture_mhl):
+            ascdir = tmp_path / "ascmhl"
+            ascdir.mkdir()
+            mhl = load_fixture_mhl(ascdir, "shotputpro_ascmhl.mhl")
+
+    The fixture file is read from the ``fixtures/`` directory next to this test
+    module and written verbatim into *dest_dir* under its original filename.
+    Returns the :class:`~pathlib.Path` of the written file.
+    """
+
+    def _load(dest_dir: Path, fixture_name: str) -> Path:
+        src = FIXTURES_DIR / fixture_name
+        dest = dest_dir / fixture_name
+        dest.write_bytes(src.read_bytes())
+        return dest
+
+    return _load
+
+
+@pytest.fixture
+def ascmhl_setup(tmp_path):
+    """Set up the layout ascmhl-debug expects and return the manifest path."""
+    pkg = tmp_path / "pkg"
+    ascdir = pkg / "ascmhl"
+    ascdir.mkdir(parents=True)
+    manifest = ascdir / "0001.mhl"
+    manifest.write_text("<dummy/>")
+    return manifest
+
+
+@pytest.fixture
+def mhlver_cli():
+    """Run mhlver.main() in-process and return (exit_code, stdout, stderr)."""
+
+    def _run_main(argv):
+        str_argv = [str(a) for a in argv]
+        old_argv = sys.argv
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.argv = ["mhlver", *str_argv]
+        out, err = io.StringIO(), io.StringIO()
+        sys.stdout, sys.stderr = out, err
+        exit_code = 0
+        try:
+            try:
+                mhlver.main()
+            except SystemExit as e:
+                exit_code = e.code if e.code is not None else 0
+        finally:
+            sys.argv = old_argv
+            sys.stdout, sys.stderr = old_out, old_err
+        return exit_code, out.getvalue(), err.getvalue()
+
+    return _run_main
 
 
 # ---------------------------------------------------------------------------
@@ -522,35 +660,21 @@ class TestAscMhlTotalBytes:
         )
         assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 1_811_635
 
-    def test_ascmhl_from_shotputpro_single_generation_with_directory_hashes(self, tmp_path, load_fixture_mhl):
-        """ShotPut Pro ASC-MHL
-
-        Expected total: 2246896176 + 4170 + 15758019120 + 4172 = 18_004_923_638
-        """
+    @pytest.mark.parametrize(
+        "fixture_name",
+        [
+            "shotputpro_ascmhl_example.mhl",
+            "silverstack_ascmhl_example.mhl",
+            "ocopy_ascmhl_example.mhl",
+        ],
+    )
+    def test_ascmhl_real_world_single_generation_total(self, tmp_path, load_fixture_mhl, fixture_name):
+        """Real-world single-generation ASC-MHL exports (with directory hashes)
+        from each vendor sum to the same aligned total."""
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
-        mhl = load_fixture_mhl(ascdir, "shotputpro_ascmhl_example.mhl")
-        assert mhlver._ascmhl_total_bytes(mhl) == 18_004_923_638
-
-    def test_ascmhl_from_silverstack_single_generation_with_directory_hashes(self, tmp_path, load_fixture_mhl):
-        """Silverstack Lab ASC-MHL
-
-        Expected total: 2246896176 + 4170 + 15758019120 + 4172 = 18_004_923_638
-        """
-        ascdir = tmp_path / "ascmhl"
-        ascdir.mkdir()
-        mhl = load_fixture_mhl(ascdir, "shotputpro_ascmhl_example.mhl")
-        assert mhlver._ascmhl_total_bytes(mhl) == 18_004_923_638
-
-    def test_ascmhl_from_ocopy_in_place_single_generation(self, tmp_path, load_fixture_mhl):
-        """o/COPY ASC-MHL
-
-        Expected total: 436085 + 2775033 + 161713671 = 164_924_789
-        """
-        ascdir = tmp_path / "ascmhl"
-        ascdir.mkdir()
-        mhl = load_fixture_mhl(ascdir, "ocopy_ascmhl_example.mhl")
-        assert mhlver._ascmhl_total_bytes(mhl) == 436085 + 2775033 + 161713671
+        mhl = load_fixture_mhl(ascdir, fixture_name)
+        assert mhlver._ascmhl_total_bytes(mhl) == _ALIGNED_FIXTURE_TOTAL_BYTES
 
     def test_corrupt_generation_file_is_skipped_others_still_counted(self, tmp_path, write_mhl):
         """A corrupt .mhl in the ascmhl dir must be silently skipped; valid
@@ -721,41 +845,23 @@ class TestAscMhlDispatch:
     output visibility, and command-not-found (127).
     """
 
-    def test_verify_clean_returns_zero(self, ascmhl_setup, monkeypatch):
-        """Exit 0 from ascmhl-debug verify -> mhlver returns 0."""
-        stub_run_step(monkeypatch, 0)
-        assert call_verify(ascmhl_setup) == 0
-
-    def test_verify_completeness_failure_propagates_10(self, ascmhl_setup, monkeypatch):
-        """Exit 10 (CompletenessCheckFailedException) propagates as-is."""
-        stub_run_step(monkeypatch, 10, "ERROR: 1 missing file(s):")
-        assert call_verify(ascmhl_setup) == 10
-
-    def test_verify_hash_mismatch_propagates_11(self, ascmhl_setup, monkeypatch):
-        """Exit 11 (VerificationFailedException) propagates as-is."""
-        stub_run_step(monkeypatch, 11, "ERROR: hash mismatch")
-        assert call_verify(ascmhl_setup) == 11
-
-    def test_verify_dir_hash_mismatch_propagates_12(self, ascmhl_setup, monkeypatch):
-        """Exit 12 (VerificationDirectoriesFailedException) propagates."""
-        stub_run_step(monkeypatch, 12)
-        assert call_verify(ascmhl_setup) == 12
-
-    def test_verify_no_history_propagates_30(self, ascmhl_setup, monkeypatch):
-        """Exit 30 (NoMHLHistoryException) propagates."""
-        stub_run_step(monkeypatch, 30)
-        assert call_verify(ascmhl_setup) == 30
-
-    def test_verify_modified_manifest_propagates_31(self, ascmhl_setup, monkeypatch):
-        """Exit 31 (ModifiedMHLManifestFileException) propagates."""
-        stub_run_step(monkeypatch, 31)
-        assert call_verify(ascmhl_setup) == 31
-
-    def test_verify_unknown_exit_code_falls_back(self, ascmhl_setup, monkeypatch):
-        """An unknown exit code from ascmhl-debug should still be returned,
-        not silently mapped to 0."""
-        stub_run_step(monkeypatch, 99, "weirdness")
-        assert call_verify(ascmhl_setup) == 99
+    @pytest.mark.parametrize(
+        ("exit_code", "output"),
+        [
+            (0, ""),  # clean
+            (10, "ERROR: 1 missing file(s):"),  # CompletenessCheckFailedException
+            (11, "ERROR: hash mismatch"),  # VerificationFailedException
+            (12, ""),  # VerificationDirectoriesFailedException
+            (30, ""),  # NoMHLHistoryException
+            (31, ""),  # ModifiedMHLManifestFileException
+            (99, "weirdness"),  # unknown code: returned unchanged, never mapped to 0
+        ],
+    )
+    def test_verify_exit_code_propagates(self, ascmhl_setup, monkeypatch, exit_code, output):
+        """Every exit code from ascmhl-debug verify is returned unchanged —
+        documented failures and unknown codes alike."""
+        stub_run_step(monkeypatch, exit_code, output)
+        assert call_verify(ascmhl_setup) == exit_code
 
     def test_schema_check_clean_returns_zero(self, ascmhl_setup, monkeypatch):
         """Both schema checks pass -> exit 0."""
@@ -889,83 +995,49 @@ class TestClassicMhlDispatch:
     is spawned and tests are independent of the installed environment.
     """
 
-    def test_verify_classicmhl_clean_returns_zero(self, tmp_path, monkeypatch):
-        """Exit 0 from simple-mhl -> _verify_classicmhl returns 0."""
+    @pytest.fixture
+    def classic_mhl(self, tmp_path, monkeypatch):
+        """A dummy .mhl plus a stubbed simple-mhl on PATH so _verify_classicmhl
+        runs without spawning a real subprocess."""
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
-        monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
-        stub_run_step(monkeypatch, 0)
-        rc, _mr = mhlver._verify_classicmhl(
-            target=mhl,
-            verbose=False,
-            schema=False,
-        )
-        assert rc == 0
+        # String (not Path) so verbose tests' _verbose_announce can " ".join(cmd).
+        monkeypatch.setattr(mhlver, "get_command_path", lambda _: "/fake/simple-mhl")
+        return mhl
 
-    def test_verify_classicmhl_invalid_argument_propagates_1(self, tmp_path, monkeypatch):
-        """Exit 1 from simple-mhl (bad argument) -> _verify_classicmhl returns 1."""
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
-        stub_run_step(monkeypatch, 1, "Verification Error: not an MHL file")
-        rc, _mr = mhlver._verify_classicmhl(
-            target=mhl,
-            verbose=False,
-            schema=False,
-        )
-        assert rc == 1
+    @pytest.mark.parametrize(
+        ("exit_code", "output"),
+        [
+            (0, ""),  # clean
+            (1, "Verification Error: not an MHL file"),  # bad argument
+            (20, "Malformed XML"),  # malformed XML
+            (30, ""),  # missing files
+            (40, ""),  # hash mismatch
+            (70, ""),  # missing + mismatch
+        ],
+    )
+    def test_verify_classicmhl_exit_code_propagates(self, classic_mhl, monkeypatch, exit_code, output):
+        """simple-mhl exit codes are returned unchanged by _verify_classicmhl."""
+        stub_run_step(monkeypatch, exit_code, output)
+        rc, _mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
+        assert rc == exit_code
 
-    def test_verify_classicmhl_malformed_xml_propagates_20(self, tmp_path, monkeypatch):
-        """Exit 20 from simple-mhl (malformed XML) -> _verify_classicmhl returns 20."""
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
-        stub_run_step(monkeypatch, 20, "Malformed XML")
-        rc, _mr = mhlver._verify_classicmhl(
-            target=mhl,
-            verbose=False,
-            schema=False,
-        )
-        assert rc == 20
-
-    def test_verify_classicmhl_missing_files_propagates_30(self, tmp_path, monkeypatch):
-        """Exit 30 from simple-mhl (missing files) -> _verify_classicmhl returns 30."""
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
-        stub_run_step(monkeypatch, 30)
-        rc, _mr = mhlver._verify_classicmhl(
-            target=mhl,
-            verbose=False,
-            schema=False,
-        )
-        assert rc == 30
-
-    def test_verify_classicmhl_hash_mismatch_propagates_40(self, tmp_path, monkeypatch):
-        """Exit 40 from simple-mhl (hash mismatch) -> _verify_classicmhl returns 40."""
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
-        stub_run_step(monkeypatch, 40)
-        rc, _mr = mhlver._verify_classicmhl(
-            target=mhl,
-            verbose=False,
-            schema=False,
-        )
+    def test_manifest_status_is_failed_when_output_is_parseable(self, classic_mhl, monkeypatch):
+        """A non-zero exit WITH parseable [ERROR] lines yields manifest_status
+        'failed' (not 'error')."""
+        stub_run_step(monkeypatch, 40, "[ERROR] hash mismatch: f.mxf")
+        rc, mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
         assert rc == 40
+        assert mr is not None
+        assert mr.manifest_status == "failed"
 
-    def test_verify_classicmhl_both_failures_propagates_70(self, tmp_path, monkeypatch):
-        """Exit 70 from simple-mhl (missing + mismatch) -> _verify_classicmhl returns 70."""
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        monkeypatch.setattr(mhlver, "get_command_path", lambda _: Path("/fake/simple-mhl"))
-        stub_run_step(monkeypatch, 70)
-        rc, _mr = mhlver._verify_classicmhl(
-            target=mhl,
-            verbose=False,
-            schema=False,
-        )
-        assert rc == 70
+    def test_manifest_status_is_error_when_output_is_empty(self, classic_mhl, monkeypatch):
+        """A non-zero exit with NO parseable output yields manifest_status 'error'."""
+        stub_run_step(monkeypatch, 20, "")
+        rc, mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
+        assert rc == 20
+        assert mr is not None
+        assert mr.manifest_status == "error"
 
     def test_verify_classicmhl_dispatch_table_covers_all_known_codes(self):
         """_CLASSICMHL_RESULTS must cover every exit code simple-mhl can emit."""
@@ -981,7 +1053,7 @@ class TestClassicMhlDispatch:
         rc, _mr = mhlver._verify_classicmhl(mhl, verbose=False, schema=False)
         assert rc == 127
 
-    def test_verbose_with_schema_does_not_add_v_flag(self, tmp_path, monkeypatch):
+    def test_verbose_with_schema_does_not_add_v_flag(self, classic_mhl, monkeypatch):
         """With verbose=True and schema=True, -v must NOT be appended
         (xsd-schema-check has no per-file output)."""
         captured_cmd = {}
@@ -990,15 +1062,12 @@ class TestClassicMhlDispatch:
             captured_cmd["cmd"] = cmd
             return mhlver.StepResult(exit_code=0, output="")
 
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
         monkeypatch.setattr(mhlver, "_run_step", _stub)
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        mhlver._verify_classicmhl(mhl, verbose=True, schema=True)
+        mhlver._verify_classicmhl(classic_mhl, verbose=True, schema=True)
         assert "-v" not in captured_cmd["cmd"]
         assert "xsd-schema-check" in captured_cmd["cmd"]
 
-    def test_verbose_without_schema_adds_v_flag(self, tmp_path, monkeypatch):
+    def test_verbose_without_schema_adds_v_flag(self, classic_mhl, monkeypatch):
         """With verbose=True and schema=False, -v IS appended."""
         captured_cmd = {}
 
@@ -1006,21 +1075,15 @@ class TestClassicMhlDispatch:
             captured_cmd["cmd"] = cmd
             return mhlver.StepResult(exit_code=0, output="")
 
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
         monkeypatch.setattr(mhlver, "_run_step", _stub)
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        mhlver._verify_classicmhl(mhl, verbose=True, schema=False)
+        mhlver._verify_classicmhl(classic_mhl, verbose=True, schema=False)
         assert "-v" in captured_cmd["cmd"]
 
-    def test_schema_uses_classicmhl_schema_results_table(self, tmp_path, monkeypatch, capsys):
+    def test_schema_uses_classicmhl_schema_results_table(self, classic_mhl, monkeypatch, capsys):
         """With schema=True, exit 60 is looked up in _CLASSICMHL_SCHEMA_RESULTS
         (which has a specific message) not _CLASSICMHL_RESULTS (which doesn't)."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/simple-mhl")
         monkeypatch.setattr(mhlver, "_run_step", lambda cmd, **kw: mhlver.StepResult(60, ""))
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        rc, _mr = mhlver._verify_classicmhl(mhl, verbose=False, schema=True)
+        rc, _mr = mhlver._verify_classicmhl(classic_mhl, verbose=False, schema=True)
         assert rc == 60
         captured = capsys.readouterr()
         assert "schema" in (captured.out + captured.err).lower()
@@ -1036,20 +1099,9 @@ class TestLogHelpers:
 
     def test_log_routes_through_console(self, capsys):
         """When a console object is passed, _log uses console.print, not print()."""
-
-        console_out = io.StringIO()
-
-        class FakeConsole:
-            def print(self, msg, **kwargs):
-                console_out.write(msg + "\n")
-
-        mhlver._log(
-            "hello",
-            colour="",
-            stream=None,
-            console=FakeConsole(),
-        )
-        assert "hello" in console_out.getvalue()
+        console = FakeConsole()
+        mhlver._log("hello", colour="", stream=None, console=console)
+        assert "hello" in console.getvalue()
         # Nothing should have leaked to the real stdout/stderr.
         captured = capsys.readouterr()
         assert "hello" not in captured.out
@@ -1063,27 +1115,15 @@ class TestLogHelpers:
 
     def test_emit_step_output_success_via_console(self, capsys):
         """On exit_code==0, a console object is used instead of print()."""
-
-        console_out = io.StringIO()
-
-        class FakeConsole:
-            def print(self, msg, **kwargs):
-                console_out.write(msg + "\n")
-
-        mhlver._emit_step_output("OK: file.bin", 0, show_on_terminal=True, console=FakeConsole())
-        assert "OK: file.bin" in console_out.getvalue()
+        console = FakeConsole()
+        mhlver._emit_step_output("OK: file.bin", 0, show_on_terminal=True, console=console)
+        assert "OK: file.bin" in console.getvalue()
 
     def test_emit_step_output_failure_via_console(self, capsys):
         """On exit_code!=0, a console object is used for the error output."""
-
-        console_out = io.StringIO()
-
-        class FakeConsole:
-            def print(self, msg, **kwargs):
-                console_out.write(msg + "\n")
-
-        mhlver._emit_step_output("ERR: file.bin", 1, show_on_terminal=True, console=FakeConsole())
-        assert "ERR: file.bin" in console_out.getvalue()
+        console = FakeConsole()
+        mhlver._emit_step_output("ERR: file.bin", 1, show_on_terminal=True, console=console)
+        assert "ERR: file.bin" in console.getvalue()
         # Nothing should have leaked to real stderr.
         assert "ERR: file.bin" not in capsys.readouterr().err
 
@@ -1116,20 +1156,9 @@ class TestLogHelpers:
 
     def test_verbose_announce_via_console(self):
         """_verbose_announce routes through console when provided."""
-
-        console_out = io.StringIO()
-
-        class FakeConsole:
-            def print(self, msg, **kwargs):
-                console_out.write(msg + "\n")
-
-        mhlver._verbose_announce(
-            ["/bin/cmd"],
-            cwd=None,
-            verbose=True,
-            console=FakeConsole(),
-        )
-        assert "running:" in console_out.getvalue()
+        console = FakeConsole()
+        mhlver._verbose_announce(["/bin/cmd"], cwd=None, verbose=True, console=console)
+        assert "running:" in console.getvalue()
 
     def test_verbose_announce_noop_when_not_verbose(self, capsys):
         """_verbose_announce produces no output when verbose=False."""
@@ -1293,36 +1322,20 @@ class TestMhlTotalBytes:
         )
         assert mhlver._mhl_total_bytes(mhl) == 50
 
-    def test_classicmhl_from_shotputpro(self, tmp_path, load_fixture_mhl):
-        """ShotPutPro classic MHL
-
-        Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919_466
-        """
-        mhl = load_fixture_mhl(tmp_path, "shotputpro_classicmhl_example.mhl")
-        assert mhlver._mhl_total_bytes(mhl) == 2246896176 + 4170 + 15758019120
-
-    def test_classicmhl_from_silverstack(self, tmp_path, load_fixture_mhl):
-        """ShotPutPro classic MHL
-
-        Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919_466
-        """
-        mhl = load_fixture_mhl(tmp_path, "silverstack_classicmhl_example.mhl")
-        assert mhlver._mhl_total_bytes(mhl) == 2246896176 + 4170 + 15758019120
-
-    def test_classicmhl_from_ocopy(self, tmp_path, load_fixture_mhl):
-        """o/COPY classic MHL
-
-        Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919,466
-        """
-        mhl = load_fixture_mhl(tmp_path, "ocopy_classicmhl_example.mhl")
-        assert mhlver._mhl_total_bytes(mhl) == 18_004_919_466
-
-    def test_classicmhl_from_offshoot(self, tmp_path, load_fixture_mhl):
-        """OffShoot classic MHL
-        Expected total: 2246896176 + 4170 + 15758019120 = 18_004_919,466
-        """
-        mhl = load_fixture_mhl(tmp_path, "offshoot_classicmhl_example.mhl")
-        assert mhlver._mhl_total_bytes(mhl) == 18_004_919_466
+    @pytest.mark.parametrize(
+        "fixture_name",
+        [
+            "shotputpro_classicmhl_example.mhl",
+            "silverstack_classicmhl_example.mhl",
+            "ocopy_classicmhl_example.mhl",
+            "offshoot_classicmhl_example.mhl",
+        ],
+    )
+    def test_classicmhl_real_world_total(self, tmp_path, load_fixture_mhl, fixture_name):
+        """Real-world classic MHL exports from each vendor sum to the same
+        aligned total."""
+        mhl = load_fixture_mhl(tmp_path, fixture_name)
+        assert mhlver._mhl_total_bytes(mhl) == _ALIGNED_FIXTURE_TOTAL_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -1429,27 +1442,18 @@ class TestRun:
         rc, _ = mhlver._run(pipe, verbose=False, schema=False)
         assert rc == 0
 
-    def test_run_writes_to_report_file(self, tmp_path, monkeypatch):
-        """_render_report writes a structured report with a summary line."""
-
+    def test_run_writes_structured_report(self, tmp_path, monkeypatch):
+        """A successful _run feeds _render_report a result that renders both the
+        PASSED summary line and the separator rules."""
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, None))
         (tmp_path / "a.mhl").write_text("")
         rc, mrs = mhlver._run(tmp_path, verbose=False, schema=False)
         buf = io.StringIO()
         mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mrs, rc)
-        assert "PASSED" in buf.getvalue()
-
-    def test_run_with_report_file_includes_separator(self, tmp_path, monkeypatch):
-        """_render_report includes separator lines in its output."""
-
-        monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
-        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, None))
-        (tmp_path / "a.mhl").write_text("")
-        rc, mrs = mhlver._run(tmp_path, verbose=False, schema=False)
-        buf = io.StringIO()
-        mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mrs, rc)
-        assert "---" in buf.getvalue()
+        report = buf.getvalue()
+        assert "PASSED" in report
+        assert "---" in report
 
 
 # ---------------------------------------------------------------------------
@@ -1665,11 +1669,11 @@ class TestMain:
         exists, mhlver appends a 'did you mean' hint — parity with simple-mhl
         via the shared unicodepaths helper. The helper is stubbed here; its own
         resolution logic is covered by the simple-mhl test suite."""
-        monkeypatch.setattr(mhlver, "normalization_variant_on_disk", lambda p: "/vol/café_nfd.mhl")
-        rc, _, err = mhlver_cli(["/vol/café_nfc.mhl"])
+        monkeypatch.setattr(mhlver, "normalization_variant_on_disk", lambda p: "/vol/rosé_nfd.mhl")
+        rc, _, err = mhlver_cli(["/vol/rosé_nfc.mhl"])
         assert rc == 2
         assert "did you mean" in err.lower()
-        assert "café_nfd.mhl" in err
+        assert "rosé_nfd.mhl" in err
 
     def test_nonexistent_path_no_variant_is_plain_error(self, mhlver_cli, monkeypatch):
         """A genuine typo (no normalization variant) gives the plain error, no hint."""
@@ -1801,3 +1805,343 @@ class TestRunStepRobustness:
         assert "ok" in result.output
         assert "bad" in result.output
         assert "�" in result.output  # the 0xff became a replacement char
+
+
+# ---------------------------------------------------------------------------
+# TestParseClassicMhlOutput
+# ---------------------------------------------------------------------------
+
+
+class TestParseClassicMhlOutput:
+    """Direct unit tests for the simple-mhl output parser. It is a pure
+    string→FileResult function, so we exercise every branch with crafted
+    backend output rather than spawning the real backend."""
+
+    def test_ok_line(self):
+        results = mhlver._parse_classicmhl_output("[OK] a/b.mxf")
+        assert results == [mhlver.FileResult(path="a/b.mxf", status="ok")]
+
+    def test_missing_line(self):
+        results = mhlver._parse_classicmhl_output("[ERROR] missing file: gone.mxf")
+        assert results == [mhlver.FileResult(path="gone.mxf", status="missing")]
+
+    def test_mismatch_without_detail(self):
+        """A bare mismatch line (non-verbose) keeps the mismatch type as detail."""
+        results = mhlver._parse_classicmhl_output("[ERROR] hash mismatch: f.mxf")
+        assert results == [mhlver.FileResult(path="f.mxf", status="mismatch", detail="hash mismatch")]
+
+    def test_mismatch_with_verbose_detail_consumes_next_line(self):
+        """The indented parenthetical on the following line is attached and consumed."""
+        output = "[ERROR] hash mismatch: f.mxf\n        (calc xxhash64be: abc | stored xxhash64be: def)"
+        results = mhlver._parse_classicmhl_output(output)
+        assert results == [
+            mhlver.FileResult(
+                path="f.mxf",
+                status="mismatch",
+                detail="hash mismatch: calc xxhash64be: abc | stored xxhash64be: def",
+            )
+        ]
+
+    def test_size_mismatch_type_is_preserved(self):
+        results = mhlver._parse_classicmhl_output("[ERROR] size mismatch: f.mxf")
+        assert results == [mhlver.FileResult(path="f.mxf", status="mismatch", detail="size mismatch")]
+
+    def test_error_category_becomes_detail(self):
+        results = mhlver._parse_classicmhl_output("[ERROR] malformed size field: weird.mxf")
+        assert results == [mhlver.FileResult(path="weird.mxf", status="error", detail="malformed size field")]
+
+    def test_cannot_verify_carries_reason(self):
+        results = mhlver._parse_classicmhl_output("[ERROR] cannot verify x.mxf: unsupported algo")
+        assert results == [mhlver.FileResult(path="x.mxf", status="error", detail="unsupported algo")]
+
+    def test_unrecognized_lines_are_ignored(self):
+        results = mhlver._parse_classicmhl_output("some banner\n\nVerifying...")
+        assert results == []
+
+
+# ---------------------------------------------------------------------------
+# TestParseAscMhlOutput
+# ---------------------------------------------------------------------------
+
+
+class TestParseAscMhlOutput:
+    """Direct unit tests for the ascmhl-debug output parser."""
+
+    def test_ok_line(self):
+        results = mhlver._parse_ascmhl_output("verification (xxh64) of file a/b.mxf: OK")
+        assert results == [mhlver.FileResult(path="a/b.mxf", status="ok")]
+
+    def test_mismatch_reorders_old_new_into_stored_calc(self):
+        """ascmhl reports old=stored, new=calculated; the parser normalises that."""
+        line = "ERROR: hash mismatch        for f.mxf old xxh64: AAA, new xxh64: BBB"
+        results = mhlver._parse_ascmhl_output(line)
+        assert results == [
+            mhlver.FileResult(
+                path="f.mxf",
+                status="mismatch",
+                detail="hash mismatch: calc xxh64: BBB | stored xxh64: AAA",
+            )
+        ]
+
+    def test_new_file(self):
+        results = mhlver._parse_ascmhl_output("found new file extra.mxf")
+        assert results == [mhlver.FileResult(path="extra.mxf", status="new")]
+
+    def test_missing_block_collects_indented_entries(self):
+        output = "ERROR: 2 missing file(s):\n    one.mxf\n    two.mxf"
+        results = mhlver._parse_ascmhl_output(output)
+        assert results == [
+            mhlver.FileResult(path="one.mxf", status="missing"),
+            mhlver.FileResult(path="two.mxf", status="missing"),
+        ]
+
+    def test_non_indented_line_ends_missing_block(self):
+        """A subsequent non-indented OK line terminates the missing block and is
+        parsed normally."""
+        output = "ERROR: 1 missing file(s):\n    gone.mxf\nverification (xxh64) of file ok.mxf: OK"
+        results = mhlver._parse_ascmhl_output(output)
+        assert results == [
+            mhlver.FileResult(path="gone.mxf", status="missing"),
+            mhlver.FileResult(path="ok.mxf", status="ok"),
+        ]
+
+    def test_informational_lines_are_skipped(self):
+        output = "check folder at path: /x\nignoring filepath /y\nError: something"
+        assert mhlver._parse_ascmhl_output(output) == []
+
+
+# ---------------------------------------------------------------------------
+# TestManifestResultCounts
+# ---------------------------------------------------------------------------
+
+
+class TestManifestResultCounts:
+    """The n_* convenience properties on ManifestResult tally file_results by
+    status; verify each counts only its own status."""
+
+    def test_counts_by_status(self):
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("m.mhl"),
+            manifest_status="failed",
+            file_results=[
+                mhlver.FileResult(path="a", status="ok"),
+                mhlver.FileResult(path="b", status="ok"),
+                mhlver.FileResult(path="c", status="missing"),
+                mhlver.FileResult(path="d", status="mismatch"),
+                mhlver.FileResult(path="e", status="new"),
+                mhlver.FileResult(path="f", status="error"),
+            ],
+        )
+        assert mr.n_ok == 2
+        assert mr.n_missing == 1
+        assert mr.n_mismatch == 1
+        assert mr.n_new == 1
+        assert mr.n_error == 1
+        assert mr.n_files == 6
+
+    def test_empty_results_are_all_zero(self):
+        mr = mhlver.ManifestResult(manifest_path=Path("m.mhl"), manifest_status="ok")
+        assert (mr.n_ok, mr.n_missing, mr.n_mismatch, mr.n_new, mr.n_error, mr.n_files) == (0, 0, 0, 0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# TestRenderReportDetails
+# ---------------------------------------------------------------------------
+
+
+class TestRenderReportDetails:
+    """_render_report is a pure fn writing to a file handle. The TestRun cases
+    only feed it empty/all-OK results, leaving the per-status summary appends,
+    the Details section, and the manifest-error line uncovered. Here we feed it
+    populated ManifestResults to exercise those branches."""
+
+    def _render(self, manifest_results, exit_status):
+        buf = io.StringIO()
+        mhlver._render_report(buf, Path("/src"), mhlver.datetime.now(), manifest_results, exit_status)
+        return buf.getvalue()
+
+    def test_summary_lists_each_nonzero_status(self):
+        """A manifest with one of every failing status produces a summary line
+        naming missing / hash mismatch / error / new counts."""
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("m.mhl"),
+            manifest_status="failed",
+            file_results=[
+                mhlver.FileResult(path="ok.mxf", status="ok"),
+                mhlver.FileResult(path="gone.mxf", status="missing"),
+                mhlver.FileResult(path="bad.mxf", status="mismatch"),
+                mhlver.FileResult(path="boom.mxf", status="error", detail="boom"),
+                mhlver.FileResult(path="extra.mxf", status="new"),
+            ],
+        )
+        out = self._render([mr], exit_status=40)
+
+        assert "❌ FAILED" in out
+        assert "1 missing" in out
+        assert "1 hash mismatch" in out
+        assert "1 error" in out
+        assert "1 new (untracked)" in out
+        # Details section is rendered for a non-empty result set.
+        assert "Details" in out
+        assert "📄 m.mhl" in out
+        # Per-file lines come from _format_file_result.
+        assert "gone.mxf" in out
+        assert "extra.mxf" in out
+
+    def test_manifest_level_error_renders_error_line(self):
+        """A manifest whose own status is 'error' prints the manifest error and
+        skips per-file rendering."""
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("broken.mhl"),
+            manifest_status="error",
+            manifest_error="could not read manifest",
+        )
+        out = self._render([mr], exit_status=20)
+        assert "📄 broken.mhl" in out
+        assert "could not read manifest" in out
+
+    def test_manifest_error_falls_back_to_default_text(self):
+        """When manifest_status is 'error' but no message was attached, a generic
+        label is printed instead."""
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("broken.mhl"),
+            manifest_status="error",
+            manifest_error="",
+        )
+        out = self._render([mr], exit_status=20)
+        assert "manifest-level error" in out
+
+
+# ---------------------------------------------------------------------------
+# TestFormatFileResult
+# ---------------------------------------------------------------------------
+
+
+class TestFormatFileResult:
+    """_format_file_result is a pure status→string mapper; cover every arm."""
+
+    def test_ok(self):
+        out = mhlver._format_file_result(mhlver.FileResult(path="f.mxf", status="ok"))
+        assert "✓" in out
+        assert "f.mxf" in out
+
+    def test_missing(self):
+        out = mhlver._format_file_result(mhlver.FileResult(path="f.mxf", status="missing"))
+        assert "missing" in out
+        assert "f.mxf" in out
+
+    def test_mismatch_with_verbose_detail_splits_label_and_parenthetical(self):
+        fr = mhlver.FileResult(path="f.mxf", status="mismatch", detail="hash mismatch: calc a | stored b")
+        out = mhlver._format_file_result(fr)
+        assert "hash mismatch: f.mxf" in out
+        assert "(calc a | stored b)" in out
+
+    def test_mismatch_without_detail_uses_fallback(self):
+        fr = mhlver.FileResult(path="f.mxf", status="mismatch", detail="size mismatch")
+        out = mhlver._format_file_result(fr)
+        assert "size mismatch: f.mxf" in out
+        assert "\n" not in out  # no parenthetical second line
+
+    def test_new(self):
+        out = mhlver._format_file_result(mhlver.FileResult(path="f.mxf", status="new"))
+        assert "new (untracked)" in out
+        assert "f.mxf" in out
+
+    def test_error_with_detail(self):
+        fr = mhlver.FileResult(path="f.mxf", status="error", detail="boom")
+        out = mhlver._format_file_result(fr)
+        assert "error" in out
+        assert "f.mxf" in out
+        assert "(boom)" in out
+
+    def test_error_without_detail(self):
+        out = mhlver._format_file_result(mhlver.FileResult(path="f.mxf", status="error"))
+        assert "error" in out
+        assert "f.mxf" in out
+        assert "\n" not in out  # no detail line
+
+
+# ---------------------------------------------------------------------------
+# TestSchemaShapedAscMhlFuzz
+# ---------------------------------------------------------------------------
+
+# Adversarial leaf values for the typed fields the ASC-MHL 2.0 schema defines.
+# The <path size="…"> attribute is xs:integer (so negatives are schema-legal),
+# and the byte-counting helpers must treat anything non-decimal as "no size".
+_fuzz_text = strategies.text(
+    alphabet=strategies.characters(blacklist_categories=("Cs", "Cc", "Cn")),
+    max_size=40,
+)
+_fuzz_size_attr = strategies.one_of(
+    strategies.sampled_from(
+        ["0", "1", "-5", "12345", "9" * 40, "1.5", "", "  10  ", "007", "0x1F", "abc", "+3", "NaN", "१२३"]
+    ),
+    strategies.integers(min_value=-10, max_value=10**15).map(str),
+    strategies.none(),  # omit the attribute entirely
+)
+_fuzz_action = strategies.sampled_from(["original", "verified", "failed", "bogus", "", "ORIGINAL"])
+# (path_text, size_attr, action, digest, is_directoryhash)
+_asc_entry = strategies.tuples(_fuzz_text, _fuzz_size_attr, _fuzz_action, _fuzz_text, strategies.booleans())
+
+
+def _build_ascmhl_fuzz(entries) -> bytes:
+    """Build a well-formed ASC-MHL 2.0 manifest (correct namespace + structure)
+    with fuzzed <path> text/size and hash action/digest. lxml guarantees
+    well-formedness so the fuzzing targets size parsing, not the serializer.
+
+    Tags use Clark notation (``{ns}tag``) so the namespace URI is correct; we
+    don't force a default-namespace nsmap because the parser under test queries
+    with a ``{*}`` wildcard, so the prefix style is irrelevant.
+    """
+    root = etree.Element(f"{{{_ASCMHL_NAMESPACE}}}hashlist", version="2.0")
+    hashes = etree.SubElement(root, f"{{{_ASCMHL_NAMESPACE}}}hashes")
+    for path_text, size_attr, action, digest, is_dir in entries:
+        kind = "directoryhash" if is_dir else "hash"
+        h = etree.SubElement(hashes, f"{{{_ASCMHL_NAMESPACE}}}{kind}")
+        p = etree.SubElement(h, f"{{{_ASCMHL_NAMESPACE}}}path")
+        p.text = path_text or None
+        if size_attr is not None:
+            p.set("size", size_attr)
+        xx = etree.SubElement(h, f"{{{_ASCMHL_NAMESPACE}}}xxh64")
+        xx.text = digest or None
+        if action:
+            xx.set("action", action)
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8")
+
+
+class TestSchemaShapedAscMhlFuzz:
+    """Schema-shaped value fuzzing of the byte-counting helpers that parse
+    manifest XML directly (no external backend needed). For any well-formed,
+    XSD-shaped manifest with adversarial typed values, the helpers must return a
+    non-negative int and never raise — they are called while building the
+    progress bar, so a crash there aborts an otherwise-fine verify run."""
+
+    @given(entries=strategies.lists(_asc_entry, min_size=1, max_size=6))
+    @settings(max_examples=120, suppress_health_check=[HealthCheck.too_slow])
+    def test_ascmhl_total_bytes_is_nonnegative_and_never_raises(self, entries):
+        xml = _build_ascmhl_fuzz(entries)
+        with tempfile.TemporaryDirectory() as tmp:
+            ascdir = Path(tmp) / "ascmhl"
+            ascdir.mkdir()
+            mhl = ascdir / "0001.mhl"
+            mhl.write_bytes(xml)
+            total = mhlver._ascmhl_total_bytes(mhl)
+            assert isinstance(total, int)
+            assert total >= 0
+
+    @given(entries=strategies.lists(strategies.tuples(_fuzz_text, _fuzz_size_attr), max_size=6))
+    @settings(max_examples=120, suppress_health_check=[HealthCheck.too_slow])
+    def test_mhl_total_bytes_is_nonnegative_and_never_raises(self, entries):
+        root = etree.Element("hashlist", version="1.1")
+        for file_text, size_text in entries:
+            h = etree.SubElement(root, "hash")
+            etree.SubElement(h, "file").text = file_text or None
+            if size_text is not None:
+                etree.SubElement(h, "size").text = size_text
+        xml = etree.tostring(root, xml_declaration=True, encoding="UTF-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            mhl = Path(tmp) / "classic.mhl"
+            mhl.write_bytes(xml)
+            total = mhlver._mhl_total_bytes(mhl)
+            assert isinstance(total, int)
+            assert total >= 0

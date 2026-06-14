@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
 """Test suite for simple_mhl.py."""
 
 import hashlib
+import io
 import os
 import random
 import re
@@ -85,6 +85,31 @@ def make_mhl(dest_dir: Path, entries: list[dict]) -> Path:
     return mhl
 
 
+@pytest.fixture
+def mhl_cli():
+    """Fixture to execute simple_mhl in-process and capture results."""
+
+    def _run(argv):
+        # Convert Path objects to strings to prevent sys.argv type errors
+        str_argv = [str(arg) for arg in argv]
+
+        old_argv, old_stdout, old_stderr = sys.argv, sys.stdout, sys.stderr
+        sys.argv = ["simple-mhl", *str_argv]
+        out, err = io.StringIO(), io.StringIO()
+        sys.stdout, sys.stderr = out, err
+        try:
+            exit_code = 0
+            try:
+                simple_mhl.main()
+            except SystemExit as e:
+                exit_code = e.code if e.code is not None else 0
+            return exit_code, out.getvalue(), err.getvalue()
+        finally:
+            sys.argv, sys.stdout, sys.stderr = old_argv, old_stdout, old_stderr
+
+    return _run
+
+
 # ---------------------------------------------------------------------------
 # TestSeal
 # ---------------------------------------------------------------------------
@@ -150,7 +175,7 @@ class TestSeal:
             tmp_path,
             {
                 "日本語.bin": b"japanese",
-                "café/résumé.txt": b"french",
+                "rosé/résumé.txt": b"french",
                 "🎬.mp4": b"emoji",
             },
         )
@@ -159,7 +184,7 @@ class TestSeal:
         assert rc == 0
         text = next(tmp_path.glob("*.mhl")).read_text(encoding="utf-8")
         assert "日本語.bin" in text
-        assert "café/résumé.txt" in text
+        assert "rosé/résumé.txt" in text
         assert "🎬.mp4" in text
 
     def test_seal_empty_file(self, mhl_cli, tmp_path):
@@ -333,6 +358,37 @@ class TestVerify:
         # "world" (5 bytes) → "changed" (7 bytes): size pre-check fires first.
         assert "bad.bin" in out
         assert "[ERROR]" in out
+
+    def test_verify_verbose_hash_mismatch_shows_calc_and_stored(self, mhl_cli, tmp_path):
+        """A same-size content change must pass the size pre-check and reach the
+        hash comparison, so --verbose prints the calc/stored hash detail line."""
+        make_tree(tmp_path, {"a.bin": b"world"})
+        mhl = seal_helper(mhl_cli, tmp_path)
+        # Same byte length (5) so the size pre-check passes and the hash differs.
+        (tmp_path / "a.bin").write_bytes(b"wXrld")
+
+        rc, out, _ = mhl_cli(["verify", "-v", str(mhl)])
+        assert rc == 40
+        assert "hash mismatch: a.bin" in out
+        assert "calc" in out
+        assert "stored" in out
+
+    def test_iter_files_without_on_skip_skips_hidden(self, tmp_path):
+        """_iter_files_for_seal's on_skip callback is optional. With on_skip=None
+        a hidden entry must still be skipped silently (no callback invoked, no
+        crash) and excluded from the yielded files."""
+        make_tree(tmp_path, {"visible.bin": b"x", ".hidden.bin": b"y"})
+        mhl_path = str(tmp_path / "out.mhl")
+        yielded = [os.path.basename(p) for p, _ in simple_mhl._iter_files_for_seal(str(tmp_path), mhl_path)]
+        assert yielded == ["visible.bin"]
+
+    def test_iter_files_without_on_skip_skips_non_regular(self, tmp_path):
+        """A non-regular file (FIFO) must be skipped silently when on_skip=None."""
+        make_tree(tmp_path, {"visible.bin": b"x"})
+        os.mkfifo(tmp_path / "pipe")
+        mhl_path = str(tmp_path / "out.mhl")
+        yielded = [os.path.basename(p) for p, _ in simple_mhl._iter_files_for_seal(str(tmp_path), mhl_path)]
+        assert yielded == ["visible.bin"]
 
     def test_verify_directory_argument(self, mhl_cli, tmp_path):
         """Passing a directory to verify should exit 1 with an error on stderr."""
@@ -597,7 +653,7 @@ class TestStressAndEdgeCases:
         root = etree.Element(
             f"{{{ns}}}hashlist",
             version="1.1",
-            nsmap=cast(dict[str, str], {None: ns}),  # lxml requires None for default ns
+            nsmap=cast("dict[str, str]", {None: ns}),  # lxml requires None for default ns
         )
         h = etree.SubElement(root, f"{{{ns}}}hash")
         etree.SubElement(h, f"{{{ns}}}file").text = "x.bin"
@@ -643,19 +699,18 @@ class TestSealAtomicCollision:
     # Two tests need to deterministically control the timestamp that seal()
     # uses for its filename — they freeze datetime.now() to a fixed value and
     # pre-create collider files at the known path. Both tests share identical
-    # patch boilerplate, so we factor it into a class-scoped fixture that:
+    # patch boilerplate, so we factor it into a fixture that:
     #
-    #   * patches mhl_suite.simple_mhl.datetime once for the whole class
-    #   * exposes the frozen timestamp string (ts) and base dir name (base)
-    #     as attributes on the fixture object
+    #   * patches mhl_suite.simple_mhl.datetime for the duration of the test
+    #   * exposes the frozen timestamp string (ts) on the yielded object
     #
     # Tests that don't need a fixed timestamp (the first three) ignore it.
-    # The fixture is class-scoped because the patch has no side-effects that
-    # would bleed between tests — each test still gets its own tmp_path.
+    # The fixture is function-scoped so the patch is torn down with each test
+    # rather than bleeding into later tests in the class.
 
-    @pytest.fixture(scope="class")
+    @pytest.fixture
     def frozen_dt(self):
-        """Freeze simple_mhl's datetime to 2025-06-01T12:00:00Z for the class.
+        """Freeze simple_mhl's datetime to 2025-06-01T12:00:00Z for the test.
 
         Yields a namespace with .ts (the formatted timestamp string) so tests
         can construct known collision filenames without repeating the patch.
@@ -1457,6 +1512,187 @@ class TestRobustness:
 
 
 # ---------------------------------------------------------------------------
+# TestSchemaShapedClassicMhlFuzz
+# ---------------------------------------------------------------------------
+
+# Schema-shaped value fuzzing — complements TestRobustness, which mutates bytes
+# and therefore mostly yields *malformed* XML. Here we build *well-formed*
+# manifests that follow the MediaHashList_v1_1.xsd element structure but inject
+# adversarial values into the typed leaf fields the schema defines:
+#   * <size>            (xs:positiveInteger)
+#   * the hash digests  (md5/sha1: fixed-length hexBinary; xxhash: bounded int)
+#   * the version attr  (versionType: decimal, 1 fraction digit, >= 0)
+# This models the realistic threat: a user hand-edits a schema-valid manifest
+# and inadvertently introduces wrong values, invalid characters, or encoding
+# artifacts (NBSP, zero-width spaces, BOM, homoglyphs, full-width digits…).
+# These inputs parse cleanly and so reach the value-handling code paths that
+# byte-level corruption never gets to.
+
+_FUZZ_VERSIONS = ["1.1", "1.0", "2.0", "0", "-1", "1.11", "", "abc", "1e5", "99.9"]
+_FUZZ_SIZES = [
+    "0",
+    "-1",
+    "1",
+    "12345",
+    "9" * 40,
+    "1.5",
+    "",
+    "   10   ",
+    "007",
+    "0x1F",
+    "1e3",
+    "NaN",
+    "abc",
+    "+5",
+    "  ",
+    "१२३",
+    "٢٣",
+]
+_CLASSIC_HASH_TAGS = ["md5", "sha1", "xxhash", "xxhash64", "xxhash64be", "null"]
+# Digest pool weighted toward "user tampered the hash" mistakes: wrong length,
+# non-hex, mixed case, and - crucially - invalid-character / encoding artifacts
+# a copy-paste or a re-save-in-another-editor injects. The odd-character values
+# are written as escapes (not literal glyphs) so the source stays reviewable and
+# free of ambiguous Unicode, while the runtime strings carry the real bytes.
+_FUZZ_DIGESTS = [
+    "",
+    "0" * 32,
+    "0" * 40,
+    "deadbeefdeadbeef",
+    "DEADBEEFDEADBEEF",
+    "g" * 32,
+    "12345",
+    "9999999999",
+    "z",
+    "   abc   ",
+    "../etc",
+    "\u00a0deadbeefdeadbeef",  # leading no-break space
+    "deadbeef\u200bdeadbeef",  # embedded zero-width space
+    "deadbeefdeadbeef\ufeff",  # trailing BOM / ZW no-break space
+    "d\u0435\u0430db\u0435\u0435f",  # Cyrillic homoglyphs that look ASCII
+    "\uff44\uff45\uff41\uff44",  # full-width latin "dead"
+    "\U0001d589\U0001d58a\U0001d586\U0001d589",  # mathematical fraktur "dead" (astral)
+    "rose\u0301rose\u0301",  # combining acute accents
+    "deadbeef\ndeadbeef",  # embedded newline
+]
+_FUZZ_FILES = [
+    "a.bin",
+    "",
+    "über.mov",
+    "a b.txt",
+    "name&<>'\".bin",
+    "💾.mov",
+    "x" * 250,
+    "./rel",
+    "CON",
+    "a/b/c.mxf",
+]
+
+
+def _build_classic_fuzz_manifest(rng: random.Random) -> bytes:
+    """Build a well-formed classic-MHL manifest whose leaf values are drawn from
+    the adversarial pools above. Structure follows the XSD; only values vary.
+
+    Built with lxml so the document is always well-formed and correctly escaped
+    — the fuzzing targets the tool's value handling, not the XML serializer.
+    """
+    root = etree.Element("hashlist", version=rng.choice(_FUZZ_VERSIONS))
+    for _ in range(rng.randint(1, 4)):
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = rng.choice(_FUZZ_FILES) or None
+        etree.SubElement(h, "size").text = rng.choice(_FUZZ_SIZES)
+        etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+        # The XSD permits one-or-more hash children (xs:choice, unbounded).
+        for _ in range(rng.randint(1, 2)):
+            tag = rng.choice(_CLASSIC_HASH_TAGS)
+            etree.SubElement(h, tag).text = "" if tag == "null" else rng.choice(_FUZZ_DIGESTS)
+        etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8")
+
+
+class TestSchemaShapedClassicMhlFuzz:
+    """Well-formed, XSD-shaped manifests with adversarial leaf values must always
+    yield a defined exit code — never an uncaught exception. A fixed seed keeps
+    failures reproducible. Complements TestRobustness's byte-mutation fuzz."""
+
+    def test_verify_on_schema_shaped_values(self, mhl_cli, tmp_path):
+        """verify must return one of its documented codes for any schema-shaped
+        manifest, whatever junk lives in the typed value fields. The referenced
+        files don't exist, so this exercises XML parsing, the version attribute,
+        path resolution and the missing-file path. (The size pre-check and digest
+        comparison sit *after* the existence check, so they are covered by the
+        existing-file tests below, not here.)"""
+        rng = random.Random(1234)
+        for i in range(80):
+            mhl = tmp_path / f"fuzz_{i}.mhl"
+            mhl.write_bytes(_build_classic_fuzz_manifest(rng))
+            rc, _, _ = mhl_cli(["verify", str(mhl)])
+            assert rc in {0, 1, 20, 30, 40, 70}, f"verify exit {rc} on fuzz iteration {i}"
+
+    def test_verify_tampered_size_on_existing_files(self, mhl_cli, tmp_path):
+        """Model a user editing the <size> of an entry whose file exists and whose
+        digest is correct: verify gets *past* the missing-file check and actually
+        runs the size pre-check. A malformed or mismatched size must be reported
+        (40); a coincidentally-correct one falls through to the matching hash and
+        passes (0). Never a crash, whatever odd characters or magnitudes the size
+        carries — so the outcome here is driven purely by the size field."""
+        rng = random.Random(24680)
+        for i in range(80):
+            content = bytes(rng.randint(0, 255) for _ in range(rng.randint(1, 32)))
+            data_file = tmp_path / f"clip_{i}.bin"
+            data_file.write_bytes(content)
+
+            root = etree.Element("hashlist", version="1.1")
+            h = etree.SubElement(root, "hash")
+            etree.SubElement(h, "file").text = data_file.name
+            etree.SubElement(h, "size").text = rng.choice(_FUZZ_SIZES)  # tampered size
+            etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+            etree.SubElement(h, "md5").text = hashlib.md5(content).hexdigest()  # correct digest
+            etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+
+            mhl = tmp_path / f"sizefuzz_{i}.mhl"
+            etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+            rc, _, _ = mhl_cli(["verify", str(mhl)])
+            assert rc in {0, 40}, f"verify exit {rc} on tampered-size iteration {i}"
+
+    def test_verify_tampered_digest_on_existing_files(self, mhl_cli, tmp_path):
+        """Model a user editing the digest of an entry whose file exists with the
+        recorded size: verify gets *past* the existence and size pre-checks and
+        actually reaches digest comparison. Whatever invalid characters or
+        encoding the tampered digest carries, verify must report a clean result
+        (0 if it happens to match, 40 mismatch / cannot-verify) — never crash."""
+        rng = random.Random(31337)
+        for i in range(80):
+            content = bytes(rng.randint(0, 255) for _ in range(rng.randint(1, 32)))
+            data_file = tmp_path / f"clip_{i}.bin"
+            data_file.write_bytes(content)
+
+            root = etree.Element("hashlist", version="1.1")
+            h = etree.SubElement(root, "hash")
+            etree.SubElement(h, "file").text = data_file.name
+            etree.SubElement(h, "size").text = str(len(content))  # correct size → reaches hash step
+            etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+            tag = rng.choice([t for t in _CLASSIC_HASH_TAGS if t != "null"])
+            etree.SubElement(h, tag).text = rng.choice(_FUZZ_DIGESTS)
+            etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+
+            mhl = tmp_path / f"tampered_{i}.mhl"
+            etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+            rc, _, _ = mhl_cli(["verify", str(mhl)])
+            assert rc in {0, 40}, f"verify exit {rc} on tampered-digest iteration {i}"
+
+    def test_xsd_schema_check_on_schema_shaped_values(self, mhl_cli, tmp_path):
+        """xsd-schema-check must return one of its documented codes (0 valid,
+        10 schema-invalid, 20 parse/file error, 60 xsd missing) — never crash."""
+        rng = random.Random(5678)
+        for i in range(80):
+            mhl = tmp_path / f"fuzz_{i}.mhl"
+            mhl.write_bytes(_build_classic_fuzz_manifest(rng))
+            rc, _, _ = mhl_cli(["xsd-schema-check", str(mhl)])
+            assert rc in {0, 10, 20, 60}, f"xsd-schema-check exit {rc} on fuzz iteration {i}"
+
+
+# ---------------------------------------------------------------------------
 # TestSmartDispatch
 # ---------------------------------------------------------------------------
 
@@ -1695,12 +1931,12 @@ class TestSizePreCheck:
 
 
 # ---------------------------------------------------------------------------
-# TestUnicodeNormalisation
+# TestUnicodeNormalization
 # ---------------------------------------------------------------------------
 
 
-class TestUnicodeNormalisation:
-    """NFC normalisation of accented filenames at seal and verify time.
+class TestUnicodeNormalization:
+    """NFC normalization of accented filenames at seal and verify time.
 
     macOS HFS+/APFS returns filenames in NFD (decomposed) form — e.g. the
     single codepoint é (U+00E9) is decomposed to e (U+0065) + combining acute
@@ -1708,17 +1944,17 @@ class TestUnicodeNormalisation:
     from the manifest would silently fail os.path.exists() against an NFC file
     on disk.
 
-    simple_mhl reconciles normalisation forms at two points:
-      1. seal — rel_path_posix is normalised to NFC before writing the <file>
+    simple_mhl reconciles normalization forms at two points:
+      1. seal — rel_path_posix is normalized to NFC before writing the <file>
                 element, so manifests are written in canonical NFC.
       2. verify — unicodepaths.resolve_on_disk() matches the manifest path against real
-                  directory entries across normalisation forms (literal bytes
+                  directory entries across normalization forms (literal bytes
                   first, NFC-keyed index as fallback) so it finds the file
                   whatever form it is stored in, without assuming the
-                  filesystem normalises for us.
+                  filesystem normalizes for us.
 
     These tests construct NFD filenames explicitly so the behaviour is
-    deterministic regardless of what the host OS normalises at mkdir/write time.
+    deterministic regardless of what the host OS normalizes at mkdir/write time.
     """
 
     # NFD forms used across tests:
@@ -1750,8 +1986,8 @@ class TestUnicodeNormalisation:
         def nfd_iter(root, mhl_path, on_skip=None):
             for p, stat_result in real_iter(root, mhl_path, on_skip=on_skip):
                 # Yield the path as-is; real_iter already found the NFD file.
-                # Normalise to NFD explicitly in case the OS returned NFC
-                # (e.g. on a case-insensitive macOS volume that normalises on
+                # Normalize to NFD explicitly in case the OS returned NFC
+                # (e.g. on a case-insensitive macOS volume that normalizes on
                 # readback), ensuring the test exercises the NFC fix on all OSes.
                 nfd_str = unicodedata.normalize("NFD", str(p))
                 yield Path(nfd_str), stat_result
@@ -1771,11 +2007,11 @@ class TestUnicodeNormalisation:
         )
         # The NFD byte sequence must not appear in the raw manifest bytes.
         assert self._NFD_NAME.encode("utf-8") not in mhl.read_bytes(), (
-            "NFD byte sequence found in manifest — NFC normalisation did not fire"
+            "NFD byte sequence found in manifest — NFC normalization did not fire"
         )
 
     def test_seal_nfc_is_idempotent_for_already_nfc_paths(self, mhl_cli, tmp_path):
-        """NFC normalisation of an already-NFC path must produce the same result.
+        """NFC normalization of an already-NFC path must produce the same result.
 
         Regression guard: applying NFC to a path that is already NFC must not
         corrupt the filename or produce a different string.
@@ -1801,7 +2037,7 @@ class TestUnicodeNormalisation:
         rc, _, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 0
 
-    def test_verify_normalises_nfd_manifest_path_to_find_nfc_file(self, mhl_cli, tmp_path):
+    def test_verify_normalizes_nfd_manifest_path_to_find_nfc_file(self, mhl_cli, tmp_path):
         """verify() must find an NFC file on disk even when the manifest contains an NFD path.
 
         This is the cross-platform scenario: manifest sealed on macOS (NFD paths)
@@ -1832,7 +2068,7 @@ class TestUnicodeNormalisation:
     def test_verify_nfd_manifest_path_correct_hash_passes(self, mhl_cli, tmp_path):
         """Complement to the above: NFD manifest + correct digest = clean verify.
 
-        Confirms the normalisation does not break the hash check that follows.
+        Confirms the normalization does not break the hash check that follows.
         """
 
         nfc_path = tmp_path / self._NFC_NAME
@@ -1854,9 +2090,9 @@ class TestUnicodeNormalisation:
         assert rc == 0
 
     def test_verify_nfd_manifest_path_wrong_hash_still_fails(self, mhl_cli, tmp_path):
-        """NFD normalisation must not suppress a genuine hash mismatch.
+        """NFD normalization must not suppress a genuine hash mismatch.
 
-        Regression guard: the normalisation step must not interfere with the
+        Regression guard: the normalization step must not interfere with the
         hash check. A correct NFC path resolution followed by a wrong digest
         must still exit 40.
         """
@@ -1881,7 +2117,7 @@ class TestUnicodeNormalisation:
     def test_verify_nfc_manifest_finds_nfd_file_on_disk(self, mhl_cli, tmp_path):
         """Scenario 3 (end-to-end): manifest path is NFC, the file on disk is NFD.
 
-        Mirror of test_verify_normalises_nfd_manifest_path_to_find_nfc_file.
+        Mirror of test_verify_normalizes_nfd_manifest_path_to_find_nfc_file.
         On a normalization-*sensitive* filesystem (ext4/exFAT/NTFS — e.g. Linux
         CI) the literal NFC lookup misses and resolution scans the directory and
         matches on NFC; on an *insensitive* volume (APFS/HFS+ — e.g. macOS dev)
@@ -1958,8 +2194,8 @@ class TestResolveOnDisk:
     """
 
     _BASE = os.path.join(os.sep, "vol")
-    _NFC = "caf\u00e9"  # café: c a f + precomposed é (U+00E9)
-    _NFD = "cafe\u0301"  # café: c a f e + combining acute (U+0301); same NFC key
+    _NFC = "ros\u00e9"  # rosé: c a f + precomposed é (U+00E9)
+    _NFD = "rose\u0301"  # rosé: c a f e + combining acute (U+0301); same NFC key
 
     def _patch(self, monkeypatch, existing):
         lexists, scandir = _sensitive_fs(set(existing))
@@ -1993,7 +2229,7 @@ class TestResolveOnDisk:
         assert result == nfd_file
 
     def test_scenario2_coexisting_forms_resolve_distinctly(self, monkeypatch):
-        """Scenario 2: NFC and NFD café/ both exist (sensitive FS). Each query
+        """Scenario 2: NFC and NFD rosé/ both exist (sensitive FS). Each query
         resolves to its own distinct directory via the literal fast path — the
         two forms never collapse onto one."""
         nfc_file = os.path.join(self._BASE, self._NFC, "text.txt")
@@ -2039,6 +2275,15 @@ class TestResolveOnDisk:
         # 'sub' exists as a leaf (file), so scandir(base/sub) raises OSError.
         self._patch(monkeypatch, {self._BASE, os.path.join(self._BASE, "sub")})
         assert unicodepaths.resolve_on_disk(self._BASE, os.path.join("sub", "child.txt"), {}) is None
+
+    def test_empty_and_curdir_components_are_skipped(self, monkeypatch):
+        """Leading './' and doubled separators yield empty / os.curdir path
+        components, which must be skipped without affecting resolution."""
+        leaf = os.path.join(self._BASE, "text.txt")
+        self._patch(monkeypatch, {self._BASE, leaf})
+        # rel_path like "./text.txt" → split gives [os.curdir, "text.txt"].
+        rel = os.curdir + os.sep + "text.txt"
+        assert unicodepaths.resolve_on_disk(self._BASE, rel, {}) == leaf
 
     def test_dir_index_caches_scandir_per_directory(self, monkeypatch):
         """Two files in the same NFD directory, addressed via NFC, must scan
@@ -2088,8 +2333,8 @@ class TestNormalizationVariantHint:
     mismatch is observable)."""
 
     _VOL = os.path.join(os.sep, "vol")
-    _NFC = "caf\u00e9"  # café: precomposed é (U+00E9)
-    _NFD = "cafe\u0301"  # café: e + combining acute (U+0301); same NFC key
+    _NFC = "ros\u00e9"  # rosé: precomposed é (U+00E9)
+    _NFD = "rose\u0301"  # rosé: e + combining acute (U+0301); same NFC key
 
     def test_variant_helper_finds_differently_normalized_path(self, monkeypatch):
         nfd_mhl = os.path.join(self._VOL, self._NFD, "m.mhl")
@@ -2113,6 +2358,11 @@ class TestNormalizationVariantHint:
         typed = os.path.join(self._VOL, "m.mhl")
         _patch_sensitive(monkeypatch, files={typed}, dirs={os.sep, self._VOL})
         assert unicodepaths.normalization_variant_on_disk(typed) is None
+
+    def test_root_only_path_returns_none(self):
+        """A bare root (no path tail) leaves nothing to resolve, so the helper
+        returns None before touching the filesystem."""
+        assert unicodepaths.normalization_variant_on_disk(os.sep) is None
 
     def test_verify_not_found_suggests_variant(self, monkeypatch, capsys):
         nfd_mhl = os.path.join(self._VOL, self._NFD, "m.mhl")
