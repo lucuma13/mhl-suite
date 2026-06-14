@@ -116,8 +116,6 @@ def get_xsd_path() -> str:
     is installed normally, then at a sibling 'xsd/' folder for the case
     where simple_mhl.py is run directly from a checkout.
     """
-    # Installed-package case. files() is the modern API (added 3.9, the
-    # legacy path() helper is deprecated in 3.11+ and emits a warning).
     try:
         resource = importlib.resources.files("mhl_suite.xsd").joinpath("MediaHashList_v1_1.xsd")
         if resource.is_file():
@@ -144,11 +142,10 @@ def get_hash(filepath: str, algo_key: str) -> str:
 
     Returns the hex digest as a lowercase string.
 
-    We deliberately do NOT use hashlib.file_digest() (Python 3.11+). Bench
-    measurements showed it is 5-15% slower than this manual loop on typical
-    media files; the wrapper overhead exceeds any internal optimisation it
-    might apply. The manual loop is also forward-compatible with xxhash,
-    which file_digest doesn't support anyway.
+    We deliberately do NOT use hashlib.file_digest(): bench measurements showed it is
+    5-15% slower than this manual loop on typical media files; the wrapper overhead
+    exceeds any internal optimisation it might apply. The manual loop is also
+    forward-compatible with xxhash, which file_digest doesn't support anyway.
     """
     if algo_key not in ALGO_MAP:
         raise ValueError(f"Unsupported hash algorithm: {algo_key}")
@@ -586,13 +583,9 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
             # definitive corruption signal that costs only one stat() call.
             #
             # isdecimal() is stricter than isdigit() or isnumeric(): it
-            # rejects superscripts (e.g. '²'), vulgar fractions, and other
-            # Unicode "digit" codepoints that would silently produce a wrong
-            # integer via int().  A <size> that fails this guard is itself
-            # evidence of manifest corruption -- a well-formed MHL never has
-            # a non-decimal size -- so we flag it as a mismatch rather than
-            # silently falling through to hash a file whose manifest entry
-            # is already known to be corrupt.
+            # rejects superscripts and other Unicode "digit" codepoints that
+            # would silently produce a wrong integer via int(). A malformed
+            # size is evidence of corruption or manifest tampering.
             size_el = h.find("{*}size")
             if size_el is not None and size_el.text is not None:
                 size_text = size_el.text.strip()
@@ -621,10 +614,8 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
                     h.clear()
                     continue
 
-            # 'null' tag records no digest: per the v1.1 schema it means
-            # "no hash, only use file size verification". The existence and
-            # <size> checks above are therefore the whole verification — there
-            # is nothing to hash, so report OK and move on.
+            # 'null' tag records no digest: the existence and size checks
+            # above are therefore the whole verification.
             if tag == "null":
                 if verbose:
                     print(f"[OK] {rel_path}")

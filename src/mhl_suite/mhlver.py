@@ -1072,19 +1072,10 @@ def _build_live() -> "tuple[Live, Progress, Text, Console]":
     """
     Construct a rich Live display for two-line progress output:
 
-      Line 1:  🔎 Verifying… XW001_2026-04-26.mhl        (plain Text, updated each manifest)
-      Line 2:   ╸━━━━━━━━━  0% — ETA 0:03:32. Elapsed 0:00:25  (Progress bar)
-
     We use Live + Group(Text, Progress) rather than two Progress tasks because
     rich renders all columns on every task row — there is no per-task column
     visibility. This approach keeps the label line completely clean (no bar
     artefacts) and the bar line completely clean (no spinner).
-
-    Colour design:
-    - Bar filled green, track default dim.
-    - Percentage white.
-    - "ETA" / "Elapsed" labels dim; their values use rich's default (white).
-    - Output on stdout with force_terminal=True for uv run compatibility.
     """
     stdout_console = Console(file=sys.stdout, force_terminal=True)
 
@@ -1241,9 +1232,6 @@ def _format_file_result(fr: "FileResult") -> str:
 
         ❌ size mismatch: path/to/file.mxf
            (calc size: 122 | stored size: 4170)
-
-    The detail string is "<label>: <parenthetical>" — split on the first ": "
-    to derive the label. Without verbose detail it is just "<label>".
     """
     if fr.status == "ok":
         return f"    ✓ {fr.path}"
@@ -1253,7 +1241,7 @@ def _format_file_result(fr: "FileResult") -> str:
         if ": " in fr.detail:
             label, paren_content = fr.detail.split(": ", 1)
             return f"    ❌ {label}: {fr.path}\n       ({paren_content})"
-        # Non-verbose fallback: detail is just "hash mismatch" or "size mismatch".
+        # Non-verbose failsafe: detail is just "hash mismatch" or "size mismatch".
         return f"    ❌ {fr.detail}: {fr.path}"
     if fr.status == "new":
         return f"    ⚠️ new (untracked): {fr.path}"
@@ -1307,7 +1295,7 @@ def main() -> None:
         msg = "Argument should be a file or directory that exists in the filesystem"
         # On a normalization-sensitive filesystem the typed path may differ from
         # the on-disk name only in Unicode form; suggest the real spelling rather
-        # than silently failing. Matches simple-mhl's behaviour (shared helper).
+        # than silently failing.
         variant = normalization_variant_on_disk(str(src))
         if variant is not None:
             msg += f"\n  A path with a different Unicode normalization exists — did you mean:\n    {variant}"
@@ -1328,11 +1316,7 @@ def main() -> None:
     sys.exit(exit_status)
 
 
-def _run(
-    src: Path,
-    verbose: bool,
-    schema: bool,
-) -> "tuple[int, list[ManifestResult]]":
+def _run(src: Path, verbose: bool, schema: bool) -> "tuple[int, list[ManifestResult]]":
     """
     Execute the verification pass on `src`.
 
