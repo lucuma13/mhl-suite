@@ -401,10 +401,10 @@ def _run_step(
         errors="replace",
     )
 
-    # Fire on_poll ticks from a background thread so the main thread can sit
-    # in communicate() uninterrupted. The stop flag is a threading.Event
-    # rather than a plain bool so the ticker sleeps efficiently (wait() with
-    # a timeout) instead of busy-looping with time.sleep().
+    # Suspend the ticker thread using Event.wait(timeout). Rely on this instead
+    # of time.sleep() to guarantee immediate responsiveness, allowing the main
+    # thread to terminate the loop without waiting for the next polling interval
+    # to expire.
     stop_ticking = threading.Event()
 
     def _ticker() -> None:
@@ -1135,7 +1135,7 @@ def _open_report(src: Path) -> Iterator[tuple[TextIO, Path]]:
     end of the verification run. Nothing is written here at open time.
     """
     report_dir = src if src.is_dir() else src.parent
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     report_path = report_dir / f"mhlver_report_{src.name}_{timestamp}.log"
     with open(report_path, "w", encoding="utf-8") as fh:
         yield fh, report_path
@@ -1317,7 +1317,7 @@ def main() -> None:
     # Open the report file if requested. Using a context manager means we
     # don't have to remember to close it on every exit path.
     if args.report:
-        started_at = datetime.now()
+        started_at = datetime.now().astimezone()
         with _open_report(src) as (rf, rp):
             exit_status, manifest_results = _run(src, args.verbose, args.xsd_schema_check)
             _render_report(rf, src, started_at, manifest_results, exit_status)
@@ -1328,7 +1328,7 @@ def main() -> None:
     sys.exit(exit_status)
 
 
-def _run(  # noqa: C901 — branches are independent cases, not nested complexity
+def _run(
     src: Path,
     verbose: bool,
     schema: bool,
