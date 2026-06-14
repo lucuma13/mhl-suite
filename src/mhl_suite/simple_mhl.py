@@ -81,7 +81,7 @@ HASH_CHUNK_SIZE = 4 * 1024 * 1024
 # Multiple aliases point to xxhash so callers can use whatever spelling they
 # like; the manifest always records "xxhash64be" for consistency.
 ALGO_MAP: dict[str, tuple[Callable[[], _Hasher], str]] = cast(
-    dict[str, tuple[Callable[[], _Hasher], str]],
+    "dict[str, tuple[Callable[[], _Hasher], str]]",
     {
         "xxhash": (xxhash.xxh64, "xxhash64be"),
         "xxh64": (xxhash.xxh64, "xxhash64be"),
@@ -168,7 +168,7 @@ def get_hash(filepath: str, algo_key: str) -> str:
 # -----------------------------------------------------------------------------
 
 
-def _iter_files_for_seal(  # noqa: C901 — flat walk with several independent skip cases
+def _iter_files_for_seal(
     root: str,
     mhl_path: str,
     on_skip: "Callable[[str, str, bool], None] | None" = None,
@@ -269,7 +269,7 @@ def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree
     return info
 
 
-def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) -> None:  # noqa: C901
+def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) -> None:
     """
     Walk `root`, hash every non-hidden file, and write a dated MHL manifest
     at the root of the directory.
@@ -363,7 +363,7 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
         # Windows, os.path.relpath returns backslashes; replace them so the
         # manifest is portable between operating systems.
         rel_path_posix = rel_path.replace(os.sep, "/") if os.sep != "/" else rel_path
-        # Normalise to NFC so accented filenames are stored as precomposed
+        # Normalize to NFC so accented filenames are stored as precomposed
         # codepoints (e.g. é = U+00E9) rather than the NFD decomposed form
         # (e = U+0065 + combining acute U+0301) that macOS HFS+/APFS returns
         # from the filesystem. A consistent NFC manifest round-trips correctly
@@ -458,7 +458,7 @@ def _validate_mhl_path(mhl_file: str) -> None:
         sys.exit(1)
 
 
-def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
+def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat per-entry verify ladder, not nested complexity
     """
     Verify each file listed in `mhl_file` against its stored hash.
 
