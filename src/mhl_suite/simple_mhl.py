@@ -461,7 +461,7 @@ def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree
     return info
 
 
-def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False, jobs: int | None = None) -> None:
+def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) -> None:
     """
     Walk `root`, hash every non-hidden file, and write a dated MHL manifest
     at the root of the directory.
@@ -474,10 +474,10 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False, jo
         (.DS_Store, macOS ._* resource forks, Spotlight/Trash/Time Machine and
         other volume-internal items — see _internal.ignorelist) is skipped.
       * Files that vanish during the walk are skipped without aborting.
-      * Concurrency is automatic: jobs=None (default) measures the storage and
-        parallelises only when it pays off (see _hash_files_auto). jobs=1 forces
-        sequential; jobs=N pins a fixed worker count. The manifest is identical
-        and deterministically ordered regardless.
+      * Concurrency is fully automatic and has no operator knob: _hash_files_auto
+        measures the storage and parallelises only when that's faster, staying
+        sequential otherwise. The manifest is identical and deterministically
+        ordered regardless.
 
     Output format:
       [OK] <path>  <algo>: <digest>             (verbose only, per hashed file)
@@ -560,20 +560,14 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False, jo
             print(f"[SKIP] {rel_posix} ({reason})")
 
     # Walk the tree first (reporting skips as we go), then hash. Materialising
-    # the entry list lets us optionally hash files concurrently (jobs>1) while
-    # still emitting the manifest in deterministic walk order. The list holds
-    # (path, stat) tuples — a few tens of MB even for a 100k-frame shoot, dwarfed
-    # by the XML tree built alongside it. With jobs<=1 this is the original
-    # sequential walk-and-hash with one extra list in hand.
+    # the entry list lets us hash files concurrently while still emitting the
+    # manifest in deterministic walk order. The list holds (path, stat) tuples —
+    # a few tens of MB even for a 100k-frame shoot, dwarfed by the XML tree built
+    # alongside it. Concurrency is decided entirely by _hash_files_auto, which
+    # measures the storage and stays sequential whenever that's faster.
     entries = list(_iter_files_for_seal(root, mhl_path, on_skip=_on_skip))
     paths = [fp for fp, _ in entries]
-    if jobs is None:
-        # Auto: measure the storage and parallelise only when it helps.
-        digests: Iterator[str] = _hash_files_auto(paths, [st.st_size for _, st in entries], algorithm)
-    else:
-        # Explicit override: 1 = sequential, N = fixed worker count.
-        job_fns: list[Callable[[], str]] = [(lambda p=p: get_hash(p, algorithm)) for p in paths]
-        digests = iter(_hash_batch(job_fns, jobs))
+    digests = _hash_files_auto(paths, [st.st_size for _, st in entries], algorithm)
 
     for (filepath, stat_result), digest in zip(entries, digests, strict=True):
         rel_path = os.path.relpath(filepath, root)
@@ -706,7 +700,7 @@ def _verify_one_hash(candidate: str, tag: str, expected: str, rel_path: str, ver
     return ("mismatch", f"[ERROR] hash mismatch: {rel_path}")
 
 
-def verify(mhl_file: str, verbose: bool = False, jobs: int | None = None) -> None:  # noqa: C901 — flat per-entry verify ladder, not nested complexity
+def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat per-entry verify ladder, not nested complexity
     """
     Verify each file listed in `mhl_file` against its stored hash.
 
@@ -889,16 +883,14 @@ def verify(mhl_file: str, verbose: bool = False, jobs: int | None = None) -> Non
 
     # --- Parallel hash phase -------------------------------------------------
     # Hash the deferred entries, auto-tuning concurrency to the storage exactly
-    # as seal does (jobs=None), or honouring an explicit -j override. With no
-    # computable algorithm (e.g. an all-xxhash128 manifest) every job is an
-    # instant "cannot verify", so a disk probe would be pointless — run straight.
+    # as seal does. With no computable algorithm (e.g. an all-xxhash128 manifest)
+    # every job is an instant "cannot verify", so a disk probe would be pointless
+    # — run them straight through.
     if hash_jobs:
-        if calib_algo is None or jobs == 1:
+        if calib_algo is None:
             hashed: list[tuple[str, str]] = [job() for job in hash_jobs]
-        elif jobs is None:
-            hashed = list(_hash_jobs_auto(hash_paths, hash_sizes, hash_jobs, calib_algo))
         else:
-            hashed = _hash_batch(hash_jobs, jobs)
+            hashed = list(_hash_jobs_auto(hash_paths, hash_sizes, hash_jobs, calib_algo))
         for slot, outcome in zip(hash_slots, hashed, strict=True):
             results[slot] = outcome
 
@@ -1030,20 +1022,7 @@ def main() -> None:
         action="store_true",
         help="print each file's hash as it is sealed, and skipped files",
     )
-    seal_p.add_argument(
-        "-j",
-        "--jobs",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "files to hash concurrently (default: auto — measures the storage and "
-            "parallelises only when it speeds things up, e.g. md5/sha1 on a fast "
-            "SSD, while staying sequential on spinning disks). Use 1 to force "
-            "sequential, or a number to pin a fixed worker count"
-        ),
-    )
-    seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal, a.verbose, a.jobs))
+    seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal, a.verbose))
 
     # verify subcommand
     verify_p = subparsers.add_parser("verify", help="verify an MHL file")
@@ -1054,20 +1033,7 @@ def main() -> None:
         action="store_true",
         help="print per-file status",
     )
-    verify_p.add_argument(
-        "-j",
-        "--jobs",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "files to hash concurrently (default: auto — measures the storage and "
-            "parallelises only when it speeds things up, e.g. md5/sha1 on a fast "
-            "SSD, while staying sequential on spinning disks). Use 1 to force "
-            "sequential, or a number to pin a fixed worker count"
-        ),
-    )
-    verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose, a.jobs))
+    verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose))
 
     # xsd-schema-check subcommand
     xsd_p = subparsers.add_parser(

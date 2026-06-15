@@ -2669,33 +2669,32 @@ class TestAdaptiveHashing:
 
 
 # ---------------------------------------------------------------------------
-# TestSealJobs — the -j/--jobs override
+# TestSealConcurrency — seal self-tunes; no operator knob
 # ---------------------------------------------------------------------------
 
 
-class TestSealJobs:
-    """The -j flag: default auto, 1 = sequential, N = pinned — all producing the
-    same digests."""
+class TestSealConcurrency:
+    """Seal always self-tunes — there is no operator knob. The adaptive path must
+    still produce correct digests, and the default must actually probe."""
 
-    def test_seal_fixed_jobs_produces_correct_digests(self, mhl_cli, tmp_path):
+    @staticmethod
+    def _force_parallel(monkeypatch):
+        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
+        monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
+        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda a: 1000.0)
+        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: 8000.0)  # read >> hash ⇒ parallel
+
+    def test_auto_parallel_produces_correct_digests(self, mhl_cli, tmp_path, monkeypatch):
         make_tree(tmp_path, {"a.bin": b"hello", "sub/b.bin": b"world"})
-        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "-j", "4"])
+        self._force_parallel(monkeypatch)
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
         text = next(tmp_path.glob("*.mhl")).read_text()
         assert hashlib.md5(b"hello").hexdigest() in text
         assert hashlib.md5(b"world").hexdigest() in text
 
-    def test_j1_bypasses_auto_probe(self, tmp_path, monkeypatch):
-        """jobs=1 must hash sequentially without ever measuring the disk."""
-        make_tree(tmp_path, {"a.bin": b"x", "b.bin": b"y"})
-        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)  # auto would otherwise probe
-        probed: list[int] = []
-        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 9e9)
-        simple_mhl.seal(str(tmp_path), "md5", dont_reseal=False, verbose=False, jobs=1)
-        assert probed == [], "jobs=1 must not run the auto disk probe"
-
     def test_default_uses_auto_probe(self, tmp_path, monkeypatch):
-        """The default (jobs=None) routes through the adaptive probe."""
+        """A plain seal routes through the adaptive probe (no operator input)."""
         make_tree(tmp_path, {"a.bin": b"x", "b.bin": b"y"})
         monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
@@ -2704,6 +2703,13 @@ class TestSealJobs:
         monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 100.0)  # disk-bound
         simple_mhl.seal(str(tmp_path), "md5", dont_reseal=False, verbose=False)
         assert probed == [1], "the default must probe the disk to decide"
+
+    def test_no_jobs_flag(self, mhl_cli, tmp_path):
+        """The operator-facing -j/--jobs knob is gone: the script decides."""
+        make_tree(tmp_path, {"a.bin": b"x"})
+        rc, _, err = mhl_cli(["seal", str(tmp_path), "-j", "4"])
+        assert rc == 2  # argparse: unrecognised arguments
+        assert "-j" in err or "jobs" in err or "unrecognized" in err.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -2742,7 +2748,9 @@ class TestVerifyConcurrency:
 
     def test_parallel_matches_sequential_clean(self, mhl_cli, tmp_path, monkeypatch):
         mhl, _ = self._build_manifest(tmp_path)
-        rc_seq, out_seq, _ = mhl_cli(["verify", str(mhl), "-v", "-j", "1"])
+        # Reference run first: a tiny manifest stays under the auto threshold ⇒
+        # sequential. Then force parallel and require identical output.
+        rc_seq, out_seq, _ = mhl_cli(["verify", str(mhl), "-v"])
         self._force_parallel(monkeypatch)
         rc_par, out_par, _ = mhl_cli(["verify", str(mhl), "-v"])
         assert rc_seq == 0
@@ -2754,17 +2762,16 @@ class TestVerifyConcurrency:
         # hash mismatch (same length, different content) + a missing file
         (tmp_path / "f002.bin").write_bytes(b"Z" * len(files["f002.bin"]))
         (tmp_path / "f005.bin").unlink()
-        rc_seq, out_seq, _ = mhl_cli(["verify", str(mhl), "-v", "-j", "1"])
+        rc_seq, out_seq, _ = mhl_cli(["verify", str(mhl), "-v"])  # sequential reference
         self._force_parallel(monkeypatch)
         rc_par, out_par, _ = mhl_cli(["verify", str(mhl), "-v"])
         assert rc_seq == 70  # both missing and mismatch
         assert rc_par == rc_seq
         assert out_par == out_seq  # same buckets, same order
 
-    def test_verify_j1_forces_sequential(self, tmp_path, monkeypatch):
+    def test_no_jobs_flag(self, mhl_cli, tmp_path):
+        """verify has no operator concurrency knob either."""
         mhl, _ = self._build_manifest(tmp_path)
-        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
-        probed: list[int] = []
-        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 9e9)
-        simple_mhl.verify(str(mhl), verbose=False, jobs=1)
-        assert probed == [], "verify -j 1 must hash sequentially without probing"
+        rc, _, err = mhl_cli(["verify", str(mhl), "-j", "1"])
+        assert rc == 2  # argparse: unrecognised arguments
+        assert "-j" in err or "jobs" in err or "unrecognized" in err.lower()
