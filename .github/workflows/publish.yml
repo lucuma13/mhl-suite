@@ -117,13 +117,14 @@ jobs:
       - name: Install deployed package from PyPI
         env:
           PACKAGE_NAME: ${{ needs.read-metadata.outputs.package-name }}
+          VERSION: ${{ needs.read-metadata.outputs.version }}
         shell: bash
         run: |
           MAX_RETRIES=6
           RETRY_INTERVAL=10
 
           for i in $(seq 1 $MAX_RETRIES); do
-            if uv pip install --system "$PACKAGE_NAME"; then
+            if uv pip install --system "$PACKAGE_NAME==$VERSION"; then
               echo "Package installed successfully from PyPI."
               exit 0
             fi
