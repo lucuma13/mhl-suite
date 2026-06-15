@@ -22,7 +22,6 @@ import hashlib
 import importlib.metadata
 import importlib.resources
 import os
-import platform
 import sys
 import unicodedata
 from collections.abc import Callable, Iterator
@@ -33,6 +32,8 @@ from typing import Protocol, cast, runtime_checkable
 import xxhash
 from lxml import etree
 
+from mhl_suite._internal.hostinfo import friendly_hostname
+from mhl_suite._internal.ignorelist import is_os_junk
 from mhl_suite._internal.unicodepaths import (
     normalization_variant_on_disk,
     resolve_on_disk,
@@ -120,7 +121,7 @@ def get_xsd_path() -> str:
         resource = importlib.resources.files("mhl_suite.xsd").joinpath("MediaHashList_v1_1.xsd")
         if resource.is_file():
             return str(resource)
-    except (ImportError, FileNotFoundError, TypeError, ModuleNotFoundError):
+    except (ImportError, FileNotFoundError, TypeError):
         pass
 
     # Source-checkout fallback
@@ -174,8 +175,12 @@ def _iter_files_for_seal(
     Walk `root` recursively and yield (absolute_path, stat_result) for every
     file that should appear in the manifest, in deterministic sorted order.
 
+    Hidden files and directories (names starting with '.') ARE included — a
+    fixity manifest should protect everything the operator put on disk.
+
     Skips:
-      - hidden files and directories (names starting with '.')
+      - OS-generated metadata (see _internal.ignorelist), which the system
+        rewrites on its own and would break re-verification
       - the manifest file itself (so we don't hash what we're writing)
       - entries that disappear or stat-fail mid-walk
 
@@ -221,9 +226,9 @@ def _iter_files_for_seal(
         # equivalent to os.walk(topdown=True) with sorted dirnames.
         subdirs: list[str] = []
         for entry in entries:
-            if entry.name.startswith("."):
+            if is_os_junk(entry.name):
                 if on_skip is not None:
-                    on_skip(entry.path, "hidden", False)
+                    on_skip(entry.path, "OS metadata", False)
                 continue
             try:
                 if entry.is_dir(follow_symlinks=False):
@@ -257,7 +262,7 @@ def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree
     info = etree.SubElement(parent, "creatorinfo")
     for tag, value in [
         ("username", getpass.getuser()),
-        ("hostname", platform.node()),
+        ("hostname", friendly_hostname()),
         ("tool", tool),
         ("startdate", iso_now),
         ("finishdate", iso_now),  # placeholder, updated after the walk
@@ -275,8 +280,16 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
       * Manifest filename: <basename>_<UTC-timestamp>.mhl
       * Collisions: if the file already exists and --dont-reseal was passed,
         exit 0 silently. Otherwise append a numeric suffix until unique.
-      * Hidden files (leading dot) are skipped.
+      * Hidden files and directories are included; only OS-generated metadata
+        (.DS_Store, macOS ._* resource forks, Spotlight/Trash/Time Machine and
+        other volume-internal items — see _internal.ignorelist) is skipped.
       * Files that vanish during the walk are skipped without aborting.
+
+    Output format:
+      [OK] <path>  <algo>: <digest>             (verbose only, per hashed file)
+      [SKIP] <path> (<reason>)                  (verbose only, skipped entry)
+      [WARNING] skipped: <path> (<reason>)      (always, on stderr; dropped dir)
+      Created MHL: <path>                        (verbose only, on completion)
 
     Exits with code 2 on argument errors (handled by argparse before we get
     here) and lets unexpected OSError on the final write propagate so the
@@ -470,7 +483,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
       * Malformed XML exits 20 with no further output.
 
     Output format:
-      [OK] <path>                                  (verbose only, success)
+      [OK] <path>  <algo>: <digest>                (verbose only, success)
       [ERROR] hash mismatch: <path>                (verify failure)
       [ERROR] missing file: <path>                 (file not on disk)
       [ERROR] blocked traversal attempt: <path>    (security)
