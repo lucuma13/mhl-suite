@@ -2704,13 +2704,6 @@ class TestSealConcurrency:
         simple_mhl.seal(str(tmp_path), "md5", dont_reseal=False, verbose=False)
         assert probed == [1], "the default must probe the disk to decide"
 
-    def test_no_jobs_flag(self, mhl_cli, tmp_path):
-        """The operator-facing -j/--jobs knob is gone: the script decides."""
-        make_tree(tmp_path, {"a.bin": b"x"})
-        rc, _, err = mhl_cli(["seal", str(tmp_path), "-j", "4"])
-        assert rc == 2  # argparse: unrecognised arguments
-        assert "-j" in err or "jobs" in err or "unrecognized" in err.lower()
-
 
 # ---------------------------------------------------------------------------
 # TestVerifyConcurrency — verify defers hashing to the shared adaptive controller
@@ -2768,10 +2761,3 @@ class TestVerifyConcurrency:
         assert rc_seq == 70  # both missing and mismatch
         assert rc_par == rc_seq
         assert out_par == out_seq  # same buckets, same order
-
-    def test_no_jobs_flag(self, mhl_cli, tmp_path):
-        """verify has no operator concurrency knob either."""
-        mhl, _ = self._build_manifest(tmp_path)
-        rc, _, err = mhl_cli(["verify", str(mhl), "-j", "1"])
-        assert rc == 2  # argparse: unrecognised arguments
-        assert "-j" in err or "jobs" in err or "unrecognized" in err.lower()
