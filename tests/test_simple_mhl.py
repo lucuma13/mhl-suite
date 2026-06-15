@@ -10,10 +10,13 @@ import time
 import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 import xxhash
 from lxml import etree
 
@@ -2564,9 +2567,9 @@ class TestAdaptiveHashing:
         calls: list[int] = []
         real = simple_mhl._hash_batch
 
-        def spy(paths, algo, workers):
+        def spy(jobs, workers):
             calls.append(workers)
-            return real(paths, algo, workers)
+            return real(jobs, workers)
 
         monkeypatch.setattr(simple_mhl, "_hash_batch", spy)
         return calls
@@ -2638,14 +2641,16 @@ class TestAdaptiveHashing:
 
     def test_hash_batch_preserves_order(self, tmp_path):
         paths, _, ref = self._make_files(tmp_path, 20)
-        assert simple_mhl._hash_batch(paths, "md5", 4) == ref
+        jobs: list[Callable[[], str]] = [(lambda p=p: simple_mhl.get_hash(p, "md5")) for p in paths]
+        assert simple_mhl._hash_batch(jobs, 4) == ref
 
-    def test_hash_batch_uses_module_level_get_hash(self, tmp_path, monkeypatch):
-        """Workers must resolve get_hash via the module global so test (and any
-        future) monkeypatches still intercept it."""
+    def test_hash_batch_runs_jobs_concurrently_in_order(self, tmp_path, monkeypatch):
+        """_hash_batch runs each job callable and returns results in input order;
+        jobs resolve get_hash via the module global so monkeypatches intercept."""
         paths, _, _ = self._make_files(tmp_path, 6)
         monkeypatch.setattr(simple_mhl, "get_hash", lambda p, a: "STUB")
-        assert simple_mhl._hash_batch(paths, "md5", 3) == ["STUB"] * 6
+        jobs: list[Callable[[], str]] = [(lambda p=p: simple_mhl.get_hash(p, "md5")) for p in paths]
+        assert simple_mhl._hash_batch(jobs, 3) == ["STUB"] * 6
 
     def test_probe_read_bw_skips_unreadable(self, tmp_path, monkeypatch):
         good = tmp_path / "g.bin"
@@ -2699,3 +2704,67 @@ class TestSealJobs:
         monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 100.0)  # disk-bound
         simple_mhl.seal(str(tmp_path), "md5", dont_reseal=False, verbose=False)
         assert probed == [1], "the default must probe the disk to decide"
+
+
+# ---------------------------------------------------------------------------
+# TestVerifyConcurrency — verify defers hashing to the shared adaptive controller
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyConcurrency:
+    """Concurrency must never change verify's verdict, exit code, or output —
+    only its speed. The deferred-hash restructure must also keep the
+    size-precheck-before-hash contract (covered separately) intact."""
+
+    @staticmethod
+    def _build_manifest(tmp_path, n=8):
+        files = {f"f{i:03d}.bin": bytes([i % 256]) * (2000 + i) for i in range(n)}
+        make_tree(tmp_path, files)
+        root = etree.Element("hashlist", version="1.1")
+        for name in sorted(files):
+            content = files[name]
+            h = etree.SubElement(root, "hash")
+            etree.SubElement(h, "file").text = name
+            etree.SubElement(h, "size").text = str(len(content))
+            etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+            etree.SubElement(h, "md5").text = hashlib.md5(content).hexdigest()
+            etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+        mhl = tmp_path / "m.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+        return mhl, files
+
+    def _force_parallel(self, monkeypatch):
+        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
+        monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
+        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda a: 1000.0)
+        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: 8000.0)  # read >> hash ⇒ parallel
+        monkeypatch.setattr(simple_mhl, "_AUTO_RECHECK_BYTES", 4096)  # several windows over tiny files
+
+    def test_parallel_matches_sequential_clean(self, mhl_cli, tmp_path, monkeypatch):
+        mhl, _ = self._build_manifest(tmp_path)
+        rc_seq, out_seq, _ = mhl_cli(["verify", str(mhl), "-v", "-j", "1"])
+        self._force_parallel(monkeypatch)
+        rc_par, out_par, _ = mhl_cli(["verify", str(mhl), "-v"])
+        assert rc_seq == 0
+        assert rc_par == rc_seq
+        assert out_par == out_seq  # identical [OK] lines, same order
+
+    def test_parallel_matches_sequential_with_failures(self, mhl_cli, tmp_path, monkeypatch):
+        mhl, files = self._build_manifest(tmp_path)
+        # hash mismatch (same length, different content) + a missing file
+        (tmp_path / "f002.bin").write_bytes(b"Z" * len(files["f002.bin"]))
+        (tmp_path / "f005.bin").unlink()
+        rc_seq, out_seq, _ = mhl_cli(["verify", str(mhl), "-v", "-j", "1"])
+        self._force_parallel(monkeypatch)
+        rc_par, out_par, _ = mhl_cli(["verify", str(mhl), "-v"])
+        assert rc_seq == 70  # both missing and mismatch
+        assert rc_par == rc_seq
+        assert out_par == out_seq  # same buckets, same order
+
+    def test_verify_j1_forces_sequential(self, tmp_path, monkeypatch):
+        mhl, _ = self._build_manifest(tmp_path)
+        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
+        probed: list[int] = []
+        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 9e9)
+        simple_mhl.verify(str(mhl), verbose=False, jobs=1)
+        assert probed == [], "verify -j 1 must hash sequentially without probing"

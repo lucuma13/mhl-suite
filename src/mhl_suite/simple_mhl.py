@@ -26,7 +26,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, TypeVar, cast, runtime_checkable
 
 import xxhash
 from lxml import etree
@@ -37,6 +37,10 @@ from mhl_suite._internal.unicodepaths import (
     normalization_variant_on_disk,
     resolve_on_disk,
 )
+
+# Generic result type for the shared hashing controller (str digests for seal,
+# (kind, line) tuples for verify).
+_T = TypeVar("_T")
 
 # -----------------------------------------------------------------------------
 # Version
@@ -169,28 +173,25 @@ def get_hash(filepath: str, algo_key: str) -> str:
 # -----------------------------------------------------------------------------
 # Hashing across files can run concurrently — xxhash and hashlib both RELEASE
 # the GIL inside update(), so threads overlap reads and use several cores. But
-# whether that HELPS depends entirely on the storage, and getting it wrong makes
-# things WORSE. Measured on real media:
+# whether that helps depends entirely on the storage, and getting it wrong makes
+# things worse. Measured on real media:
 #
 #   * Helps only when the hash is slower than the disk (CPU-bound): md5
-#     (~0.95 GB/s) on a fast SSD (~3.1 GB/s) went 923 -> 2476 MB/s (~2.7x) — the
-#     disk had spare bandwidth one md5 thread couldn't use.
+#     (~950 MB/s) on a very fast SSD (~3000 MB/s) went ~2.7x - the disk had
+#     spare bandwidth one md5 thread couldn't use.
 #   * Does nothing when the disk is the bottleneck: xxhash (~13 GB/s) outruns any
-#     disk, so it stays disk-bound (~1.0x) however many workers.
-#   * HURTS on a spinning disk: concurrent reads make the head seek between
-#     files. On a 68 MB/s USB HDD, 4 workers REGRESSED to md5 0.65x / xxhash
-#     0.76x — and the drive couldn't even be detected as rotational (USB bridges
-#     report "Solid State: Info not available"), so device-type detection can't
-#     protect it.
+#     disk, so it stays disk-bound however many workers.
+#   * Hurts on a slow disk. On a slow HDD (~70 MB/s), 4 workers regressed to
+#     md5 0.65x / xxhash 0.76x. Concurrent reads make the head seek between files.
 #
-# So we don't ask the operator and we don't detect hardware — we MEASURE:
+# So we should measure:
 #
 #   1. Calibrate the pure in-RAM hash speed (no disk, ~50 ms).
 #   2. Probe the disk: a plain timed read of the first ~1 GB (and >=0.5 s, so a
 #      very fast NVMe still samples past its read ramp). This reads bytes we're
-#      about to hash anyway — ~1 GB out of hundreds is noise.
+#      about to hash anyway.
 #   3. If the disk can't clearly outrun one hash thread (read_bw < 1.3x hash_bw),
-#      the disk is the ceiling — HDD, slow volume, or any fast hash like xxhash —
+#      the disk is the ceiling — slow volume or very fast hash (like xxhash) —
 #      so we stay sequential and never issue a concurrent read (no seek penalty).
 #   4. Otherwise the hash is the bottleneck and the disk has spare bandwidth:
 #      run workers = round(read_bw / hash_bw) of them. Because we hand the whole
@@ -223,16 +224,17 @@ _AUTO_MAX_WORKERS = 16
 _AUTO_CALIBRATION_SECONDS = 0.05
 
 
-def _hash_batch(paths: list[str], algo_key: str, workers: int) -> list[str]:
-    """Hash `paths` and return digests in input order, up to `workers` at once.
+def _hash_batch(jobs: "list[Callable[[], _T]]", workers: int) -> "list[_T]":
+    """Run `jobs` and return their results in input order, up to `workers` at once.
 
-    get_hash is looked up via the module global on each call so test
-    monkeypatches still intercept it; ThreadPoolExecutor.map preserves order.
+    A job is a zero-arg callable that hashes one file (seal) or hashes-and-compares
+    one entry (verify). ThreadPoolExecutor.map preserves order, so the manifest /
+    report stays deterministic regardless of which finishes first.
     """
-    if workers <= 1 or len(paths) <= 1:
-        return [get_hash(p, algo_key) for p in paths]
-    with ThreadPoolExecutor(max_workers=min(workers, len(paths))) as ex:
-        return list(ex.map(lambda p: get_hash(p, algo_key), paths))
+    if workers <= 1 or len(jobs) <= 1:
+        return [job() for job in jobs]
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as ex:
+        return list(ex.map(lambda job: job(), jobs))
 
 
 def _calibrate_hash_bw(algo_key: str) -> float:
@@ -281,33 +283,36 @@ def _probe_read_bw(paths: list[str]) -> float:
     return read / elapsed if elapsed > 0 else float("inf")
 
 
-def _hash_files_auto(paths: list[str], sizes: list[int], algo_key: str) -> Iterator[str]:
-    """Yield each path's digest in input order, auto-tuning concurrency to the
+def _hash_jobs_auto(
+    paths: list[str], sizes: list[int], jobs: "list[Callable[[], _T]]", calib_algo: str
+) -> "Iterator[_T]":
+    """Yield each job's result in input order, auto-tuning concurrency to the
     storage (see section comment).
 
-    `sizes` are the files' byte sizes (already known from the seal walk's stat),
-    used only to carve the byte-sized recheck windows — never re-stat'd here.
+    `paths[i]`/`sizes[i]` describe the file job `i` will read — `paths` drives
+    the disk probe, `sizes` (already known from a stat) carve the recheck
+    windows — and `jobs[i]` does the hashing. `calib_algo` is the algorithm used
+    for the in-RAM hash-speed calibration. Shared by seal and verify.
     """
-    n = len(paths)
+    n = len(jobs)
     cap = min(_AUTO_MAX_WORKERS, os.cpu_count() or 4)
     # Not worth probing for a single file, a small job, or a uniprocessor.
     if n <= 1 or cap <= 1 or sum(sizes) < _AUTO_MIN_BYTES:
-        for p in paths:
-            yield get_hash(p, algo_key)
+        for job in jobs:
+            yield job()
         return
 
-    hash_bw = _calibrate_hash_bw(algo_key)
+    hash_bw = _calibrate_hash_bw(calib_algo)
     read_bw = _probe_read_bw(paths)
 
-    # Disk-bound (HDD, slow volume, or any hash faster than the disk): one core
-    # already keeps the disk busy, so more cores can't help and would seek-thrash
-    # a spinning disk. Stay sequential — decided before any concurrent read.
+    # Disk-bound (hash faster than the disk): one core already keeps the disk busy,
+    # so more cores can't help and would seek-thrash a spinning disk - stay sequential.
     if read_bw < _AUTO_PARALLEL_THRESHOLD * hash_bw:
-        for p in paths:
-            yield get_hash(p, algo_key)
+        for job in jobs:
+            yield job()
         return
 
-    # Hash-bound: the disk outruns one hash thread, so spread the work across
+    # Hash-bound (disk faster than one hash thread), so spread the work across
     # enough threads to soak up its bandwidth. round(read_bw/hash_bw) lands near
     # the count that saturates the disk without piling on idle threads.
     workers = max(2, min(cap, round(read_bw / hash_bw)))
@@ -325,15 +330,25 @@ def _hash_files_auto(paths: list[str], sizes: list[int], algo_key: str) -> Itera
             acc += sizes[stop]
             stop += 1
         start = time.perf_counter()
-        yield from _hash_batch(paths[pos:stop], algo_key, workers)
+        yield from _hash_batch(jobs[pos:stop], workers)
         elapsed = time.perf_counter() - start
         pos = stop
         rate = acc / elapsed if elapsed > 0 else float("inf")
         if rate < hash_bw:
             # Parallel isn't beating a single thread → disk is the bottleneck now.
-            for p in paths[pos:]:
-                yield get_hash(p, algo_key)
+            for job in jobs[pos:]:
+                yield job()
             return
+
+
+def _hash_files_auto(paths: list[str], sizes: list[int], algo_key: str) -> Iterator[str]:
+    """Seal helper: yield each path's digest in order, auto-tuning concurrency.
+
+    Wraps _hash_jobs_auto with one get_hash job per path. get_hash is resolved at
+    call time (module global) so test monkeypatches still intercept it.
+    """
+    jobs: list[Callable[[], str]] = [(lambda p=p: get_hash(p, algo_key)) for p in paths]
+    return _hash_jobs_auto(paths, sizes, jobs, algo_key)
 
 
 # -----------------------------------------------------------------------------
@@ -557,7 +572,8 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False, jo
         digests: Iterator[str] = _hash_files_auto(paths, [st.st_size for _, st in entries], algorithm)
     else:
         # Explicit override: 1 = sequential, N = fixed worker count.
-        digests = iter(_hash_batch(paths, algorithm, jobs))
+        job_fns: list[Callable[[], str]] = [(lambda p=p: get_hash(p, algorithm)) for p in paths]
+        digests = iter(_hash_batch(job_fns, jobs))
 
     for (filepath, stat_result), digest in zip(entries, digests, strict=True):
         rel_path = os.path.relpath(filepath, root)
@@ -659,7 +675,38 @@ def _validate_mhl_path(mhl_file: str) -> None:
         sys.exit(1)
 
 
-def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat per-entry verify ladder, not nested complexity
+def _verify_one_hash(candidate: str, tag: str, expected: str, rel_path: str, verbose: bool) -> tuple[str, str]:
+    """Hash `candidate` with `tag` and compare against `expected`.
+
+    Returns ("ok", rel_path) on a match, otherwise ("mismatch", line). Catches
+    the per-file errors verify must report rather than abort on (an unsupported
+    accept-on-read tag like xxhash128, or a file that vanished mid-run), so this
+    can run inside a thread pool without a raise tearing down the whole verify.
+    """
+    try:
+        calculated = get_hash(candidate, tag)
+    except (ValueError, OSError) as e:
+        return ("mismatch", f"[ERROR] cannot verify {rel_path}: {e}")
+
+    # Some legacy MHL files stored xxhash as a *decimal integer* rather than the
+    # modern big-endian hex. Detect that case and compare numerically, otherwise
+    # compare hex case-insensitively (uppercase hex appears in some tool output).
+    if tag == "xxhash" and expected.isdecimal():
+        ok = int(calculated, 16) == int(expected)
+    else:
+        ok = calculated.lower() == expected.lower()
+
+    if ok:
+        return ("ok", rel_path)
+    if verbose:
+        return (
+            "mismatch",
+            f"[ERROR] hash mismatch: {rel_path}\n        (calc {tag}: {calculated} | stored {tag}: {expected})",
+        )
+    return ("mismatch", f"[ERROR] hash mismatch: {rel_path}")
+
+
+def verify(mhl_file: str, verbose: bool = False, jobs: int | None = None) -> None:  # noqa: C901 — flat per-entry verify ladder, not nested complexity
     """
     Verify each file listed in `mhl_file` against its stored hash.
 
@@ -698,75 +745,69 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
     # but not '/foobar'.
     mhl_dir_with_sep = mhl_dir + os.sep
 
-    # We collect failures in two buckets so the final exit code can
-    # distinguish missing-only (30), mismatch-only (40), or both (70).
-    # Lines are pre-formatted with their structured prefix at append time
-    # so the final output loop can be a simple iteration.
-    missing: list[str] = []
-    mismatches: list[str] = []
+    # Per-entry outcomes in manifest order. Cheap failures (traversal, missing,
+    # malformed/size, no-hash) and null-OK are decided inline while streaming;
+    # entries that still need a hash pass get a None placeholder filled by the
+    # parallel phase below. One small tuple per entry trades the old O(1)
+    # streaming memory for O(files) — a few MB for a typical offload, and the
+    # price of hashing files concurrently instead of strictly one at a time.
+    results: list[tuple[str, str] | None] = []
+
+    # Entries deferred to the parallel hash phase: parallel arrays plus the slot
+    # in `results` each fills. `hash_sizes` reuse the size pre-check's stat, so
+    # the recheck windows cost no extra syscalls.
+    hash_paths: list[str] = []
+    hash_sizes: list[int] = []
+    hash_slots: list[int] = []
+    hash_jobs: list[Callable[[], tuple[str, str]]] = []
+    calib_algo: str | None = None
 
     # Per-call cache of directory listings ({dir: {NFC(name): real_name}}),
     # populated lazily by resolve_on_disk when a literal path lookup misses.
     dir_index: dict[str, dict[str, str]] = {}
 
-    # iterparse yields each <hash> element as soon as its closing tag is
-    # read, then we immediately free it — keeping peak memory proportional
-    # to one element rather than the full document DOM.  This matters for
-    # VFX pipelines where manifests can track hundreds of thousands of DPX
-    # frames and grow to hundreds of megabytes.
+    # iterparse yields each <hash> element as its closing tag is read, then we
+    # free it — peak DOM memory stays proportional to one element, not the whole
+    # document (which can reach hundreds of MB).
     #
-    # OSError covers lxml raising "Invalid bytes in character encoding"
-    # (e.g. null bytes mid-XML introduced by mutation fuzzing or disk
-    # corruption) — a case etree.parse() also raises as OSError rather
-    # than XMLSyntaxError.  Both are malformed-manifest conditions → exit 20.
+    # OSError covers lxml raising "Invalid bytes in character encoding" (e.g. null
+    # bytes mid-XML from mutation fuzzing or disk corruption) — a case
+    # etree.parse() also raises as OSError. Both are malformed → exit 20.
     try:
         for _, h in etree.iterparse(mhl_file, events=("end",), tag="{*}hash"):
-            # Find the <file> child. Should be exactly one; malformed entries
-            # without a file are silently skipped (the schema would have caught
-            # them at xsd-schema-check time).
+            # Exactly one <file> child expected; malformed entries without one
+            # are silently skipped (xsd-schema-check would have caught them).
             file_el = h.find("{*}file")
             if file_el is None or file_el.text is None:
                 h.clear()
                 continue
 
-            # Manifests use forward slashes; convert to platform separator for
-            # the local filesystem call. On POSIX this is a no-op.
+            # Manifests use forward slashes; convert to the platform separator
+            # for the local filesystem call. On POSIX this is a no-op.
             rel_path = file_el.text
             if os.sep != "/":
                 rel_path = rel_path.replace("/", os.sep)
 
             # --- Path traversal guard -----------------------------------
-            # Collapse '..' and '.' via normpath, then check the result is
-            # inside mhl_dir. This blocks attacks where a malicious manifest
-            # contains entries like "../../etc/passwd" — without the guard,
-            # we'd happily read and report on files outside the offload tree.
-            # Containment is a byte-structural property, independent of Unicode
-            # normalization, so we guard the literal path (no NFC coercion).
+            # Collapse '..'/'.' via normpath, then require the result inside
+            # mhl_dir — blocks a malicious manifest reading "../../etc/passwd".
+            # Containment is byte-structural, so guard the literal path (no NFC).
             jailed = os.path.normpath(os.path.join(mhl_dir, rel_path))
             if jailed != mhl_dir and not jailed.startswith(mhl_dir_with_sep):
-                mismatches.append(f"[ERROR] blocked traversal attempt: {rel_path}")
+                results.append(("mismatch", f"[ERROR] blocked traversal attempt: {rel_path}"))
                 h.clear()
                 continue
 
             # --- Resolve to the real on-disk path -----------------------
-            # Match the manifest path against actual directory entries across
-            # Unicode normalization forms, rather than synthesising an NFC path
-            # and assuming the filesystem will match it for us (only true on
-            # normalization-*insensitive* volumes like HFS+/APFS). Existence
-            # falls out of resolution: a None result means the file is genuinely
-            # absent. normpath above has already collapsed '..'/'.', so the
-            # relative path handed to the resolver is clean.
+            # Match against actual directory entries across Unicode normalization
+            # forms. A None result means the file is genuinely absent.
             candidate = resolve_on_disk(mhl_dir, os.path.relpath(jailed, mhl_dir), dir_index)
             if candidate is None:
-                missing.append(f"[ERROR] missing file: {rel_path}")
+                results.append(("missing", f"[ERROR] missing file: {rel_path}"))
                 h.clear()
                 continue
 
-            # Find the first child element whose tag is a recognised hash
-            # algorithm. We iterate direct children only (one level deep)
-            # rather than the original's recursive xpath; a malformed manifest
-            # with a <hash> nested inside a <hash> is not a real concern, and
-            # one-level iteration is faster.
+            # First direct child whose tag is a recognised hash algorithm.
             hash_node = None
             for child in h:
                 if _localname(child.tag) in SUPPORTED_HASH_TAGS:
@@ -774,7 +815,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
                     break
 
             if hash_node is None:
-                mismatches.append(f"[ERROR] no supported hash found: {rel_path}")
+                results.append(("mismatch", f"[ERROR] no supported hash found: {rel_path}"))
                 h.clear()
                 continue
 
@@ -782,83 +823,61 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
             expected = (hash_node.text or "").strip()
 
             # --- File size pre-check ------------------------------------
-            # Compare the manifest's <size> against the file on disk before
-            # spending time on a full hash pass.  A size mismatch is a
-            # definitive corruption signal that costs only one stat() call.
-            #
-            # isdecimal() is stricter than isdigit() or isnumeric(): it
-            # rejects superscripts and other Unicode "digit" codepoints that
-            # would silently produce a wrong integer via int(). A malformed
-            # size is evidence of corruption or manifest tampering.
+            # Compare the manifest's <size> against the file before spending a
+            # full hash pass — a size mismatch is definitive and costs one stat().
+            # isdecimal() rejects superscripts/other Unicode "digits" that int()
+            # would silently convert to the wrong value (corruption or tampering).
+            actual_size: int | None = None
             size_el = h.find("{*}size")
             if size_el is not None and size_el.text is not None:
                 size_text = size_el.text.strip()
                 if not size_text.isdecimal():
-                    mismatches.append(f"[ERROR] malformed size field: {rel_path}")
+                    results.append(("mismatch", f"[ERROR] malformed size field: {rel_path}"))
                     h.clear()
                     continue
                 try:
-                    manifest_size = int(size_text)
                     actual_size = os.path.getsize(candidate)
-                    if manifest_size != actual_size:
-                        if verbose:
-                            mismatches.append(
-                                f"[ERROR] size mismatch: {rel_path}\n"
-                                f"        (calc size: {actual_size} | stored size: {manifest_size})"
-                            )
-                        else:
-                            mismatches.append(f"[ERROR] size mismatch: {rel_path}")
-                        h.clear()
-                        continue
                 except OSError:
-                    # File vanished between resolution above and getsize();
-                    # treat as missing to give a consistent message rather
-                    # than a bare OSError traceback.
-                    missing.append(f"[ERROR] missing file: {rel_path}")
+                    # Vanished between resolution and getsize() — report missing
+                    # rather than a bare OSError traceback.
+                    results.append(("missing", f"[ERROR] missing file: {rel_path}"))
+                    h.clear()
+                    continue
+                manifest_size = int(size_text)
+                if manifest_size != actual_size:
+                    if verbose:
+                        results.append(
+                            (
+                                "mismatch",
+                                f"[ERROR] size mismatch: {rel_path}\n"
+                                f"        (calc size: {actual_size} | stored size: {manifest_size})",
+                            )
+                        )
+                    else:
+                        results.append(("mismatch", f"[ERROR] size mismatch: {rel_path}"))
                     h.clear()
                     continue
 
-            # 'null' tag records no digest: the existence and size checks
-            # above are therefore the whole verification.
+            # 'null' tag records no digest: existence + size are the whole check.
             if tag == "null":
-                if verbose:
-                    print(f"[OK] {rel_path}")
+                results.append(("ok", rel_path))
                 h.clear()
                 continue
 
-            # Tags we accept-on-read but cannot recompute (xxhash128, xxhash3_64)
-            # raise ValueError inside get_hash; surface this as a mismatch
-            # rather than crashing.
-            try:
-                calculated = get_hash(candidate, tag)
-            except (ValueError, OSError) as e:
-                mismatches.append(f"[ERROR] cannot verify {rel_path}: {e}")
-                h.clear()
-                continue
+            # Needs a hash pass — defer it to the parallel phase. get_hash is NOT
+            # called here, so the size pre-check above still short-circuits a
+            # corrupt-size file before any hashing happens.
+            slot = len(results)
+            results.append(None)
+            hash_slots.append(slot)
+            hash_paths.append(candidate)
+            hash_sizes.append(actual_size if actual_size is not None else 0)
+            hash_jobs.append(lambda c=candidate, t=tag, e=expected, r=rel_path: _verify_one_hash(c, t, e, r, verbose))
+            # Calibrate the storage probe against the first computable algorithm.
+            if calib_algo is None and tag in ALGO_MAP:
+                calib_algo = tag
 
-            # Some legacy MHL files stored xxhash as a *decimal integer* rather
-            # than the modern big-endian hex. Detect that case and compare
-            # numerically, otherwise compare hex case-insensitively (uppercase
-            # hex appears in some third-party tool output).
-            if tag == "xxhash" and expected.isdecimal():
-                ok = int(calculated, 16) == int(expected)
-            else:
-                ok = calculated.lower() == expected.lower()
-
-            if not ok:
-                if verbose:
-                    mismatches.append(
-                        f"[ERROR] hash mismatch: {rel_path}\n"
-                        f"        (calc {tag}: {calculated} | stored {tag}: {expected})"
-                    )
-                else:
-                    mismatches.append(f"[ERROR] hash mismatch: {rel_path}")
-            elif verbose:
-                print(f"[OK] {rel_path}")
-
-            # Free this element and all already-processed siblings. Each
-            # cleared element becomes an empty shell with no children or
-            # text; deleting it from the parent removes it entirely.
+            # Free this element and all already-processed siblings.
             h.clear()
             parent = h.getparent()
             if parent is not None:
@@ -868,19 +887,44 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
     except (etree.XMLSyntaxError, OSError):
         sys.exit(20)
 
-    # Default mode: silent on full success, structured per-file output on
-    # failure. Verbose mode also prints OK lines (printed inline above as
-    # files are verified, so we only need to print errors here).
-    # We let the exit code carry the structured signal for automation.
+    # --- Parallel hash phase -------------------------------------------------
+    # Hash the deferred entries, auto-tuning concurrency to the storage exactly
+    # as seal does (jobs=None), or honouring an explicit -j override. With no
+    # computable algorithm (e.g. an all-xxhash128 manifest) every job is an
+    # instant "cannot verify", so a disk probe would be pointless — run straight.
+    if hash_jobs:
+        if calib_algo is None or jobs == 1:
+            hashed: list[tuple[str, str]] = [job() for job in hash_jobs]
+        elif jobs is None:
+            hashed = list(_hash_jobs_auto(hash_paths, hash_sizes, hash_jobs, calib_algo))
+        else:
+            hashed = _hash_batch(hash_jobs, jobs)
+        for slot, outcome in zip(hash_slots, hashed, strict=True):
+            results[slot] = outcome
+
+    # --- Emit ----------------------------------------------------------------
+    # Verbose prints [OK] per file in manifest order; failures fill two buckets
+    # so the exit code can distinguish missing-only (30), mismatch-only (40), or
+    # both (70). Default mode stays silent on full success.
+    missing: list[str] = []
+    mismatches: list[str] = []
+    for entry in results:
+        if entry is None:
+            continue  # unreachable: every placeholder is filled by the hash phase
+        kind, payload = entry
+        if kind == "ok":
+            if verbose:
+                print(f"[OK] {payload}")
+        elif kind == "missing":
+            missing.append(payload)
+        else:
+            mismatches.append(payload)
+
     if missing or mismatches:
         for line in missing:
             print(line)
         for line in mismatches:
             print(line)
-        # Exit code priority:
-        #   70: both kinds of failure (worst-case combined signal)
-        #   40: at least one mismatch (data corruption)
-        #   30: missing only (incomplete copy)
         if missing and mismatches:
             sys.exit(70)
         sys.exit(40 if mismatches else 30)
@@ -1010,7 +1054,20 @@ def main() -> None:
         action="store_true",
         help="print per-file status",
     )
-    verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose))
+    verify_p.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "files to hash concurrently (default: auto — measures the storage and "
+            "parallelises only when it speeds things up, e.g. md5/sha1 on a fast "
+            "SSD, while staying sequential on spinning disks). Use 1 to force "
+            "sequential, or a number to pin a fixed worker count"
+        ),
+    )
+    verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose, a.jobs))
 
     # xsd-schema-check subcommand
     xsd_p = subparsers.add_parser(
