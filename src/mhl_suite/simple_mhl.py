@@ -505,8 +505,8 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
 
     base_name = os.path.basename(root)
 
-    # We capture creation time once and reuse it so every <hashdate> is consistent
-    # with the <creationdate>.
+    # iso_now stamps the run's <creationdate> and <creatorinfo> start/finish.
+    # Each file's <hashdate> is captured separately as that file is hashed.
     now_dt = datetime.now(UTC)
     timestamp_for_filename = now_dt.strftime("%Y-%m-%d_%H%M%S")
     iso_now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -570,6 +570,7 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
     digests = _hash_files_auto(paths, [st.st_size for _, st in entries], algorithm)
 
     for (filepath, stat_result), digest in zip(entries, digests, strict=True):
+        hashdate = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         rel_path = os.path.relpath(filepath, root)
         # The MHL spec requires forward slashes regardless of platform. On
         # Windows, os.path.relpath returns backslashes; replace them so the
@@ -591,7 +592,7 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
         if verbose:
             print(f"[OK] {rel_path_posix}  {xml_tag}: {digest}")
         etree.SubElement(h, xml_tag).text = digest
-        etree.SubElement(h, "hashdate").text = iso_now
+        etree.SubElement(h, "hashdate").text = hashdate
 
     # Update finishdate to reflect actual completion; useful for auditing
     # how long the seal took.
