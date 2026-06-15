@@ -183,25 +183,39 @@ def get_hash(filepath: str, algo_key: str) -> str:
 #     report "Solid State: Info not available"), so device-type detection can't
 #     protect it.
 #
-# So we don't ask the operator and we don't detect hardware — we MEASURE. The
-# free trick: the first ~1 GB of hashing is real work we owe anyway, and the
-# rate it achieves is min(disk_bw, hash_bw). Compare that to the pure in-RAM
-# hash speed: if one core already can't keep the disk busy, the disk is the
-# ceiling (HDD/slow volume / fast-hash-on-anything) and we stay sequential —
-# reaching that verdict WITHOUT ever issuing a concurrent read, so HDDs pay no
-# seek penalty. Only when we're provably hash-bound (fast disk, slow hash) do we
-# add workers, re-measuring each window and stopping once throughput plateaus.
+# So we don't ask the operator and we don't detect hardware — we MEASURE:
+#
+#   1. Calibrate the pure in-RAM hash speed (no disk, ~50 ms).
+#   2. Probe the disk: a plain timed read of the first ~1 GB (and >=0.5 s, so a
+#      very fast NVMe still samples past its read ramp). This reads bytes we're
+#      about to hash anyway — ~1 GB out of hundreds is noise.
+#   3. If the disk can't clearly outrun one hash thread (read_bw < 1.3x hash_bw),
+#      the disk is the ceiling — HDD, slow volume, or any fast hash like xxhash —
+#      so we stay sequential and never issue a concurrent read (no seek penalty).
+#   4. Otherwise the hash is the bottleneck and the disk has spare bandwidth:
+#      run workers = round(read_bw / hash_bw) of them. Because we hand the whole
+#      file list (huge opener included) to the pool, a 100 GB first file overlaps
+#      with the rest instead of blocking the decision.
+#
+# A 1 GB probe can't tell a warm page cache from a fast disk (cache reads look
+# like a fast SSD). That false-positive is harmless on a real SSD, and on a
+# spinning disk it self-corrects: each hashing window is re-measured, and if a
+# parallel window can't even beat ONE hash thread (cold platter, seeking), we
+# demote to sequential for the remainder. Cached data, conversely, never seeks,
+# so parallelising it is fine.
 
 # Below this total size, parallelism saves too little wall-time to bother probing.
 _AUTO_MIN_BYTES = 2 * 1024 * 1024 * 1024
-# Sequential baseline (and each ramp probe) hashes about this many bytes.
+# Disk probe reads at least this many bytes AND runs at least this long, so the
+# sample is stable whether the volume does 70 MB/s or 7 GB/s.
 _AUTO_PROBE_BYTES = 1024 * 1024 * 1024
-# A measured rate at/above this fraction of pure hash speed means the HASH, not
-# the disk, is the bottleneck — i.e. the disk has spare bandwidth to exploit.
-_AUTO_HASHBOUND_FRACTION = 0.8
-# A worker-count bump must beat the best rate so far by this factor to be kept;
-# otherwise we've saturated the disk and stop adding workers.
-_AUTO_IMPROVE = 1.10
+_AUTO_PROBE_SECONDS = 0.5
+# The disk must beat one hash thread by this factor before parallelism is worth
+# it (below this the gain is marginal and not worth the extra reads/seeks).
+_AUTO_PARALLEL_THRESHOLD = 1.3
+# Re-measure throughput every this many bytes so a disk that goes cold mid-run
+# (warm cache exhausted) can be caught and demoted to sequential.
+_AUTO_RECHECK_BYTES = 8 * 1024 * 1024 * 1024
 # Never spin up more than this many workers regardless of core count.
 _AUTO_MAX_WORKERS = 16
 # Wall-time budget for the in-RAM hash-speed calibration — long enough to average
@@ -224,9 +238,9 @@ def _hash_batch(paths: list[str], algo_key: str, workers: int) -> list[str]:
 def _calibrate_hash_bw(algo_key: str) -> float:
     """Pure in-RAM hashing throughput (bytes/sec) for `algo_key`, no disk involved.
 
-    Lets us tell whether a measured sequential rate is limited by the hash (CPU)
-    or by the disk. Runs for a brief fixed time using HASH_CHUNK_SIZE updates so
-    the figure reflects get_hash's real per-chunk cost; ~50 ms is long enough to
+    Lets us tell whether a measured read rate is limited by the hash (CPU) or by
+    the disk. Runs for a brief fixed time using HASH_CHUNK_SIZE updates so the
+    figure reflects get_hash's real per-chunk cost; ~50 ms is long enough to
     average out scheduler jitter and invisible beside a multi-GB seal.
     """
     buf = bytes(HASH_CHUNK_SIZE)
@@ -240,12 +254,39 @@ def _calibrate_hash_bw(algo_key: str) -> float:
     return done / elapsed if elapsed > 0 else float("inf")
 
 
+def _probe_read_bw(paths: list[str]) -> float:
+    """Measure the volume's read bandwidth (bytes/sec) with a plain buffered read
+    of the first files, stopping once we've read >=_AUTO_PROBE_BYTES AND spent
+    >=_AUTO_PROBE_SECONDS. The byte floor gives a meaningful sample on a slow
+    disk; the time floor makes a very fast one read enough to get past its ramp.
+
+    Not hashed — just read and timed. The bytes are re-read when the files are
+    hashed for real, a negligible cost against a multi-GB seal.
+    """
+    buf = bytearray(HASH_CHUNK_SIZE)
+    read = 0
+    start = time.perf_counter()
+    elapsed = 0.0
+    for p in paths:
+        try:
+            with open(p, "rb") as f:
+                while f.readinto(buf):
+                    read += len(buf)
+                    elapsed = time.perf_counter() - start
+                    if read >= _AUTO_PROBE_BYTES and elapsed >= _AUTO_PROBE_SECONDS:
+                        return read / elapsed
+        except OSError:
+            continue  # a file that won't open is the real hash pass's problem, not the probe's
+    elapsed = time.perf_counter() - start
+    return read / elapsed if elapsed > 0 else float("inf")
+
+
 def _hash_files_auto(paths: list[str], sizes: list[int], algo_key: str) -> Iterator[str]:
     """Yield each path's digest in input order, auto-tuning concurrency to the
-    storage by measuring throughput as it goes (see section comment).
+    storage (see section comment).
 
     `sizes` are the files' byte sizes (already known from the seal walk's stat),
-    used only to carve the byte-sized probe windows — never re-stat'd here.
+    used only to carve the byte-sized recheck windows — never re-stat'd here.
     """
     n = len(paths)
     cap = min(_AUTO_MAX_WORKERS, os.cpu_count() or 4)
@@ -256,57 +297,43 @@ def _hash_files_auto(paths: list[str], sizes: list[int], algo_key: str) -> Itera
         return
 
     hash_bw = _calibrate_hash_bw(algo_key)
+    read_bw = _probe_read_bw(paths)
 
-    # --- Baseline: hash the first ~1 GB sequentially (real, owed work) --------
-    end = 0
-    acc = 0
-    while end < n and acc < _AUTO_PROBE_BYTES:
-        acc += sizes[end]
-        end += 1
-    start = time.perf_counter()
-    base = _hash_batch(paths[:end], algo_key, 1)
-    elapsed = time.perf_counter() - start
-    yield from base
-    seq_bw = acc / elapsed if elapsed > 0 else float("inf")
-
-    # Disk-bound: one core can't even saturate the disk, so more cores can't
-    # help and (on a spinning disk) would hurt. Stay sequential — reached with
-    # no concurrent read, so an HDD never pays a seek penalty.
-    if seq_bw < _AUTO_HASHBOUND_FRACTION * hash_bw:
-        for p in paths[end:]:
+    # Disk-bound (HDD, slow volume, or any hash faster than the disk): one core
+    # already keeps the disk busy, so more cores can't help and would seek-thrash
+    # a spinning disk. Stay sequential — decided before any concurrent read.
+    if read_bw < _AUTO_PARALLEL_THRESHOLD * hash_bw:
+        for p in paths:
             yield get_hash(p, algo_key)
         return
 
-    # --- Hash-bound: the disk has spare bandwidth. Ramp workers (2,4,8,…),
-    # re-measuring each window, until adding workers stops paying off or we hit
-    # the core cap. Probes only ever run here, on storage fast enough to be
-    # hash-bound, so they're quick and a slightly non-optimal count costs little.
-    best_workers, best_bw = 1, seq_bw
-    workers = 2
-    while end < n:
-        stop = end
+    # Hash-bound: the disk outruns one hash thread, so spread the work across
+    # enough threads to soak up its bandwidth. round(read_bw/hash_bw) lands near
+    # the count that saturates the disk without piling on idle threads.
+    workers = max(2, min(cap, round(read_bw / hash_bw)))
+
+    # Hash in windows so we can re-measure: if a window's parallel throughput
+    # can't even beat one hash thread, the disk has gone cold/seek-bound (e.g. a
+    # warm cache that fooled the probe is now exhausted) — demote to sequential
+    # for the remainder. Each window takes at least `workers` files so every
+    # worker has something to do even when files are large.
+    pos = 0
+    while pos < n:
+        stop = pos
         acc = 0
-        # Take at least `workers` files so every worker has something to hash,
-        # even when files are large enough that one fills the byte window.
-        while stop < n and (acc < _AUTO_PROBE_BYTES or (stop - end) < workers):
+        while stop < n and (acc < _AUTO_RECHECK_BYTES or (stop - pos) < workers):
             acc += sizes[stop]
             stop += 1
         start = time.perf_counter()
-        yield from _hash_batch(paths[end:stop], algo_key, workers)
+        yield from _hash_batch(paths[pos:stop], algo_key, workers)
         elapsed = time.perf_counter() - start
-        end = stop
+        pos = stop
         rate = acc / elapsed if elapsed > 0 else float("inf")
-        if rate > best_bw * _AUTO_IMPROVE:
-            best_workers, best_bw = workers, rate
-            if workers >= cap:
-                break
-            workers = min(workers * 2, cap)
-        else:
-            break  # plateaued: disk saturated (or thrashing) — stop adding workers
-
-    # Remainder at the best worker count we found.
-    if end < n:
-        yield from _hash_batch(paths[end:], algo_key, best_workers)
+        if rate < hash_bw:
+            # Parallel isn't beating a single thread → disk is the bottleneck now.
+            for p in paths[pos:]:
+                yield get_hash(p, algo_key)
+            return
 
 
 # -----------------------------------------------------------------------------
