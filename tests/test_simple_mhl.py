@@ -2525,3 +2525,177 @@ class TestFriendlyHostname:
         doc = etree.Element("hashlist", version="1.1")
         info = simple_mhl._build_creatorinfo(doc, "simple-mhl test", "2026-01-01T00:00:00Z")
         assert info.findtext("hostname") == "Luis's MacBook Pro"
+
+
+# ---------------------------------------------------------------------------
+# TestAdaptiveHashing — locks the auto-concurrency decisions and invariants
+# ---------------------------------------------------------------------------
+
+
+class TestAdaptiveHashing:
+    """Behaviour of _hash_files_auto / _probe_read_bw / _hash_batch.
+
+    These pin the *decisions* (sequential vs parallel-N vs demotion) and the
+    output invariant, never the throughput numbers (which are hardware-bound).
+    The disk/hash measurements are mocked so the tests are deterministic on any
+    machine — including the all-important guarantee that concurrency never
+    changes the manifest.
+    """
+
+    @staticmethod
+    def _make_files(tmp_path, count, algo="md5"):
+        paths, sizes = [], []
+        for i in range(count):
+            p = tmp_path / f"f{i:04d}.bin"
+            p.write_bytes(bytes([i % 256]) * (1000 + i))  # distinct content & size
+            paths.append(str(p))
+            sizes.append(p.stat().st_size)
+        ref = [simple_mhl.get_hash(p, algo) for p in paths]  # pure-sequential reference
+        return paths, sizes, ref
+
+    def _force(self, monkeypatch, *, read_bw, hash_bw, cpu=8, min_bytes=0, recheck=8 * 1024**3):
+        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", min_bytes)
+        monkeypatch.setattr(simple_mhl, "_AUTO_RECHECK_BYTES", recheck)
+        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda algo: hash_bw)
+        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda paths: read_bw)
+        monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: cpu)
+
+    def _spy_batch(self, monkeypatch):
+        calls: list[int] = []
+        real = simple_mhl._hash_batch
+
+        def spy(paths, algo, workers):
+            calls.append(workers)
+            return real(paths, algo, workers)
+
+        monkeypatch.setattr(simple_mhl, "_hash_batch", spy)
+        return calls
+
+    # --- output invariance: the manifest must be identical on every path -----
+
+    def test_output_identical_parallel_branch(self, tmp_path, monkeypatch):
+        paths, sizes, ref = self._make_files(tmp_path, 30)
+        self._force(monkeypatch, read_bw=4000, hash_bw=1000)
+        assert list(simple_mhl._hash_files_auto(paths, sizes, "md5")) == ref
+
+    def test_output_identical_demotion_branch(self, tmp_path, monkeypatch):
+        paths, sizes, ref = self._make_files(tmp_path, 30)
+        # hash_bw huge => every window's measured rate < hash_bw => demote; a
+        # tiny recheck window makes demotion leave a real sequential remainder.
+        self._force(monkeypatch, read_bw=1e30, hash_bw=1e18, recheck=1)
+        assert list(simple_mhl._hash_files_auto(paths, sizes, "md5")) == ref
+
+    def test_output_identical_sequential_gate(self, tmp_path, monkeypatch):
+        paths, sizes, ref = self._make_files(tmp_path, 30)
+        self._force(monkeypatch, read_bw=100, hash_bw=1000)  # disk-bound
+        assert list(simple_mhl._hash_files_auto(paths, sizes, "md5")) == ref
+
+    # --- decisions -----------------------------------------------------------
+
+    def test_disk_bound_never_parallelises(self, tmp_path, monkeypatch):
+        """read_bw below the threshold (HDD / fast hash) must stay sequential —
+        the branch that protects spinning disks from seek-thrash."""
+        paths, sizes, _ = self._make_files(tmp_path, 10)
+        self._force(monkeypatch, read_bw=100, hash_bw=1000)
+        calls = self._spy_batch(monkeypatch)
+        list(simple_mhl._hash_files_auto(paths, sizes, "md5"))
+        assert all(w <= 1 for w in calls), f"disk-bound must not issue a concurrent batch, saw {calls}"
+
+    def test_parallel_worker_count_from_bandwidth(self, tmp_path, monkeypatch):
+        """workers ~= round(read_bw / hash_bw)."""
+        paths, sizes, _ = self._make_files(tmp_path, 10)
+        self._force(monkeypatch, read_bw=4000, hash_bw=1000, cpu=8)
+        calls = self._spy_batch(monkeypatch)
+        list(simple_mhl._hash_files_auto(paths, sizes, "md5"))
+        assert calls, "expected a concurrent batch to run"
+        assert max(calls) == 4, f"expected 4 workers, saw {calls}"
+
+    def test_worker_count_clamped_to_cores(self, tmp_path, monkeypatch):
+        paths, sizes, _ = self._make_files(tmp_path, 10)
+        self._force(monkeypatch, read_bw=100_000, hash_bw=1000, cpu=4)  # wants 100, capped to cores
+        calls = self._spy_batch(monkeypatch)
+        list(simple_mhl._hash_files_auto(paths, sizes, "md5"))
+        assert calls, "expected a concurrent batch to run"
+        assert max(calls) == 4
+
+    def test_small_job_skips_probe(self, tmp_path, monkeypatch):
+        paths, sizes, ref = self._make_files(tmp_path, 5)
+        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 10 * 1024**3)  # larger than the job
+        probed: list[int] = []
+        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 1.0)
+        assert list(simple_mhl._hash_files_auto(paths, sizes, "md5")) == ref
+        assert probed == [], "a sub-threshold job must not probe the disk"
+
+    def test_single_file_skips_probe(self, tmp_path, monkeypatch):
+        paths, sizes, ref = self._make_files(tmp_path, 1)
+        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
+        probed: list[int] = []
+        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 9e9)
+        assert list(simple_mhl._hash_files_auto(paths, sizes, "md5")) == ref
+        assert probed == [], "nothing to parallelise across a single file"
+
+    # --- helpers -------------------------------------------------------------
+
+    def test_hash_batch_preserves_order(self, tmp_path):
+        paths, _, ref = self._make_files(tmp_path, 20)
+        assert simple_mhl._hash_batch(paths, "md5", 4) == ref
+
+    def test_hash_batch_uses_module_level_get_hash(self, tmp_path, monkeypatch):
+        """Workers must resolve get_hash via the module global so test (and any
+        future) monkeypatches still intercept it."""
+        paths, _, _ = self._make_files(tmp_path, 6)
+        monkeypatch.setattr(simple_mhl, "get_hash", lambda p, a: "STUB")
+        assert simple_mhl._hash_batch(paths, "md5", 3) == ["STUB"] * 6
+
+    def test_probe_read_bw_skips_unreadable(self, tmp_path, monkeypatch):
+        good = tmp_path / "g.bin"
+        good.write_bytes(b"x" * 4096)
+        monkeypatch.setattr(simple_mhl, "_AUTO_PROBE_BYTES", 1)
+        monkeypatch.setattr(simple_mhl, "_AUTO_PROBE_SECONDS", 0.0)
+        bw = simple_mhl._probe_read_bw([str(tmp_path / "missing.bin"), str(good)])
+        assert bw > 0  # unreadable path skipped without error, good file measured
+
+    def test_calibrate_hash_bw_is_positive_and_finite(self):
+        """The real in-RAM calibration (mocked everywhere else) returns a usable
+        bytes/sec figure for every writable algorithm."""
+        for algo in ("md5", "xxhash"):
+            bw = simple_mhl._calibrate_hash_bw(algo)
+            assert 0 < bw < float("inf")
+
+
+# ---------------------------------------------------------------------------
+# TestSealJobs — the -j/--jobs override
+# ---------------------------------------------------------------------------
+
+
+class TestSealJobs:
+    """The -j flag: default auto, 1 = sequential, N = pinned — all producing the
+    same digests."""
+
+    def test_seal_fixed_jobs_produces_correct_digests(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"a.bin": b"hello", "sub/b.bin": b"world"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "-j", "4"])
+        assert rc == 0
+        text = next(tmp_path.glob("*.mhl")).read_text()
+        assert hashlib.md5(b"hello").hexdigest() in text
+        assert hashlib.md5(b"world").hexdigest() in text
+
+    def test_j1_bypasses_auto_probe(self, tmp_path, monkeypatch):
+        """jobs=1 must hash sequentially without ever measuring the disk."""
+        make_tree(tmp_path, {"a.bin": b"x", "b.bin": b"y"})
+        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)  # auto would otherwise probe
+        probed: list[int] = []
+        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 9e9)
+        simple_mhl.seal(str(tmp_path), "md5", dont_reseal=False, verbose=False, jobs=1)
+        assert probed == [], "jobs=1 must not run the auto disk probe"
+
+    def test_default_uses_auto_probe(self, tmp_path, monkeypatch):
+        """The default (jobs=None) routes through the adaptive probe."""
+        make_tree(tmp_path, {"a.bin": b"x", "b.bin": b"y"})
+        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
+        monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
+        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda a: 1000.0)
+        probed: list[int] = []
+        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 100.0)  # disk-bound
+        simple_mhl.seal(str(tmp_path), "md5", dont_reseal=False, verbose=False)
+        assert probed == [1], "the default must probe the disk to decide"

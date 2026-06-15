@@ -2213,3 +2213,89 @@ class TestSchemaShapedAscMhlFuzz:
             total = mhlver._mhl_total_bytes(mhl)
             assert isinstance(total, int)
             assert total >= 0
+
+
+# ---------------------------------------------------------------------------
+# TestSinglePassVerify — the non-verbose path must spawn each backend ONCE
+# ---------------------------------------------------------------------------
+
+
+class TestSinglePassVerify:
+    """Locks the double-run fix: a default (non-verbose) verify runs the backend
+    a single time. The old code ran it twice — once -v for the report, once
+    plain for the terminal — re-hashing every file, so a regression here silently
+    doubles verify time."""
+
+    def test_classicmhl_verify_runs_backend_once(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(mhlver, "get_command_path", lambda name: "/fake/simple-mhl")
+        calls: list[list[str]] = []
+
+        def counting(cmd, cwd=None, **kw):
+            calls.append(cmd)
+            return mhlver.StepResult(exit_code=0, output="[OK] a.bin\n")
+
+        monkeypatch.setattr(mhlver, "_run_step", counting)
+        target = tmp_path / "m.mhl"
+        target.write_text("<hashlist/>")
+
+        mhlver._verify_classicmhl(target, verbose=False, schema=False)
+
+        assert len(calls) == 1, f"expected 1 backend spawn, got {len(calls)}"
+        assert "-v" in calls[0], "the single run must be the -v run (feeds both report and terminal)"
+
+    def test_ascmhl_verify_runs_backend_once(self, monkeypatch, tmp_path):
+        calls: list[list[str]] = []
+        monkeypatch.setattr(
+            mhlver,
+            "_run_step",
+            lambda cmd, cwd=None, **kw: calls.append(cmd) or mhlver.StepResult(exit_code=0, output=""),
+        )
+        pkg = tmp_path / "ascmhl"
+        pkg.mkdir()
+        target = pkg / "0001.mhl"
+        target.write_text("<x/>")
+
+        mhlver._ascmhl_verify(target, "/fake/ascmhl-debug", tmp_path, verbose=False)
+
+        assert len(calls) == 1, f"expected 1 backend spawn, got {len(calls)}"
+        assert "-v" in calls[0]
+
+
+# ---------------------------------------------------------------------------
+# TestStripVerbose — deriving non-verbose backend output from the -v run
+# ---------------------------------------------------------------------------
+
+
+class TestStripVerbose:
+    """The strip helpers reduce a backend's -v output to its non-verbose form,
+    which is what lets a single -v run feed both the report and the terminal."""
+
+    def test_strip_classicmhl_drops_ok_and_indented_detail(self):
+        verbose = (
+            "[OK] a.bin\n"
+            "[ERROR] hash mismatch: b.bin\n"
+            "        (calc md5: 111 | stored md5: 222)\n"
+            "[ERROR] missing file: c.bin\n"
+        )
+        out = mhlver._strip_classicmhl_verbose(verbose)
+        assert "[OK]" not in out
+        assert "calc md5" not in out  # indented verbose-only detail dropped
+        assert "[ERROR] hash mismatch: b.bin" in out
+        assert "[ERROR] missing file: c.bin" in out
+
+    def test_strip_ascmhl_keeps_errors_and_missing_block(self):
+        verbose = (
+            "check folder at path: /x\n"
+            "verification (xxh64) of file a.bin: OK\n"
+            "ERROR: hash mismatch        for b.bin old xxh64: 1, new xxh64: 2\n"
+            "found new file d.bin\n"
+            "ERROR: 1 missing file(s):\n"
+            "  c.bin\n"
+        )
+        out = mhlver._strip_ascmhl_verbose(verbose)
+        assert "check folder" not in out  # verbose-only header dropped
+        assert "of file a.bin: OK" not in out  # verbose-only per-file OK dropped
+        assert "hash mismatch" in out
+        assert "found new file d.bin" in out
+        assert "ERROR: 1 missing file(s):" in out
+        assert "  c.bin" in out  # INDENTED missing entry preserved (present in both modes)
