@@ -18,7 +18,7 @@ import xxhash
 from lxml import etree
 
 from mhl_suite import simple_mhl
-from mhl_suite._internal import unicodepaths
+from mhl_suite._internal import hostinfo, ignorelist, unicodepaths
 
 
 def make_tree(root: Path, spec: dict):
@@ -139,14 +139,17 @@ class TestSeal:
         text = next(tmp_path.glob("*.mhl")).read_text()
         assert "<sha1>" in text
 
-    def test_seal_skips_hidden_files(self, mhl_cli, tmp_path):
-        """Files starting with '.' should be excluded from the manifest."""
+    def test_seal_includes_hidden_files_and_dirs(self, mhl_cli, tmp_path):
+        """Hidden files and directories are part of the fixity record; only
+        OS-generated junk is excluded."""
         make_tree(
             tmp_path,
             {
                 "visible.bin": b"yes",
-                ".hidden.bin": b"no",
-                ".hiddendir/inside.bin": b"also no",
+                ".hidden.bin": b"yes too",
+                ".hiddendir/inside.bin": b"deep",
+                ".DS_Store": b"junk",
+                "._visible.bin": b"resource fork",
             },
         )
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
@@ -154,7 +157,11 @@ class TestSeal:
         assert rc == 0
         text = next(tmp_path.glob("*.mhl")).read_text()
         assert "visible.bin" in text
-        assert "hidden" not in text
+        assert ".hidden.bin" in text
+        assert ".hiddendir/inside.bin" in text
+        # OS metadata stays out.
+        assert ".DS_Store" not in text
+        assert "._visible.bin" not in text
 
     def test_seal_dont_reseal(self, mhl_cli, tmp_path):
         """--dont-reseal should bail out if MHL already exists."""
@@ -223,13 +230,13 @@ class TestSealVerbose:
         assert "[OK] clip.mxf" in out
         assert "md5:" in out  # the algorithm tag and digest are shown
 
-    def test_verbose_prints_skip_for_hidden(self, mhl_cli, tmp_path):
+    def test_verbose_prints_skip_for_os_junk(self, mhl_cli, tmp_path):
         make_tree(tmp_path, {"clip.mxf": b"data", ".DS_Store": b"junk"})
         rc, out, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "-v"])
         assert rc == 0
-        assert "[SKIP] .DS_Store (hidden)" in out
+        assert "[SKIP] .DS_Store (OS metadata)" in out
 
-    def test_hidden_skip_silent_without_verbose(self, mhl_cli, tmp_path):
+    def test_os_junk_skip_silent_without_verbose(self, mhl_cli, tmp_path):
         make_tree(tmp_path, {"clip.mxf": b"data", ".DS_Store": b"junk"})
         rc, out, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
@@ -373,14 +380,59 @@ class TestVerify:
         assert "calc" in out
         assert "stored" in out
 
-    def test_iter_files_without_on_skip_skips_hidden(self, tmp_path):
+    def test_iter_files_without_on_skip_skips_os_junk(self, tmp_path):
         """_iter_files_for_seal's on_skip callback is optional. With on_skip=None
-        a hidden entry must still be skipped silently (no callback invoked, no
-        crash) and excluded from the yielded files."""
-        make_tree(tmp_path, {"visible.bin": b"x", ".hidden.bin": b"y"})
+        an OS-junk entry must still be skipped silently (no callback invoked, no
+        crash) and excluded, while a hidden user file IS yielded."""
+        make_tree(tmp_path, {"visible.bin": b"x", ".hidden.bin": b"y", ".DS_Store": b"junk"})
         mhl_path = str(tmp_path / "out.mhl")
-        yielded = [os.path.basename(p) for p, _ in simple_mhl._iter_files_for_seal(str(tmp_path), mhl_path)]
-        assert yielded == ["visible.bin"]
+        yielded = sorted(os.path.basename(p) for p, _ in simple_mhl._iter_files_for_seal(str(tmp_path), mhl_path))
+        assert yielded == [".hidden.bin", "visible.bin"]
+
+    @pytest.mark.parametrize(
+        ("name", "is_junk"),
+        [
+            # Exact names (case-insensitive)
+            (".DS_Store", True),
+            (".ds_store", False),  # case-sensitive: only the OS's exact casing matches
+            (".Spotlight-V100", True),
+            (".Trashes", True),
+            (".fseventsd", True),
+            ("Thumbs.db", True),
+            (".localized", True),
+            (".AppleDouble", True),
+            (".LSOverride", True),
+            (".DocumentRevisions-V100", True),
+            (".TemporaryItems", True),
+            (".VolumeIcon.icns", True),
+            (".com.apple.timemachine.donotpresent", True),
+            (".com.apple.timemachine.supported", True),
+            (".PKInstallSandboxManager", True),
+            (".PKInstallSandboxManager-SystemSoftware", True),
+            (".hotfiles.btree", True),
+            (".vol", True),
+            (".file", True),
+            ("lost+found", True),
+            # Trailing-carriage-return names (real bytes in the on-disk name)
+            ("Icon\r", True),
+            (".HFS+ Private Directory Data\r", True),
+            # Prefix matches
+            ("._MyClip.mov", True),  # macOS AppleDouble resource fork
+            ("._", True),  # bare '._' still matches the fork prefix
+            (".disk_label", True),
+            (".disk_label_2x", True),
+            # NOT junk — hidden user content is sealed
+            (".hidden.bin", False),
+            (".git", False),  # hidden user dir — descended
+            (".env", False),
+            ("clip.mxf", False),
+            ("Icon", False),  # plain 'Icon' (no CR) is a real file, not the marker
+            ("lost+found2", False),  # exact match only
+        ],
+    )
+    def test_is_os_junk(self, name, is_junk):
+        """Only OS-generated metadata is junk; hidden user files/dirs are not."""
+        assert ignorelist.is_os_junk(name) is is_junk
 
     @pytest.mark.skipif(sys.platform == "win32", reason="os.mkfifo is POSIX-only")
     def test_iter_files_without_on_skip_skips_non_regular(self, tmp_path):
@@ -2407,3 +2459,69 @@ class TestNormalizationVariantHint:
         err = capsys.readouterr().err
         assert "did you mean" in err
         assert nfd_dir in err
+
+
+# ---------------------------------------------------------------------------
+# hostinfo.friendly_hostname — shared host identity helper
+# ---------------------------------------------------------------------------
+
+
+class TestFriendlyHostname:
+    """friendly_hostname prefers the macOS ComputerName, with fallbacks. Shared
+    by simple_mhl (manifest <hostname>) and mhlver (report Host field)."""
+
+    def test_macos_uses_computer_name(self, monkeypatch):
+        """On macOS the user-facing ComputerName from scutil is preferred over
+        the bare network hostname."""
+        monkeypatch.setattr(hostinfo.sys, "platform", "darwin")
+        completed = hostinfo.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Luis's MacBook Pro\n", stderr=""
+        )
+        monkeypatch.setattr(hostinfo.subprocess, "run", lambda *a, **kw: completed)
+        assert hostinfo.friendly_hostname() == "Luis's MacBook Pro"
+
+    def test_macos_falls_back_to_node_when_scutil_fails(self, monkeypatch):
+        """If scutil is missing or errors, fall back to platform.node()."""
+        monkeypatch.setattr(hostinfo.sys, "platform", "darwin")
+        monkeypatch.setattr(hostinfo.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(OSError()))
+        monkeypatch.setattr(hostinfo.platform, "node", lambda: "fallback-host")
+        assert hostinfo.friendly_hostname() == "fallback-host"
+
+    def test_non_macos_uses_node(self, monkeypatch):
+        """Off macOS, platform.node() is used directly (FQDN preserved)."""
+        monkeypatch.setattr(hostinfo.sys, "platform", "linux")
+        monkeypatch.setattr(hostinfo.platform, "node", lambda: "nas01.studio.local")
+        assert hostinfo.friendly_hostname() == "nas01.studio.local"
+
+    def test_empty_node_falls_back_to_unknown(self, monkeypatch):
+        """A blank platform.node() (minimal containers) yields a stable label."""
+        monkeypatch.setattr(hostinfo.sys, "platform", "linux")
+        monkeypatch.setattr(hostinfo.platform, "node", lambda: "")
+        assert hostinfo.friendly_hostname() == "unknown"
+
+    def test_scutil_decoded_as_utf8_regardless_of_locale(self, monkeypatch):
+        """scutil output must be decoded as UTF-8, not via the (possibly ASCII)
+        locale — otherwise a ComputerName with a curly apostrophe, accent, or
+        emoji would raise UnicodeDecodeError under LANG=C. A non-ASCII name
+        must round-trip intact."""
+        captured: dict = {}
+
+        def fake_run(*a, **kw):
+            captured.update(kw)
+            return hostinfo.subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="Jos\u00e9\u2019s iMac \U0001f3ac\n", stderr=""
+            )
+
+        monkeypatch.setattr(hostinfo.sys, "platform", "darwin")
+        monkeypatch.setattr(hostinfo.subprocess, "run", fake_run)
+        assert hostinfo.friendly_hostname() == "Jos\u00e9\u2019s iMac \U0001f3ac"
+        assert captured.get("encoding") == "utf-8"
+        assert captured.get("errors") == "replace"
+
+    def test_creatorinfo_uses_friendly_hostname(self, monkeypatch):
+        """The manifest's creatorinfo <hostname> is sourced from the shared
+        helper, not the bare network hostname."""
+        monkeypatch.setattr(simple_mhl, "friendly_hostname", lambda: "Luis's MacBook Pro")
+        doc = etree.Element("hashlist", version="1.1")
+        info = simple_mhl._build_creatorinfo(doc, "simple-mhl test", "2026-01-01T00:00:00Z")
+        assert info.findtext("hostname") == "Luis's MacBook Pro"

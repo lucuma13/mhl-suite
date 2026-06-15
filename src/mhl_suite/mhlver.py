@@ -20,6 +20,7 @@
 # =============================================================================
 
 import argparse
+import getpass
 import importlib.metadata
 import re
 import shutil
@@ -39,6 +40,7 @@ from rich.live import Live
 from rich.progress import BarColumn, Progress, TextColumn
 from rich.text import Text
 
+from mhl_suite._internal.hostinfo import friendly_hostname
 from mhl_suite._internal.unicodepaths import normalization_variant_on_disk
 
 # -----------------------------------------------------------------------------
@@ -1137,10 +1139,41 @@ _SEP_HEAVY = "=" * _W
 _SEP_LIGHT = "-" * _W
 
 
+def _summary_line(
+    *,
+    passed: bool,
+    n_files: int,
+    n_ok: int,
+    n_missing: int,
+    n_mismatch: int,
+    n_error: int,
+    n_new: int,
+    n_manifests: int | None = None,
+) -> str:
+    """Build the ' | '-joined verdict line shared by the global summary and
+    each per-manifest sub-summary. Pass n_manifests=None to omit the manifest
+    count (per-manifest lines don't repeat it)."""
+    parts = ["✅ VERIFIED" if passed else "❌ FAILED"]
+    if n_manifests is not None:
+        parts.append(f"{n_manifests} {'manifest' if n_manifests == 1 else 'manifests'}")
+    parts.append(f"{n_files} {'file' if n_files == 1 else 'files'}")
+    parts.append(f"{n_ok} verified")
+    if n_missing:
+        parts.append(f"{n_missing} missing")
+    if n_mismatch:
+        parts.append(f"{n_mismatch} hash mismatch")
+    if n_error:
+        parts.append(f"{n_error} error")
+    if n_new:
+        parts.append(f"{n_new} new (untracked)")
+    return " | ".join(parts)
+
+
 def _render_report(
     fh: TextIO,
     src: Path,
     started_at: datetime,
+    finished_at: datetime,
     manifest_results: list[ManifestResult],
     exit_status: int,
 ) -> None:
@@ -1157,16 +1190,20 @@ def _render_report(
     line(_SEP_HEAVY)
     line()
 
-    date_str = started_at.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    host = friendly_hostname()
+    try:
+        operator = getpass.getuser()
+    except (OSError, KeyError, ImportError):
+        operator = "unknown"
 
-    line(f"Tool:       mhlver {__version__}")
-    line(f"Date:       {date_str}")
+    fmt = "%Y-%m-%d %H:%M:%S %Z"
     line(f"Source:     {src}")
+    line(f"Tool:       mhlver {__version__}")
+    line(f"User:       {operator}")
+    line(f"Host:       {host}")
+    line(f"Started:    {started_at.astimezone().strftime(fmt)}")
+    line(f"Finished:   {finished_at.astimezone().strftime(fmt)}")
     line()
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    line("Summary")
-    line(_SEP_LIGHT)
 
     # Aggregate counts across all manifests.
     n_manifests = len(manifest_results)
@@ -1177,33 +1214,43 @@ def _render_report(
     n_new = sum(mr.n_new for mr in manifest_results)
     n_error = sum(mr.n_error for mr in manifest_results)
 
-    manifest_word = "manifest" if n_manifests == 1 else "manifests"
-    file_word = "file" if n_files == 1 else "files"
-
-    overall_ok = exit_status == 0
-    status_icon = "✅ PASSED" if overall_ok else "❌ FAILED"
-
-    parts = [
-        f"{status_icon}",
-        f"{n_manifests} {manifest_word}",
-        f"{n_files} {file_word}",
-        f"{n_ok} passed",
-    ]
-    if n_missing:
-        parts.append(f"{n_missing} missing")
-    if n_mismatch:
-        parts.append(f"{n_mismatch} hash mismatch")
-    if n_error:
-        parts.append(f"{n_error} error")
-    if n_new:
-        parts.append(f"{n_new} new (untracked)")
-
-    line(" | ".join(parts))
+    # ── Summary ───────────────────────────────────────────────────────────────
+    line("Summary")
+    line(_SEP_LIGHT)
+    line(
+        _summary_line(
+            passed=exit_status == 0,
+            n_manifests=n_manifests,
+            n_files=n_files,
+            n_ok=n_ok,
+            n_missing=n_missing,
+            n_mismatch=n_mismatch,
+            n_error=n_error,
+            n_new=n_new,
+        )
+    )
     line()
 
-    # ── Details ───────────────────────────────────────────────────────────────
+    # ── Issues ────────────────────────────────────────────────────────────────
+    # Everything that isn't a clean OK, pulled to the top across all manifests
+    # Omitted entirely when there's nothing to show.
+    issue_lines: list[str] = []
+    for mr in manifest_results:
+        if mr.manifest_status == "error":
+            issue_lines.append(f"🚨 {mr.manifest_path}: {mr.manifest_error or 'manifest-level error'}")
+            continue
+        issue_lines.extend(_format_file_result(fr, indent="") for fr in mr.file_results if fr.status != "ok")
+
+    if issue_lines:
+        line("Issues")
+        line(_SEP_LIGHT)
+        for s in issue_lines:
+            line(s)
+        line()
+
+    # ── Manifests ───────────────────────────────────────────────────────────────
     if manifest_results:
-        line("Details")
+        line("Manifest" if n_manifests == 1 else "Manifests")
         line(_SEP_LIGHT)
 
     for mr in manifest_results:
@@ -1215,14 +1262,34 @@ def _render_report(
             line(f"    ✗ {mr.manifest_error or 'manifest-level error'}")
             continue
 
+        # Per-manifest sub-summary — same fields as the global verdict minus the
+        # manifest count. New/untracked is a warning, not a verification failure,
+        # so it doesn't flip the manifest's PASSED/FAILED state.
+        line(
+            _summary_line(
+                passed=mr.n_missing == 0 and mr.n_mismatch == 0 and mr.n_error == 0,
+                n_files=mr.n_files,
+                n_ok=mr.n_ok,
+                n_missing=mr.n_missing,
+                n_mismatch=mr.n_mismatch,
+                n_error=mr.n_error,
+                n_new=mr.n_new,
+            )
+        )
+
         for fr in mr.file_results:
             line(_format_file_result(fr))
+        line()
 
     line(_SEP_HEAVY)
 
 
-def _format_file_result(fr: "FileResult") -> str:
+def _format_file_result(fr: "FileResult", indent: str = "    ") -> str:
     """Return the report line(s) for a single FileResult (without trailing newline).
+
+    `indent` is the leading whitespace for the primary line; the Details section
+    indents under its manifest header (4 spaces) while the Issues section sits at
+    column 0. Continuation (detail) lines are indented `indent` + 3 spaces.
 
     Mismatch entries with detail render across two lines, using the label
     embedded in the detail string (e.g. "hash mismatch", "size mismatch"):
@@ -1233,22 +1300,23 @@ def _format_file_result(fr: "FileResult") -> str:
         ❌ size mismatch: path/to/file.mxf
            (calc size: 122 | stored size: 4170)
     """
+    cont = indent + "   "  # continuation/detail line indent
     if fr.status == "ok":
-        return f"    ✓ {fr.path}"
+        return f"{indent}✓ {fr.path}"
     if fr.status == "missing":
-        return f"    ❌ missing: {fr.path}"
+        return f"{indent}❌ missing: {fr.path}"
     if fr.status == "mismatch":
         if ": " in fr.detail:
             label, paren_content = fr.detail.split(": ", 1)
-            return f"    ❌ {label}: {fr.path}\n       ({paren_content})"
+            return f"{indent}❌ {label}: {fr.path}\n{cont}({paren_content})"
         # Non-verbose failsafe: detail is just "hash mismatch" or "size mismatch".
-        return f"    ❌ {fr.detail}: {fr.path}"
+        return f"{indent}❌ {fr.detail}: {fr.path}"
     if fr.status == "new":
-        return f"    ⚠️ new (untracked): {fr.path}"
+        return f"{indent}⚠️ new (untracked): {fr.path}"
     # "error"
     if fr.detail:
-        return f"    🚨 error: {fr.path}\n       ({fr.detail})"
-    return f"    🚨 error: {fr.path}"
+        return f"{indent}🚨 error: {fr.path}\n{cont}({fr.detail})"
+    return f"{indent}🚨 error: {fr.path}"
 
 
 # -----------------------------------------------------------------------------
@@ -1308,7 +1376,8 @@ def main() -> None:
         started_at = datetime.now().astimezone()
         with _open_report(src) as (rf, rp):
             exit_status, manifest_results = _run(src, args.verbose, args.xsd_schema_check)
-            _render_report(rf, src, started_at, manifest_results, exit_status)
+            finished_at = datetime.now().astimezone()
+            _render_report(rf, src, started_at, finished_at, manifest_results, exit_status)
         print(f"report saved to: {rp}")
     else:
         exit_status, _ = _run(src, args.verbose, args.xsd_schema_check)

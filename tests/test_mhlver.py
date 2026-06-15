@@ -1450,9 +1450,9 @@ class TestRun:
         (tmp_path / "a.mhl").write_text("")
         rc, mrs = mhlver._run(tmp_path, verbose=False, schema=False)
         buf = io.StringIO()
-        mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mrs, rc)
+        mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mhlver.datetime.now(), mrs, rc)
         report = buf.getvalue()
-        assert "PASSED" in report
+        assert "VERIFIED" in report
         assert "---" in report
 
 
@@ -1646,7 +1646,7 @@ class TestRunWithProgress:
         (tmp_path / "a.mhl").write_text("")
         rc, mrs = mhlver._run(tmp_path, verbose=False, schema=False)
         buf = io.StringIO()
-        mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mrs, rc)
+        mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mhlver.datetime.now(), mrs, rc)
         assert "---" in buf.getvalue()
 
 
@@ -1767,7 +1767,7 @@ class TestMain:
         mhl.write_text("")
         mhlver_cli(["--report", str(mhl)])
         report = next(tmp_path.glob("mhlver_report_*.log"))
-        assert "PASSED" in report.read_text(encoding="utf-8")
+        assert "VERIFIED" in report.read_text(encoding="utf-8")
 
     def test_report_flag_with_failure_records_nonzero_exit(self, mhlver_cli, monkeypatch, tmp_path):
         """A non-zero exit from _run is reflected as FAILED in the report file."""
@@ -1957,7 +1957,8 @@ class TestRenderReportDetails:
 
     def _render(self, manifest_results, exit_status):
         buf = io.StringIO()
-        mhlver._render_report(buf, Path("/src"), mhlver.datetime.now(), manifest_results, exit_status)
+        now = mhlver.datetime.now()
+        mhlver._render_report(buf, Path("/src"), now, now, manifest_results, exit_status)
         return buf.getvalue()
 
     def test_summary_lists_each_nonzero_status(self):
@@ -1981,8 +1982,9 @@ class TestRenderReportDetails:
         assert "1 hash mismatch" in out
         assert "1 error" in out
         assert "1 new (untracked)" in out
-        # Details section is rendered for a non-empty result set.
-        assert "Details" in out
+        # Manifest section is rendered for a non-empty result set (singular
+        # header for a single manifest).
+        assert "Manifest\n" in out
         assert "📄 m.mhl" in out
         # Per-file lines come from _format_file_result.
         assert "gone.mxf" in out
@@ -2010,6 +2012,72 @@ class TestRenderReportDetails:
         )
         out = self._render([mr], exit_status=20)
         assert "manifest-level error" in out
+
+    def test_header_carries_provenance_fields(self):
+        """The header records tool, host, user, source, and the start/finish
+        window that anchor a fixity record for archival."""
+        out = self._render([], exit_status=0)
+        for label in ("Tool:", "Host:", "User:", "Source:", "Started:", "Finished:"):
+            assert label in out
+
+    def test_operator_falls_back_when_lookup_fails(self, monkeypatch):
+        """Environments that can't resolve a username must not crash the report."""
+        monkeypatch.setattr(mhlver.getpass, "getuser", lambda: (_ for _ in ()).throw(OSError()))
+        out = self._render([], exit_status=0)
+        assert "User:       unknown" in out
+
+    def test_issues_section_collects_non_ok_across_manifests(self):
+        """The Issues section surfaces every non-OK entry — including new/untracked
+        warnings and manifest-level errors — pulled above the per-manifest Manifests section."""
+        good = mhlver.ManifestResult(
+            manifest_path=Path("good.mhl"),
+            manifest_status="ok",
+            file_results=[mhlver.FileResult(path="ok.mxf", status="ok")],
+        )
+        bad = mhlver.ManifestResult(
+            manifest_path=Path("bad.mhl"),
+            manifest_status="failed",
+            file_results=[
+                mhlver.FileResult(path="bad.mxf", status="mismatch"),
+                mhlver.FileResult(path="extra.mxf", status="new"),
+            ],
+        )
+        broken = mhlver.ManifestResult(
+            manifest_path=Path("broken.mhl"),
+            manifest_status="error",
+            manifest_error="parse failed",
+        )
+        out = self._render([good, bad, broken], exit_status=40)
+        issues = out.split("Issues", 1)[1].split("Manifests", 1)[0]
+        assert "bad.mxf" in issues
+        assert "extra.mxf" in issues  # new/untracked included
+        assert "parse failed" in issues  # manifest-level error included
+        assert "ok.mxf" not in issues  # clean entries stay out
+
+    def test_issues_section_omitted_when_all_ok(self):
+        """No Issues heading when every file passed."""
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("m.mhl"),
+            manifest_status="ok",
+            file_results=[mhlver.FileResult(path="ok.mxf", status="ok")],
+        )
+        out = self._render([mr], exit_status=0)
+        assert "Issues" not in out
+
+    def test_per_manifest_sub_summary_line(self):
+        """Each manifest header is followed by its own verdict line; new/untracked
+        is a warning and does not flip the manifest to FAILED."""
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("m.mhl"),
+            manifest_status="ok",
+            file_results=[
+                mhlver.FileResult(path="ok.mxf", status="ok"),
+                mhlver.FileResult(path="extra.mxf", status="new"),
+            ],
+        )
+        details = self._render([mr], exit_status=0).split("Manifest\n", 1)[1]
+        assert "📄 m.mhl" in details
+        assert "✅ VERIFIED | 2 files | 1 verified | 1 new (untracked)" in details
 
 
 # ---------------------------------------------------------------------------
