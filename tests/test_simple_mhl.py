@@ -382,6 +382,7 @@ class TestVerify:
         yielded = [os.path.basename(p) for p, _ in simple_mhl._iter_files_for_seal(str(tmp_path), mhl_path)]
         assert yielded == ["visible.bin"]
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="os.mkfifo is POSIX-only")
     def test_iter_files_without_on_skip_skips_non_regular(self, tmp_path):
         """A non-regular file (FIFO) must be skipped silently when on_skip=None."""
         make_tree(tmp_path, {"visible.bin": b"x"})
