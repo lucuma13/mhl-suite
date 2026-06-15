@@ -7,7 +7,7 @@
 # mhlver walks a path looking for MHL manifests and verifies each one by
 # delegating to the right backend:
 #
-#     classic MHL (1.x)  -> shells out to `simple-mhl verify`
+#     Classic MHL (1.x)  -> shells out to `simple-mhl verify`
 #     ASC-MHL  (2.0)    -> shells out to `ascmhl-debug verify`
 #
 # It detects ASC-MHL packages by the conventional `ascmhl/` folder containing
@@ -296,6 +296,24 @@ def _parse_classicmhl_output(output: str) -> list[FileResult]:
     return results
 
 
+def _strip_classicmhl_verbose(output: str) -> str:
+    """Reduce `simple-mhl verify -v` output to what it prints WITHOUT -v.
+
+    The -v output is a strict superset of the plain output: it adds an
+    ``[OK] <path>`` line per verified file and an indented ``(calc … | stored …)``
+    detail line under each mismatch. Dropping those two leaves exactly the
+    non-verbose error lines.
+    """
+    kept = [
+        line
+        for line in output.splitlines()
+        # [OK] lines and indented verbose-only detail continuations are the only
+        # things -v adds; every primary error line starts at column 0.
+        if not line.startswith("[OK] ") and not line[:1].isspace()
+    ]
+    return "\n".join(kept).strip()
+
+
 # ascmhl-debug verify -v line patterns:
 #   verification (xxh64) of file <path>: OK
 #   ERROR: hash mismatch        for <path> old xxh64: <hex>, new xxh64: <hex>
@@ -344,6 +362,24 @@ def _parse_ascmhl_output(output: str) -> list[FileResult]:
         # Informational lines (check folder, ignoring filepath, Error: …) are skipped.
 
     return results
+
+
+_ASCMHL_CHECK_FOLDER = re.compile(r"^check folder at path: ")
+
+
+def _strip_ascmhl_verbose(output: str) -> str:
+    """Reduce `ascmhl-debug verify -v` output to what it prints WITHOUT -v.
+
+    Lets a single -v run drive both the report parser and the terminal, instead
+    of running ascmhl-debug a second time (a full re-hash of the package) just
+    to get the quieter output.
+    """
+    kept = [
+        line
+        for line in output.splitlines()
+        if not _ASCMHL_CHECK_FOLDER.match(line.strip()) and not _ASCMHL_OK.match(line.strip())
+    ]
+    return "\n".join(kept).strip()
 
 
 class _PollEvent(Protocol):
@@ -714,31 +750,30 @@ def _verify_classicmhl(
 
     sub = "xsd-schema-check" if schema else "verify"
     cmd = [cmd_path, sub, str(target)]
-    # Pass -v through to simple-mhl when in verbose mode (only for verify;
-    # xsd-schema-check has no notion of per-file OK lines). simple-mhl will
-    # then emit `OK: <path>` for every successfully verified file, which
-    # mhlver's "always show classic MHL backend output" rule will surface.
-    #
-    # For report collection we always pass -v even when the user didn't ask
-    # for it, so we can parse per-file OK lines. The extra output never
-    # reaches the terminal (show_backend_output remains driven by verbose),
-    # so the user experience is unchanged.
-    cmd_for_report = cmd + (["-v"] if not verbose and not schema else [])
-    if verbose and not schema:
-        cmd.append("-v")
-    _verbose_announce(cmd, cwd=None, verbose=verbose, console=console)
 
-    # Run with -v for report collection; run the user-facing command for terminal.
-    # When verbose is already set both are the same invocation, so we avoid
-    # running the subprocess twice.
-    if not verbose and not schema:
-        # Run once with -v to get full per-file output for the report.
-        step = _run_step(cmd_for_report, on_poll=poll_event)
-        # Run again without -v for the terminal (silent on success as the user expects).
-        step_terminal = _run_step(cmd, on_poll=poll_event)
-    else:
+    if schema:
+        # xsd-schema-check has no per-file -v output and nothing to parse for the
+        # report — a single plain run is all that's needed.
+        _verbose_announce(cmd, cwd=None, verbose=verbose, console=console)
         step = _run_step(cmd, on_poll=poll_event)
         step_terminal = step
+    else:
+        # Run verify ONCE, always with -v. The -v output is a strict superset of
+        # the plain output (see _strip_classicmhl_verbose), so it feeds both the
+        # report parser (`step`) and the terminal (`step_terminal`). Previously we
+        # ran the backend a second time without -v purely to reproduce the quieter
+        # terminal text — re-hashing every file and doubling verify time on the
+        # default, non-verbose path. We now derive that text instead.
+        cmd_v = [*cmd, "-v"]
+        _verbose_announce(cmd_v if verbose else cmd, cwd=None, verbose=verbose, console=console)
+        step = _run_step(cmd_v, on_poll=poll_event)
+        if verbose:
+            step_terminal = step
+        else:
+            step_terminal = StepResult(
+                exit_code=step.exit_code,
+                output=_strip_classicmhl_verbose(step.output),
+            )
 
     # simple-mhl is a tool we control. Its per-file output uses structured
     # `ERROR: <category>: <path>` and `OK: <path>` prefixes that stand
@@ -916,23 +951,24 @@ def _ascmhl_verify(
     """
     package_dir = target.parent.parent
 
-    cmd = [cmd_path, "verify"]
-    if verbose:
-        cmd.append("-v")
-    cmd.append(str(package_dir))
-
+    # Run ascmhl-debug ONCE, always with -v. Its -v output is a strict superset
+    # of the plain output (see _strip_ascmhl_verbose), so it feeds both the
+    # report parser (`step_verbose`) and the terminal (`step_terminal`).
+    # Previously we ran ascmhl-debug a second time without -v just to reproduce
+    # the quieter terminal text — re-hashing the entire package and doubling
+    # verify time on the default, non-verbose path. We derive that text instead.
     cmd_verbose = [cmd_path, "verify", "-v", str(package_dir)]
 
-    _verbose_announce(cmd, cwd, verbose, console=console)
+    _verbose_announce(cmd_verbose if verbose else [cmd_path, "verify", str(package_dir)], cwd, verbose, console=console)
 
-    # Always run with -v for report collection.  When the user also asked
-    # for --verbose both commands are identical and we avoid the extra run.
-    if not verbose:
-        step_verbose = _run_step(cmd_verbose, cwd=cwd, on_poll=poll_event)
-        step_terminal = _run_step(cmd, cwd=cwd, on_poll=poll_event)
-    else:
-        step_verbose = _run_step(cmd, cwd=cwd, on_poll=poll_event)
+    step_verbose = _run_step(cmd_verbose, cwd=cwd, on_poll=poll_event)
+    if verbose:
         step_terminal = step_verbose
+    else:
+        step_terminal = StepResult(
+            exit_code=step_verbose.exit_code,
+            output=_strip_ascmhl_verbose(step_verbose.output),
+        )
 
     _report_via_table(
         _ASCMHL_VERIFY_RESULTS,
