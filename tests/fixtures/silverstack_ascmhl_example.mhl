@@ -31,16 +31,20 @@
   </processinfo>
   <hashes>
     <hash>
-      <path lastmodificationdate="2026-06-07T02:18:26-07:00">Card/Clip/A001/A001C001.mxf</path>
-      <xxh64  size="2246896176" action="original" hashdate="2026-06-07T02:32:02.169057-07:00">d4b2ab4a3e2619c6</xxh64>
+      <path lastmodificationdate="2026-06-07T02:18:26-07:00">SONY/SONYCARD.IND</path>
+      <xxh64 action="original" hashdate="2026-06-07T02:32:02.169057-07:00">ef46db3751d8e999</xxh64>
+    </hash>
+    <hash>
+      <path size="2246896176" lastmodificationdate="2026-06-07T02:18:26-07:00">Card/Clip/A001/A001C001.mxf</path>
+      <xxh64 action="original" hashdate="2026-06-07T02:32:02.169057-07:00">d4b2ab4a3e2619c6</xxh64>
     </hash>
     <hash>
       <path size="4170" lastmodificationdate="2026-06-07T02:18:26-07:00">Card/Clip/A001/A001C001M01.xml</path>
-      <xxh64 action="original" hashdate="2026-06-07T02:32:02.169172-07:00">e292aa48da83f894</xxh64>
+      <xxh64 action="original" hashdate="2026-06-07T02:32:02.169172-07:00">fb5ba52fd1791f62</xxh64>
     </hash>
     <hash>
       <path size="15758019120" lastmodificationdate="2026-06-07T02:18:26-07:00">Card/Clip/A002/A002C001.mxf</path>
-      <xxh64 action="original" hashdate="2026-06-07T02:32:02.169227-07:00">e543afeac2f1b7f1</xxh64>
+      <xxh64 action="original" hashdate="2026-06-07T02:32:02.169227-07:00">958a6c5a73c506bf</xxh64>
     </hash>
   </hashes>
 </hashlist>

@@ -9,7 +9,7 @@
 # Background: filesystems disagree on Unicode normalization. HFS+ forces a
 # decomposed (NFD-ish) form; APFS/NTFS-upcase are normalization-*insensitive*
 # but byte-preserving; exFAT/ext4 (default)/NTFS are normalization-*sensitive*,
-# so "café"-NFC and "café"-NFD are distinct entries. A path that visually
+# so "rosé"-NFC and "rosé"-NFD are distinct entries. A path that visually
 # matches may therefore fail a byte-exact lookup. These helpers match on NFC
 # while only ever opening names that actually exist on disk.
 # -----------------------------------------------------------------------------
@@ -25,7 +25,7 @@ def resolve_on_disk(base: str, rel_path: str, dir_index: dict[str, dict[str, str
     Walks ``rel_path`` one component at a time from ``base``. Each component is
     tried as literal bytes first — the common case, and the only correct choice
     when several normalization forms coexist on a normalization-*sensitive*
-    filesystem (exFAT/ext4/NTFS), where ``café``-NFC and ``café``-NFD are
+    filesystem (exFAT/ext4/NTFS), where ``rosé``-NFC and ``rosé``-NFD are
     distinct entries. On a literal miss we scan the directory once and match the
     component's NFC form against the NFC form of each real entry, so a name
     stored in a different form (e.g. an NFD name from an HFS+ round-trip, looked

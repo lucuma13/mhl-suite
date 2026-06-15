@@ -27,7 +27,7 @@
         </hash>
         <hash>
             <path size="4170" lastmodificationdate="2026-01-01T00:00:00Z">Card/Clip/A001/A001C001M01.xml</path>
-            <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">fb5ba52fd1791f62</xxh64>
+            <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">e292aa48da83f894</xxh64>
         </hash>
         <directoryhash>
             <path lastmodificationdate="2026-01-01T00:00:00Z">Card/Clip/A001</path>
@@ -35,11 +35,7 @@
         </directoryhash>
         <hash>
             <path size="15758019120" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A002/A002C001.mxf</path>
-            <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">958a6c5a73c506bf</xxh64>
-        </hash>
-        <hash>
-            <path size="4172" lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A002/A002C001M01.xml</path>
-            <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">cde877e7e0079f3d</xxh64>
+            <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">e543afeac2f1b7f1</xxh64>
         </hash>
         <directoryhash>
             <path lastmodificationdate="2026-01-01T00:00:00+00:00">Card/Clip/A002</path>

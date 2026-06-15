@@ -81,7 +81,7 @@ HASH_CHUNK_SIZE = 4 * 1024 * 1024
 # Multiple aliases point to xxhash so callers can use whatever spelling they
 # like; the manifest always records "xxhash64be" for consistency.
 ALGO_MAP: dict[str, tuple[Callable[[], _Hasher], str]] = cast(
-    dict[str, tuple[Callable[[], _Hasher], str]],
+    "dict[str, tuple[Callable[[], _Hasher], str]]",
     {
         "xxhash": (xxhash.xxh64, "xxhash64be"),
         "xxh64": (xxhash.xxh64, "xxhash64be"),
@@ -116,8 +116,6 @@ def get_xsd_path() -> str:
     is installed normally, then at a sibling 'xsd/' folder for the case
     where simple_mhl.py is run directly from a checkout.
     """
-    # Installed-package case. files() is the modern API (added 3.9, the
-    # legacy path() helper is deprecated in 3.11+ and emits a warning).
     try:
         resource = importlib.resources.files("mhl_suite.xsd").joinpath("MediaHashList_v1_1.xsd")
         if resource.is_file():
@@ -144,11 +142,10 @@ def get_hash(filepath: str, algo_key: str) -> str:
 
     Returns the hex digest as a lowercase string.
 
-    We deliberately do NOT use hashlib.file_digest() (Python 3.11+). Bench
-    measurements showed it is 5-15% slower than this manual loop on typical
-    media files; the wrapper overhead exceeds any internal optimisation it
-    might apply. The manual loop is also forward-compatible with xxhash,
-    which file_digest doesn't support anyway.
+    We deliberately do NOT use hashlib.file_digest(): bench measurements showed it is
+    5-15% slower than this manual loop on typical media files; the wrapper overhead
+    exceeds any internal optimisation it might apply. The manual loop is also
+    forward-compatible with xxhash, which file_digest doesn't support anyway.
     """
     if algo_key not in ALGO_MAP:
         raise ValueError(f"Unsupported hash algorithm: {algo_key}")
@@ -168,7 +165,7 @@ def get_hash(filepath: str, algo_key: str) -> str:
 # -----------------------------------------------------------------------------
 
 
-def _iter_files_for_seal(  # noqa: C901 — flat walk with several independent skip cases
+def _iter_files_for_seal(
     root: str,
     mhl_path: str,
     on_skip: "Callable[[str, str, bool], None] | None" = None,
@@ -269,7 +266,7 @@ def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree
     return info
 
 
-def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) -> None:  # noqa: C901
+def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) -> None:
     """
     Walk `root`, hash every non-hidden file, and write a dated MHL manifest
     at the root of the directory.
@@ -363,7 +360,7 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
         # Windows, os.path.relpath returns backslashes; replace them so the
         # manifest is portable between operating systems.
         rel_path_posix = rel_path.replace(os.sep, "/") if os.sep != "/" else rel_path
-        # Normalise to NFC so accented filenames are stored as precomposed
+        # Normalize to NFC so accented filenames are stored as precomposed
         # codepoints (e.g. é = U+00E9) rather than the NFD decomposed form
         # (e = U+0065 + combining acute U+0301) that macOS HFS+/APFS returns
         # from the filesystem. A consistent NFC manifest round-trips correctly
@@ -458,7 +455,7 @@ def _validate_mhl_path(mhl_file: str) -> None:
         sys.exit(1)
 
 
-def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
+def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat per-entry verify ladder, not nested complexity
     """
     Verify each file listed in `mhl_file` against its stored hash.
 
@@ -586,13 +583,9 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
             # definitive corruption signal that costs only one stat() call.
             #
             # isdecimal() is stricter than isdigit() or isnumeric(): it
-            # rejects superscripts (e.g. '²'), vulgar fractions, and other
-            # Unicode "digit" codepoints that would silently produce a wrong
-            # integer via int().  A <size> that fails this guard is itself
-            # evidence of manifest corruption -- a well-formed MHL never has
-            # a non-decimal size -- so we flag it as a mismatch rather than
-            # silently falling through to hash a file whose manifest entry
-            # is already known to be corrupt.
+            # rejects superscripts and other Unicode "digit" codepoints that
+            # would silently produce a wrong integer via int(). A malformed
+            # size is evidence of corruption or manifest tampering.
             size_el = h.find("{*}size")
             if size_el is not None and size_el.text is not None:
                 size_text = size_el.text.strip()
@@ -621,10 +614,8 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901
                     h.clear()
                     continue
 
-            # 'null' tag records no digest: per the v1.1 schema it means
-            # "no hash, only use file size verification". The existence and
-            # <size> checks above are therefore the whole verification — there
-            # is nothing to hash, so report OK and move on.
+            # 'null' tag records no digest: the existence and size checks
+            # above are therefore the whole verification.
             if tag == "null":
                 if verbose:
                     print(f"[OK] {rel_path}")
