@@ -4,7 +4,7 @@ requires = [ "hatchling" ]
 
 [project]
 name = "mhl-suite"
-version = "1.3.0"
+version = "1.3.1"
 description = "Simple MHL verification and sealing tools"
 readme = "README.md"
 license = { text = "MIT" }
@@ -43,8 +43,9 @@ dev = [
 ]
 
 [tool.hatch]
-build.targets.wheel.packages = [ "src/mhl_suite" ]
-build.targets.sdist.include = [ "src/mhl_suite/", "tests/" ]
+build.targets.wheel.packages = [ "src/mhl_suite/" ]
+build.targets.sdist.include = [ "/src/mhl_suite/", "tests/" ]
+build.targets.sdist.exclude = [ "/.github/" ]
 
 [tool.uv]
 managed = true
