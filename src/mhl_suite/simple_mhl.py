@@ -20,8 +20,10 @@ import importlib.metadata
 import importlib.resources
 import os
 import sys
+import time
 import unicodedata
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast, runtime_checkable
@@ -163,6 +165,151 @@ def get_hash(filepath: str, algo_key: str) -> str:
 
 
 # -----------------------------------------------------------------------------
+# Adaptive parallel hashing
+# -----------------------------------------------------------------------------
+# Hashing across files can run concurrently — xxhash and hashlib both RELEASE
+# the GIL inside update(), so threads overlap reads and use several cores. But
+# whether that HELPS depends entirely on the storage, and getting it wrong makes
+# things WORSE. Measured on real media:
+#
+#   * Helps only when the hash is slower than the disk (CPU-bound): md5
+#     (~0.95 GB/s) on a fast SSD (~3.1 GB/s) went 923 -> 2476 MB/s (~2.7x) — the
+#     disk had spare bandwidth one md5 thread couldn't use.
+#   * Does nothing when the disk is the bottleneck: xxhash (~13 GB/s) outruns any
+#     disk, so it stays disk-bound (~1.0x) however many workers.
+#   * HURTS on a spinning disk: concurrent reads make the head seek between
+#     files. On a 68 MB/s USB HDD, 4 workers REGRESSED to md5 0.65x / xxhash
+#     0.76x — and the drive couldn't even be detected as rotational (USB bridges
+#     report "Solid State: Info not available"), so device-type detection can't
+#     protect it.
+#
+# So we don't ask the operator and we don't detect hardware — we MEASURE. The
+# free trick: the first ~1 GB of hashing is real work we owe anyway, and the
+# rate it achieves is min(disk_bw, hash_bw). Compare that to the pure in-RAM
+# hash speed: if one core already can't keep the disk busy, the disk is the
+# ceiling (HDD/slow volume / fast-hash-on-anything) and we stay sequential —
+# reaching that verdict WITHOUT ever issuing a concurrent read, so HDDs pay no
+# seek penalty. Only when we're provably hash-bound (fast disk, slow hash) do we
+# add workers, re-measuring each window and stopping once throughput plateaus.
+
+# Below this total size, parallelism saves too little wall-time to bother probing.
+_AUTO_MIN_BYTES = 2 * 1024 * 1024 * 1024
+# Sequential baseline (and each ramp probe) hashes about this many bytes.
+_AUTO_PROBE_BYTES = 1024 * 1024 * 1024
+# A measured rate at/above this fraction of pure hash speed means the HASH, not
+# the disk, is the bottleneck — i.e. the disk has spare bandwidth to exploit.
+_AUTO_HASHBOUND_FRACTION = 0.8
+# A worker-count bump must beat the best rate so far by this factor to be kept;
+# otherwise we've saturated the disk and stop adding workers.
+_AUTO_IMPROVE = 1.10
+# Never spin up more than this many workers regardless of core count.
+_AUTO_MAX_WORKERS = 16
+# Wall-time budget for the in-RAM hash-speed calibration — long enough to average
+# out jitter, short enough to vanish beside a multi-GB seal.
+_AUTO_CALIBRATION_SECONDS = 0.05
+
+
+def _hash_batch(paths: list[str], algo_key: str, workers: int) -> list[str]:
+    """Hash `paths` and return digests in input order, up to `workers` at once.
+
+    get_hash is looked up via the module global on each call so test
+    monkeypatches still intercept it; ThreadPoolExecutor.map preserves order.
+    """
+    if workers <= 1 or len(paths) <= 1:
+        return [get_hash(p, algo_key) for p in paths]
+    with ThreadPoolExecutor(max_workers=min(workers, len(paths))) as ex:
+        return list(ex.map(lambda p: get_hash(p, algo_key), paths))
+
+
+def _calibrate_hash_bw(algo_key: str) -> float:
+    """Pure in-RAM hashing throughput (bytes/sec) for `algo_key`, no disk involved.
+
+    Lets us tell whether a measured sequential rate is limited by the hash (CPU)
+    or by the disk. Runs for a brief fixed time using HASH_CHUNK_SIZE updates so
+    the figure reflects get_hash's real per-chunk cost; ~50 ms is long enough to
+    average out scheduler jitter and invisible beside a multi-GB seal.
+    """
+    buf = bytes(HASH_CHUNK_SIZE)
+    hasher = ALGO_MAP[algo_key][0]()
+    done = 0
+    start = time.perf_counter()
+    while time.perf_counter() - start < _AUTO_CALIBRATION_SECONDS:
+        hasher.update(buf)
+        done += HASH_CHUNK_SIZE
+    elapsed = time.perf_counter() - start
+    return done / elapsed if elapsed > 0 else float("inf")
+
+
+def _hash_files_auto(paths: list[str], sizes: list[int], algo_key: str) -> Iterator[str]:
+    """Yield each path's digest in input order, auto-tuning concurrency to the
+    storage by measuring throughput as it goes (see section comment).
+
+    `sizes` are the files' byte sizes (already known from the seal walk's stat),
+    used only to carve the byte-sized probe windows — never re-stat'd here.
+    """
+    n = len(paths)
+    cap = min(_AUTO_MAX_WORKERS, os.cpu_count() or 4)
+    # Not worth probing for a single file, a small job, or a uniprocessor.
+    if n <= 1 or cap <= 1 or sum(sizes) < _AUTO_MIN_BYTES:
+        for p in paths:
+            yield get_hash(p, algo_key)
+        return
+
+    hash_bw = _calibrate_hash_bw(algo_key)
+
+    # --- Baseline: hash the first ~1 GB sequentially (real, owed work) --------
+    end = 0
+    acc = 0
+    while end < n and acc < _AUTO_PROBE_BYTES:
+        acc += sizes[end]
+        end += 1
+    start = time.perf_counter()
+    base = _hash_batch(paths[:end], algo_key, 1)
+    elapsed = time.perf_counter() - start
+    yield from base
+    seq_bw = acc / elapsed if elapsed > 0 else float("inf")
+
+    # Disk-bound: one core can't even saturate the disk, so more cores can't
+    # help and (on a spinning disk) would hurt. Stay sequential — reached with
+    # no concurrent read, so an HDD never pays a seek penalty.
+    if seq_bw < _AUTO_HASHBOUND_FRACTION * hash_bw:
+        for p in paths[end:]:
+            yield get_hash(p, algo_key)
+        return
+
+    # --- Hash-bound: the disk has spare bandwidth. Ramp workers (2,4,8,…),
+    # re-measuring each window, until adding workers stops paying off or we hit
+    # the core cap. Probes only ever run here, on storage fast enough to be
+    # hash-bound, so they're quick and a slightly non-optimal count costs little.
+    best_workers, best_bw = 1, seq_bw
+    workers = 2
+    while end < n:
+        stop = end
+        acc = 0
+        # Take at least `workers` files so every worker has something to hash,
+        # even when files are large enough that one fills the byte window.
+        while stop < n and (acc < _AUTO_PROBE_BYTES or (stop - end) < workers):
+            acc += sizes[stop]
+            stop += 1
+        start = time.perf_counter()
+        yield from _hash_batch(paths[end:stop], algo_key, workers)
+        elapsed = time.perf_counter() - start
+        end = stop
+        rate = acc / elapsed if elapsed > 0 else float("inf")
+        if rate > best_bw * _AUTO_IMPROVE:
+            best_workers, best_bw = workers, rate
+            if workers >= cap:
+                break
+            workers = min(workers * 2, cap)
+        else:
+            break  # plateaued: disk saturated (or thrashing) — stop adding workers
+
+    # Remainder at the best worker count we found.
+    if end < n:
+        yield from _hash_batch(paths[end:], algo_key, best_workers)
+
+
+# -----------------------------------------------------------------------------
 # Filesystem walking
 # -----------------------------------------------------------------------------
 
@@ -272,7 +419,7 @@ def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree
     return info
 
 
-def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) -> None:
+def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False, jobs: int | None = None) -> None:
     """
     Walk `root`, hash every non-hidden file, and write a dated MHL manifest
     at the root of the directory.
@@ -285,6 +432,10 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
         (.DS_Store, macOS ._* resource forks, Spotlight/Trash/Time Machine and
         other volume-internal items — see _internal.ignorelist) is skipped.
       * Files that vanish during the walk are skipped without aborting.
+      * Concurrency is automatic: jobs=None (default) measures the storage and
+        parallelises only when it pays off (see _hash_files_auto). jobs=1 forces
+        sequential; jobs=N pins a fixed worker count. The manifest is identical
+        and deterministically ordered regardless.
 
     Output format:
       [OK] <path>  <algo>: <digest>             (verbose only, per hashed file)
@@ -366,8 +517,22 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
         elif verbose:
             print(f"[SKIP] {rel_posix} ({reason})")
 
-    # Walk and hash.
-    for filepath, stat_result in _iter_files_for_seal(root, mhl_path, on_skip=_on_skip):
+    # Walk the tree first (reporting skips as we go), then hash. Materialising
+    # the entry list lets us optionally hash files concurrently (jobs>1) while
+    # still emitting the manifest in deterministic walk order. The list holds
+    # (path, stat) tuples — a few tens of MB even for a 100k-frame shoot, dwarfed
+    # by the XML tree built alongside it. With jobs<=1 this is the original
+    # sequential walk-and-hash with one extra list in hand.
+    entries = list(_iter_files_for_seal(root, mhl_path, on_skip=_on_skip))
+    paths = [fp for fp, _ in entries]
+    if jobs is None:
+        # Auto: measure the storage and parallelise only when it helps.
+        digests: Iterator[str] = _hash_files_auto(paths, [st.st_size for _, st in entries], algorithm)
+    else:
+        # Explicit override: 1 = sequential, N = fixed worker count.
+        digests = iter(_hash_batch(paths, algorithm, jobs))
+
+    for (filepath, stat_result), digest in zip(entries, digests, strict=True):
         rel_path = os.path.relpath(filepath, root)
         # The MHL spec requires forward slashes regardless of platform. On
         # Windows, os.path.relpath returns backslashes; replace them so the
@@ -386,7 +551,6 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
         etree.SubElement(h, "size").text = str(stat_result.st_size)
         mtime = datetime.fromtimestamp(stat_result.st_mtime, UTC)
         etree.SubElement(h, "lastmodificationdate").text = mtime.strftime("%Y-%m-%dT%H:%M:%SZ")
-        digest = get_hash(filepath, algorithm)
         if verbose:
             print(f"[OK] {rel_path_posix}  {xml_tag}: {digest}")
         etree.SubElement(h, xml_tag).text = digest
@@ -795,7 +959,20 @@ def main() -> None:
         action="store_true",
         help="print each file's hash as it is sealed, and skipped files",
     )
-    seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal, a.verbose))
+    seal_p.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "files to hash concurrently (default: auto — measures the storage and "
+            "parallelises only when it speeds things up, e.g. md5/sha1 on a fast "
+            "SSD, while staying sequential on spinning disks). Use 1 to force "
+            "sequential, or a number to pin a fixed worker count"
+        ),
+    )
+    seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal, a.verbose, a.jobs))
 
     # verify subcommand
     verify_p = subparsers.add_parser("verify", help="verify an MHL file")
