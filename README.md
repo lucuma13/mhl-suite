@@ -46,11 +46,16 @@ mhlver path/to/directory/
 mhlver                                     # verify current directory
 ```
 
+Verify directory and create a log report:
+```bash
+mhlver --report path/to/directory/
+```
+
 Seal a directory:
 
 ```bash
 simple-mhl seal path/to/directory/
-simple-mhl seal -a md5 path/to/directory/   # use MD5 algorithm
+simple-mhl seal -a md5,xxhash path/to/directory/   # use both MD5 and xxhash algorithms
 ```
 
 Validate XML Schema Definition of a file:
