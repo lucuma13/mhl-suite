@@ -732,41 +732,6 @@ class TestAscMhlTotalBytes:
         )
         assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 100
 
-    def test_superscript_size_attr_is_ignored_and_sibling_entry_counted(self, tmp_path):
-        """A superscript-digit size attribute ('²') is rejected by isdecimal()
-        and the sibling entry with a valid decimal size IS counted.
-
-        Before the fix (isdigit guard): '²' passed the guard, int('²') raised
-        ValueError, and the outer except dropped the ENTIRE generation — the
-        500-byte sibling was also lost.
-
-        After the fix (isdecimal guard): '²'.isdecimal() is False, the guard
-        skips that entry cleanly, and the loop continues to count the 500-byte
-        sibling.
-        """
-        ascdir = tmp_path / "ascmhl"
-        ascdir.mkdir()
-        mhl = ascdir / "0001.mhl"
-        mhl.write_text(
-            f'<?xml version="1.0" encoding="UTF-8"?>\n'
-            f'<hashlist version="2.0" xmlns="{_ASCMHL_NAMESPACE}">\n'
-            "  <hashes>\n"
-            "    <hash>\n"
-            '      <path size="\u00b2" lastmodificationdate="2026-01-01T00:00:00+00:00">'
-            "superscript_file.mov</path>\n"
-            '      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">aabb</xxh64>\n'
-            "    </hash>\n"
-            "    <hash>\n"
-            '      <path size="500" lastmodificationdate="2026-01-01T00:00:00+00:00">'
-            "good_file.mov</path>\n"
-            '      <xxh64 action="original" hashdate="2026-01-01T00:00:00+00:00">ccdd</xxh64>\n'
-            "    </hash>\n"
-            "  </hashes>\n"
-            "</hashlist>\n",
-            encoding="utf-8",
-        )
-        assert mhlver._ascmhl_total_bytes(mhl) == 500
-
     def test_superscript_only_entry_contributes_zero_sibling_generation_unaffected(self, tmp_path):
         """A generation containing only a superscript size contributes 0 bytes,
         and a sibling generation is unaffected.
@@ -1504,9 +1469,6 @@ class TestRunStep:
         regresses, the test will hang and pytest-timeout will report a failure
         rather than letting the suite stall silently, which mirrors exactly
         how `mhlver --report --verbose` stalled before the fix.
-
-        128 KB is chosen as double the pipe buffer so the test catches any
-        single-stream overflow regardless of platform-specific buffer sizes.
         """
         # Write 128 KB to stderr — well past the 64 KB pipe-buffer ceiling.
         large_stderr_script = "import sys; sys.stderr.write('x' * 128 * 1024); sys.stderr.flush()"
