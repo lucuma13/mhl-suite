@@ -1309,6 +1309,22 @@ def validate_schema(mhl_file: str) -> None:
 # -----------------------------------------------------------------------------
 
 
+def _dedup_keys_by_tag(keys: list[str]) -> list[str]:
+    """De-duplicate ALGO_MAP keys by their manifest tag, first occurrence wins.
+
+    Aliases resolving to the same manifest tag collapse, so `xxhash` and
+    `xxh64` together record a single <xxhash64be>.
+    """
+    out: list[str] = []
+    seen_tags: set[str] = set()
+    for name in keys:
+        tag = ALGO_MAP[name][1]
+        if tag not in seen_tags:
+            seen_tags.add(tag)
+            out.append(name)
+    return out
+
+
 def parse_algorithms(value: str) -> list[str]:
     """argparse type= for `seal -a`: parse a comma-separated list of algorithm
     names into a validated, de-duplicated list of ALGO_MAP keys.
@@ -1318,7 +1334,6 @@ def parse_algorithms(value: str) -> list[str]:
     argparse.ArgumentTypeError, which argparse turns into a usage error (exit 2).
     """
     keys: list[str] = []
-    seen_tags: set[str] = set()
     for raw in value.split(","):
         name = raw.strip().lower()
         if not name:
@@ -1327,13 +1342,23 @@ def parse_algorithms(value: str) -> list[str]:
             raise argparse.ArgumentTypeError(
                 f"unsupported algorithm '{name}' (choose from {', '.join(sorted(ALGO_MAP))})"
             )
-        tag = ALGO_MAP[name][1]
-        if tag not in seen_tags:
-            seen_tags.add(tag)
-            keys.append(name)
+        keys.append(name)
     if not keys:
         raise argparse.ArgumentTypeError("no algorithm given")
-    return keys
+    return _dedup_keys_by_tag(keys)
+
+
+def combine_seal_algorithms(parsed: list[list[str]] | None) -> list[str]:
+    """Merge repeated `seal -a` occurrences into one de-duplicated key list.
+
+    With action="append" each `-a` yields its own parsed list, so `-a md5
+    -a sha1` arrives as [["md5"], ["sha1"]]. None means no `-a` was given,
+    so we fall back to the historic default of xxhash.
+    """
+    if not parsed:
+        return ["xxhash"]
+    flat = [name for group in parsed for name in group]
+    return _dedup_keys_by_tag(flat)
 
 
 def parse_verify_algorithms(value: str) -> "str | list[str]":
@@ -1363,6 +1388,30 @@ def parse_verify_algorithms(value: str) -> "str | list[str]":
         if tag not in seen:
             seen.add(tag)
             tags.append(tag)
+    return tags
+
+
+def combine_verify_algorithms(
+    parsed: "list[str | list[str]] | None",
+) -> "str | list[str] | None":
+    """Merge repeated `verify -a` occurrences into one selection.
+
+    With action="append" each `-a` yields its own parsed value, so `-a md5
+    -a sha1` arrives as [["md5"], ["sha1"]]. None means no `-a` was given
+    (verify the fastest available). 'all' supersedes any specific names, and
+    specific tags are flattened and de-duplicated in order.
+    """
+    if not parsed:
+        return None
+    if _VERIFY_ALL in parsed:
+        return _VERIFY_ALL
+    tags: list[str] = []
+    seen: set[str] = set()
+    for group in parsed:
+        for tag in group:
+            if tag not in seen:
+                seen.add(tag)
+                tags.append(tag)
     return tags
 
 
@@ -1410,9 +1459,10 @@ def main() -> None:
         "-a",
         "--algorithm",
         type=parse_algorithms,
-        default=["xxhash"],
+        action="append",
+        default=None,
         metavar="ALGO[,ALGO...]",
-        help="hash algorithm: xxhash (default), md5, sha1",
+        help="hash algorithm: xxhash (default), md5, sha1 (repeatable / comma-separated)",
     )
     seal_p.add_argument(
         "--dont-reseal",
@@ -1424,7 +1474,7 @@ def main() -> None:
         "--verbose",
         action="store_true",
     )
-    seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal, a.verbose))
+    seal_p.set_defaults(func=lambda a: seal(a.path, combine_seal_algorithms(a.algorithm), a.dont_reseal, a.verbose))
 
     # verify subcommand
     verify_p = subparsers.add_parser("verify", help="verify an MHL file")
@@ -1433,9 +1483,10 @@ def main() -> None:
         "-a",
         "--algorithm",
         type=parse_verify_algorithms,
+        action="append",
         default=None,
         metavar="ALGO[,ALGO...]",
-        help="hash algorithm: xxhash, md5, sha1, or all (default: fastest available)",
+        help="hash algorithm: xxhash, md5, sha1, or all (repeatable / comma-separated; default: fastest available)",
     )
     verify_p.add_argument(
         "-S",
@@ -1448,7 +1499,7 @@ def main() -> None:
         "--verbose",
         action="store_true",
     )
-    verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose, a.algorithm, a.size_only))
+    verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose, combine_verify_algorithms(a.algorithm), a.size_only))
 
     # xsd-schema-check subcommand
     xsd_p = subparsers.add_parser(

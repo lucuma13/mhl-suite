@@ -342,6 +342,32 @@ class TestSealMultiFormat:
         assert "md5:" in out
         assert "xxhash64be:" in out
 
+    def test_repeated_flag_records_each_format(self, mhl_cli, tmp_path):
+        """-a md5 -a sha1 is equivalent to -a md5,sha1."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "-a", "sha1"])
+        assert rc == 0
+        h = self._hash_element(next(tmp_path.glob("*.mhl")))
+        assert h.findtext("md5") == hashlib.md5(b"hello").hexdigest()
+        assert h.findtext("sha1") == hashlib.sha1(b"hello").hexdigest()
+
+    def test_repeated_flag_mixed_with_comma_list(self, mhl_cli, tmp_path):
+        """Repeated and comma forms combine: -a md5,sha1 -a xxhash records all three."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5,sha1", "-a", "xxhash"])
+        assert rc == 0
+        text = next(tmp_path.glob("*.mhl")).read_text()
+        assert text.count("<md5>") == 1
+        assert text.count("<sha1>") == 1
+        assert text.count("<xxhash64be>") == 1
+
+    def test_repeated_flag_dedups_across_occurrences(self, mhl_cli, tmp_path):
+        """-a md5 -a md5 collapses to a single md5 element."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "-a", "md5"])
+        assert rc == 0
+        assert next(tmp_path.glob("*.mhl")).read_text().count("<md5>") == 1
+
     def test_read_once_opens_file_a_single_time(self, mhl_cli, tmp_path, monkeypatch):
         """The whole point: N formats cost one open()/read pass, not N."""
         target = tmp_path / "a.bin"
@@ -511,6 +537,62 @@ class TestVerifyAlgorithmSelection:
         rc, out, _ = mhl_cli(["verify", "-a", "sha1,md5", str(mhl)])
         assert rc == 40
         assert "requested hashes md5, sha1 not recorded" in out
+
+    def test_repeated_flag_checks_each_selected_hash(self, mhl_cli, tmp_path):
+        """-a md5 -a sha1 verifies both, order-independent, like -a md5,sha1."""
+        content = b"hello world"
+        mhl = make_multi_hash_mhl(
+            tmp_path,
+            "clip.bin",
+            content,
+            {
+                "md5": hashlib.md5(content).hexdigest(),
+                "sha1": hashlib.sha1(content).hexdigest(),
+                "xxhash64be": xxhash.xxh64(content).hexdigest(),
+            },
+        )
+        for first, second in (("md5", "sha1"), ("sha1", "md5")):
+            rc, out, _ = mhl_cli(["verify", "-a", first, "-a", second, "-v", str(mhl)])
+            assert rc == 0, f"order {first},{second}"
+            assert "md5:" in out
+            assert "sha1:" in out
+            assert "xxhash64be:" not in out  # not requested → not checked
+
+    def test_repeated_all_supersedes_specific(self, mhl_cli, tmp_path):
+        """-a all -a md5 behaves as -a all: every recorded hash is checked."""
+        content = b"hello world"
+        mhl = make_multi_hash_mhl(
+            tmp_path,
+            "clip.bin",
+            content,
+            {
+                "md5": hashlib.md5(content).hexdigest(),
+                "sha1": "0" * 40,  # wrong; only -a all would catch it
+                "xxhash64be": xxhash.xxh64(content).hexdigest(),
+            },
+        )
+        rc, out, _ = mhl_cli(["verify", "-a", "all", "-a", "md5", "-v", str(mhl)])
+        assert rc == 40
+        assert "sha1 MISMATCH" in out
+
+
+class TestCombineAlgorithms:
+    """Merging repeated -a occurrences (argparse action="append" shapes)."""
+
+    def test_seal_none_defaults_to_xxhash(self):
+        assert simple_mhl.combine_seal_algorithms(None) == ["xxhash"]
+
+    def test_seal_flattens_and_dedups_across_flags(self):
+        assert simple_mhl.combine_seal_algorithms([["md5"], ["sha1"], ["md5"]]) == ["md5", "sha1"]
+
+    def test_verify_none_means_fastest(self):
+        assert simple_mhl.combine_verify_algorithms(None) is None
+
+    def test_verify_flattens_and_dedups_in_order(self):
+        assert simple_mhl.combine_verify_algorithms([["md5"], ["sha1"], ["md5"]]) == ["md5", "sha1"]
+
+    def test_verify_all_supersedes(self):
+        assert simple_mhl.combine_verify_algorithms([["md5"], "all"]) == simple_mhl._VERIFY_ALL
 
 
 class TestParseAlgorithms:
