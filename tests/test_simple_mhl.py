@@ -1,5 +1,7 @@
 """Test suite for simple_mhl.py."""
 
+import argparse
+import builtins
 import hashlib
 import io
 import os
@@ -84,6 +86,30 @@ def make_mhl(dest_dir: Path, entries: list[dict]) -> Path:
         etree.SubElement(h, "md5").text = e["md5"]
         etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
     mhl = dest_dir / "manual.mhl"
+    etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+    return mhl
+
+
+def make_multi_hash_mhl(dest_dir: Path, filename: str, content: bytes, hashes: dict[str, str]) -> Path:
+    """Write a file and a manifest entry carrying the given {tag: value} hashes.
+
+    Elements are emitted in dict order before a single <hashdate>, letting a test
+    pin both which hashes are present and their document order.
+    """
+    target = dest_dir / filename
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+
+    root = etree.Element("hashlist", version="1.1")
+    h = etree.SubElement(root, "hash")
+    etree.SubElement(h, "file").text = filename
+    etree.SubElement(h, "size").text = str(len(content))
+    etree.SubElement(h, "lastmodificationdate").text = "2026-01-01T00:00:00Z"
+    for tag, value in hashes.items():
+        etree.SubElement(h, tag).text = value
+    etree.SubElement(h, "hashdate").text = "2026-01-01T00:00:00Z"
+
+    mhl = dest_dir / "multi.mhl"
     etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
     return mhl
 
@@ -226,7 +252,10 @@ class TestSeal:
 class TestSealVerbose:
     """seal -v streams per-file hashes, skipped files, and a completion line."""
 
-    def test_verbose_prints_per_file_hash(self, mhl_cli, tmp_path):
+    def test_seal_verbose_success_output(self, mhl_cli, tmp_path):
+        """Umbrella for seal's verbose per-file success line — strengthen this
+        rather than adding a sibling per detail (skip / completion lines have
+        their own scenario tests)."""
         make_tree(tmp_path, {"clip.mxf": b"data"})
         rc, out, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "-v"])
         assert rc == 0
@@ -259,23 +288,192 @@ class TestSealVerbose:
 # ---------------------------------------------------------------------------
 
 
+class TestSealMultiFormat:
+    """seal -a md5,xxhash records multiple hashes per file in a single read pass."""
+
+    @staticmethod
+    def _hash_element(mhl_path):
+        return etree.parse(str(mhl_path)).find("hash")
+
+    def test_two_formats_emitted_per_file(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5,xxhash"])
+        assert rc == 0
+        h = self._hash_element(next(tmp_path.glob("*.mhl")))
+        assert h.findtext("md5") == hashlib.md5(b"hello").hexdigest()
+        assert h.findtext("xxhash64be") == xxhash.xxh64(b"hello").hexdigest()
+        # Both hash elements precede a single shared <hashdate>, in -a order.
+        tags = [etree.QName(e).localname for e in h]
+        assert tags == ["file", "size", "lastmodificationdate", "md5", "xxhash64be", "hashdate"]
+
+    def test_multi_format_passes_xsd(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"a.bin": b"hello", "b/c.bin": b"world"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5,sha1,xxhash"])
+        assert rc == 0
+        rc2, _, err = mhl_cli(["xsd-schema-check", str(next(tmp_path.glob("*.mhl")))])
+        assert rc2 == 0, err
+
+    def test_alias_dedup_single_element(self, mhl_cli, tmp_path):
+        """Aliases that resolve to the same manifest tag collapse to one element."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "xxhash,xxh64,xxhash64be"])
+        assert rc == 0
+        assert next(tmp_path.glob("*.mhl")).read_text().count("<xxhash64be>") == 1
+
+    def test_default_is_single_xxhash(self, mhl_cli, tmp_path):
+        """No -a still produces exactly one xxhash64be — byte-compatible with before."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path)])
+        assert rc == 0
+        text = next(tmp_path.glob("*.mhl")).read_text()
+        assert text.count("<xxhash64be>") == 1
+        assert "<md5>" not in text
+
+    def test_bad_name_in_list_errors(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, err = mhl_cli(["seal", str(tmp_path), "-a", "md5,blake2"])
+        assert rc == 2
+        assert "blake2" in err
+
+    def test_verbose_prints_each_format(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, out, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5,xxhash", "-v"])
+        assert rc == 0
+        assert "md5:" in out
+        assert "xxhash64be:" in out
+
+    def test_read_once_opens_file_a_single_time(self, mhl_cli, tmp_path, monkeypatch):
+        """The whole point: N formats cost one open()/read pass, not N."""
+        target = tmp_path / "a.bin"
+        target.write_bytes(b"hello world")
+        opens: list[str] = []
+        real_open = builtins.open
+
+        def counting_open(path, *args, **kwargs):
+            if str(path) == str(target):
+                opens.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(simple_mhl, "open", counting_open, raising=False)
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5,sha1,xxhash"])
+        assert rc == 0
+        assert opens == [str(target)], f"expected one read pass, got {len(opens)}"
+
+
+class TestVerifyAlgorithmSelection:
+    """verify defaults to the fastest recorded hash (xxhash > md5 > sha1); -a overrides."""
+
+    def test_default_uses_xxhash_when_md5_is_wrong(self, mhl_cli, tmp_path):
+        """md5 deliberately wrong but xxhash correct → default (xxhash) passes."""
+        content = b"hello"
+        mhl = make_multi_hash_mhl(
+            tmp_path, "a.bin", content, {"md5": "0" * 32, "xxhash64be": xxhash.xxh64(content).hexdigest()}
+        )
+        rc, _, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0
+
+    def test_default_picks_xxhash_even_when_listed_last(self, mhl_cli, tmp_path):
+        """md5 correct but xxhash (last element) wrong → default chooses xxhash and
+        fails, proving selection is by speed, not document order."""
+        content = b"hello"
+        mhl = make_multi_hash_mhl(
+            tmp_path, "a.bin", content, {"md5": hashlib.md5(content).hexdigest(), "xxhash64be": "00" * 8}
+        )
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 40
+        assert "hash mismatch" in out
+
+    def test_override_md5_passes_when_md5_correct(self, mhl_cli, tmp_path):
+        """Same manifest where xxhash is wrong but md5 is right: -a md5 passes."""
+        content = b"hello"
+        mhl = make_multi_hash_mhl(
+            tmp_path, "a.bin", content, {"md5": hashlib.md5(content).hexdigest(), "xxhash64be": "00" * 8}
+        )
+        rc, _, _ = mhl_cli(["verify", str(mhl), "-a", "md5"])
+        assert rc == 0
+
+    def test_override_md5_detects_corrupt_md5(self, mhl_cli, tmp_path):
+        """-a md5 forces md5 even though the correct xxhash would pass by default."""
+        content = b"hello"
+        mhl = make_multi_hash_mhl(
+            tmp_path, "a.bin", content, {"md5": "0" * 32, "xxhash64be": xxhash.xxh64(content).hexdigest()}
+        )
+        rc, _, _ = mhl_cli(["verify", str(mhl), "-a", "md5"])
+        assert rc == 40
+
+    def test_default_prefers_md5_over_sha1(self, mhl_cli, tmp_path):
+        """No xxhash present: md5 (correct) wins over sha1 (wrong) → passes."""
+        content = b"hello"
+        mhl = make_multi_hash_mhl(
+            tmp_path, "a.bin", content, {"sha1": "0" * 40, "md5": hashlib.md5(content).hexdigest()}
+        )
+        rc, _, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0
+
+    def test_override_alias_matches_recorded_tag(self, mhl_cli, tmp_path):
+        """-a xxh64 resolves to the xxhash64be element via the manifest tag."""
+        content = b"hello"
+        mhl = make_multi_hash_mhl(
+            tmp_path, "a.bin", content, {"md5": "0" * 32, "xxhash64be": xxhash.xxh64(content).hexdigest()}
+        )
+        rc, _, _ = mhl_cli(["verify", str(mhl), "-a", "xxh64"])
+        assert rc == 0
+
+    def test_override_absent_format_is_reported(self, mhl_cli, tmp_path):
+        """Requesting a format the entry doesn't record is a per-file failure."""
+        content = b"hello"
+        mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"md5": hashlib.md5(content).hexdigest()})
+        rc, out, _ = mhl_cli(["verify", str(mhl), "-a", "sha1"])
+        assert rc == 40
+        assert "requested hash sha1 not recorded" in out
+
+    def test_sealed_multi_format_default_is_clean(self, mhl_cli, tmp_path):
+        """End-to-end: a real md5,xxhash seal verifies clean by default and per -a."""
+        make_tree(tmp_path, {"a.bin": b"hello", "b/c.bin": b"world"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5,xxhash"])
+        assert rc == 0
+        mhl = str(next(tmp_path.glob("*.mhl")))
+        assert mhl_cli(["verify", mhl])[0] == 0
+        assert mhl_cli(["verify", mhl, "-a", "md5"])[0] == 0
+        assert mhl_cli(["verify", mhl, "-a", "xxhash"])[0] == 0
+
+
+class TestParseAlgorithms:
+    """The seal -a comma-list parser."""
+
+    def test_single_default_name(self):
+        assert simple_mhl.parse_algorithms("xxhash") == ["xxhash"]
+
+    def test_order_preserved(self):
+        assert simple_mhl.parse_algorithms("md5,sha1,xxhash") == ["md5", "sha1", "xxhash"]
+
+    def test_dedup_by_tag_first_wins(self):
+        # xxhash and xxh64 both map to xxhash64be; only the first survives.
+        assert simple_mhl.parse_algorithms("xxhash,xxh64") == ["xxhash"]
+
+    def test_whitespace_and_case_tolerated(self):
+        assert simple_mhl.parse_algorithms(" MD5 , XXHash ") == ["md5", "xxhash"]
+
+    def test_unknown_raises(self):
+        with pytest.raises(argparse.ArgumentTypeError):
+            simple_mhl.parse_algorithms("md5,blake2")
+
+    def test_empty_raises(self):
+        with pytest.raises(argparse.ArgumentTypeError):
+            simple_mhl.parse_algorithms(" , ")
+
+
 class TestSealUnsupportedAlgorithm:
     """seal() exits 2 when called directly with an algorithm not in ALGO_MAP."""
 
-    def test_unsupported_algorithm_exits_2(self, tmp_path):
-        """Calling seal() directly with 'blake3' (not in ALGO_MAP) exits with 2."""
+    def test_unsupported_algorithm_exits_2_with_message(self, tmp_path, capsys):
+        """Calling seal() directly with an algorithm not in ALGO_MAP exits 2 and
+        names it on stderr (the internal guard, unreachable via the CLI parser)."""
 
         (tmp_path / "a.bin").write_bytes(b"data")
         with pytest.raises(SystemExit) as exc:
-            simple_mhl.seal(str(tmp_path), "blake3", dont_reseal=False)
+            simple_mhl.seal(str(tmp_path), ["blake3"], dont_reseal=False)
         assert exc.value.code == 2
-
-    def test_unsupported_algorithm_writes_error_to_stderr(self, tmp_path, capsys):
-        """The error message written to stderr names the unsupported algorithm."""
-
-        (tmp_path / "a.bin").write_bytes(b"data")
-        with pytest.raises(SystemExit):
-            simple_mhl.seal(str(tmp_path), "blake3", dont_reseal=False)
         assert "blake3" in capsys.readouterr().err
 
 
@@ -346,15 +544,34 @@ class TestVerify:
         assert out == ""
         assert err == ""
 
-    def test_verify_verbose_emits_ok_lines(self, mhl_cli, tmp_path):
-        """--verbose should print one 'OK: <path>' line per verified file."""
+    def test_verify_verbose_success_output(self, mhl_cli, tmp_path):
+        """--verbose prints one '[OK] <path>  <algo>: <digest>' line per verified
+        file, naming the algorithm actually checked and its digest. Umbrella for
+        verify's verbose *success* output — extend this rather than adding a
+        sibling per detail (failure output lives in its own scenario tests)."""
         make_tree(tmp_path, {"a.bin": b"hello", "sub/b.bin": b"world"})
-        mhl = seal_helper(mhl_cli, tmp_path)
+        mhl = seal_helper(mhl_cli, tmp_path, algo="md5")
 
         rc, out, _err = mhl_cli(["verify", "-v", str(mhl)])
         assert rc == 0
-        assert "[OK] a.bin" in out
+        assert f"[OK] a.bin  md5: {hashlib.md5(b'hello').hexdigest()}" in out
         assert "[OK] sub/b.bin" in out.replace(os.sep, "/")
+
+    def test_verify_verbose_reflects_selected_algorithm(self, mhl_cli, tmp_path):
+        """With md5+xxhash recorded, default picks xxhash; -a md5 names md5 instead."""
+        content = b"hello"
+        mhl = make_multi_hash_mhl(
+            tmp_path,
+            "a.bin",
+            content,
+            {"md5": hashlib.md5(content).hexdigest(), "xxhash64be": xxhash.xxh64(content).hexdigest()},
+        )
+        _, out_default, _ = mhl_cli(["verify", "-v", str(mhl)])
+        assert f"xxhash64be: {xxhash.xxh64(content).hexdigest()}" in out_default
+        assert "md5:" not in out_default
+
+        _, out_md5, _ = mhl_cli(["verify", "-v", str(mhl), "-a", "md5"])
+        assert f"md5: {hashlib.md5(content).hexdigest()}" in out_md5
 
     def test_verify_verbose_with_failures_shows_both(self, mhl_cli, tmp_path):
         """--verbose plus failures: OK for clean files, ERROR for failed."""
@@ -369,9 +586,10 @@ class TestVerify:
         assert "bad.bin" in out
         assert "[ERROR]" in out
 
-    def test_verify_verbose_hash_mismatch_shows_calc_and_stored(self, mhl_cli, tmp_path):
-        """A same-size content change must pass the size pre-check and reach the
-        hash comparison, so --verbose prints the calc/stored hash detail line."""
+    def test_verify_verbose_mismatch_output(self, mhl_cli, tmp_path):
+        """Umbrella for verify's verbose *failure* output. A same-size content
+        change passes the size pre-check and reaches the hash comparison, so
+        --verbose prints the calc/stored hash detail line."""
         make_tree(tmp_path, {"a.bin": b"world"})
         mhl = seal_helper(mhl_cli, tmp_path)
         # Same byte length (5) so the size pre-check passes and the hash differs.
@@ -2457,7 +2675,7 @@ class TestNormalizationVariantHint:
         )
         typed = os.path.join(self._VOL, self._NFC)  # NFC dir, not on disk
         with pytest.raises(SystemExit) as exc:
-            simple_mhl.seal(typed, "md5", dont_reseal=False)
+            simple_mhl.seal(typed, ["md5"], dont_reseal=False)
         assert exc.value.code == 2
         err = capsys.readouterr().err
         assert "did you mean" in err
@@ -2560,6 +2778,8 @@ class TestAdaptiveHashing:
         monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", min_bytes)
         monkeypatch.setattr(simple_mhl, "_AUTO_RECHECK_BYTES", recheck)
         monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda algo: hash_bw)
+        # seal calibrates all formats combined via _calibrate_hash_bw_multi.
+        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw_multi", lambda factories: hash_bw)
         monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda paths: read_bw)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: cpu)
 
@@ -2579,19 +2799,19 @@ class TestAdaptiveHashing:
     def test_output_identical_parallel_branch(self, tmp_path, monkeypatch):
         paths, sizes, ref = self._make_files(tmp_path, 30)
         self._force(monkeypatch, read_bw=4000, hash_bw=1000)
-        assert list(simple_mhl._hash_files_auto(paths, sizes, "md5")) == ref
+        assert [d for d, _hashdate in simple_mhl._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
 
     def test_output_identical_demotion_branch(self, tmp_path, monkeypatch):
         paths, sizes, ref = self._make_files(tmp_path, 30)
         # hash_bw huge => every window's measured rate < hash_bw => demote; a
         # tiny recheck window makes demotion leave a real sequential remainder.
         self._force(monkeypatch, read_bw=1e30, hash_bw=1e18, recheck=1)
-        assert list(simple_mhl._hash_files_auto(paths, sizes, "md5")) == ref
+        assert [d for d, _hashdate in simple_mhl._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
 
     def test_output_identical_sequential_gate(self, tmp_path, monkeypatch):
         paths, sizes, ref = self._make_files(tmp_path, 30)
         self._force(monkeypatch, read_bw=100, hash_bw=1000)  # disk-bound
-        assert list(simple_mhl._hash_files_auto(paths, sizes, "md5")) == ref
+        assert [d for d, _hashdate in simple_mhl._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
 
     # --- decisions -----------------------------------------------------------
 
@@ -2601,7 +2821,7 @@ class TestAdaptiveHashing:
         paths, sizes, _ = self._make_files(tmp_path, 10)
         self._force(monkeypatch, read_bw=100, hash_bw=1000)
         calls = self._spy_batch(monkeypatch)
-        list(simple_mhl._hash_files_auto(paths, sizes, "md5"))
+        list(simple_mhl._hash_files_auto(paths, sizes, ["md5"]))
         assert all(w <= 1 for w in calls), f"disk-bound must not issue a concurrent batch, saw {calls}"
 
     def test_parallel_worker_count_from_bandwidth(self, tmp_path, monkeypatch):
@@ -2609,7 +2829,7 @@ class TestAdaptiveHashing:
         paths, sizes, _ = self._make_files(tmp_path, 10)
         self._force(monkeypatch, read_bw=4000, hash_bw=1000, cpu=8)
         calls = self._spy_batch(monkeypatch)
-        list(simple_mhl._hash_files_auto(paths, sizes, "md5"))
+        list(simple_mhl._hash_files_auto(paths, sizes, ["md5"]))
         assert calls, "expected a concurrent batch to run"
         assert max(calls) == 4, f"expected 4 workers, saw {calls}"
 
@@ -2617,7 +2837,7 @@ class TestAdaptiveHashing:
         paths, sizes, _ = self._make_files(tmp_path, 10)
         self._force(monkeypatch, read_bw=100_000, hash_bw=1000, cpu=4)  # wants 100, capped to cores
         calls = self._spy_batch(monkeypatch)
-        list(simple_mhl._hash_files_auto(paths, sizes, "md5"))
+        list(simple_mhl._hash_files_auto(paths, sizes, ["md5"]))
         assert calls, "expected a concurrent batch to run"
         assert max(calls) == 4
 
@@ -2626,7 +2846,7 @@ class TestAdaptiveHashing:
         monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 10 * 1024**3)  # larger than the job
         probed: list[int] = []
         monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 1.0)
-        assert list(simple_mhl._hash_files_auto(paths, sizes, "md5")) == ref
+        assert [d for d, _hashdate in simple_mhl._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
         assert probed == [], "a sub-threshold job must not probe the disk"
 
     def test_single_file_skips_probe(self, tmp_path, monkeypatch):
@@ -2634,7 +2854,7 @@ class TestAdaptiveHashing:
         monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
         probed: list[int] = []
         monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 9e9)
-        assert list(simple_mhl._hash_files_auto(paths, sizes, "md5")) == ref
+        assert [d for d, _hashdate in simple_mhl._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
         assert probed == [], "nothing to parallelise across a single file"
 
     # --- helpers -------------------------------------------------------------
@@ -2660,6 +2880,15 @@ class TestAdaptiveHashing:
         bw = simple_mhl._probe_read_bw([str(tmp_path / "missing.bin"), str(good)])
         assert bw > 0  # unreadable path skipped without error, good file measured
 
+    def test_carries_well_formed_per_file_hashdate(self, tmp_path):
+        """Each file comes back paired with a UTC ISO-8601 hashdate captured by the
+        hashing worker (precise even in parallel windows), not stamped at emit."""
+        paths, sizes, ref = self._make_files(tmp_path, 3)
+        out = list(simple_mhl._hash_files_auto(paths, sizes, ["md5"]))
+        assert [d for d, _ in out] == [[r] for r in ref]
+        for _digests, hashdate in out:
+            datetime.strptime(hashdate, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
     def test_calibrate_hash_bw_is_positive_and_finite(self):
         """The real in-RAM calibration (mocked everywhere else) returns a usable
         bytes/sec figure for every writable algorithm."""
@@ -2682,6 +2911,7 @@ class TestSealConcurrency:
         monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
         monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda a: 1000.0)
+        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw_multi", lambda f: 1000.0)
         monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: 8000.0)  # read >> hash ⇒ parallel
 
     def test_auto_parallel_produces_correct_digests(self, mhl_cli, tmp_path, monkeypatch):
@@ -2699,9 +2929,10 @@ class TestSealConcurrency:
         monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
         monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda a: 1000.0)
+        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw_multi", lambda f: 1000.0)
         probed: list[int] = []
         monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 100.0)  # disk-bound
-        simple_mhl.seal(str(tmp_path), "md5", dont_reseal=False, verbose=False)
+        simple_mhl.seal(str(tmp_path), ["md5"], dont_reseal=False, verbose=False)
         assert probed == [1], "the default must probe the disk to decide"
 
 

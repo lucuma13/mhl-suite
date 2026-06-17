@@ -101,6 +101,23 @@ ALGO_MAP: dict[str, tuple[Callable[[], _Hasher], str]] = cast(
 # <null> means "no hash, only use file size verification").
 SUPPORTED_HASH_TAGS = frozenset(ALGO_MAP) | {"xxhash128", "xxhash3_64", "null"}
 
+# Preference order verify uses to pick which recorded hash to re-compute when an
+# entry carries several: faster algorithms first (xxhash ≫ md5 > sha1), so a
+# multi-format manifest re-verifies cheaply by default regardless of element
+# order. Tags absent here get _VERIFY_RANK_DEFAULT: "null" (size-only) ranks
+# ahead of read-only formats we can't recompute (xxhash128, xxhash3_64), so a
+# real computable hash always wins and null beats "cannot verify".
+_VERIFY_RANK: dict[str, int] = {
+    "xxhash": 0,
+    "xxh64": 0,
+    "xxhash64": 0,
+    "xxhash64be": 0,
+    "md5": 1,
+    "sha1": 2,
+    "null": 8,
+}
+_VERIFY_RANK_DEFAULT = 9
+
 
 # -----------------------------------------------------------------------------
 # XSD location
@@ -138,21 +155,21 @@ def get_xsd_path() -> str:
 # -----------------------------------------------------------------------------
 
 
-def get_hash(filepath: str, algo_key: str) -> str:
+def get_hashes(filepath: str, factories: "list[Callable[[], _Hasher]]") -> list[str]:
     """
-    Compute the digest of `filepath` using algorithm `algo_key`.
+    Compute several digests of `filepath` in a single read pass.
 
-    Returns the hex digest as a lowercase string.
+    `factories` is a list of hasher constructors (the first element of each
+    ALGO_MAP entry). Every chunk read from disk is fed to all hashers, so an
+    N-format seal costs one disk read instead of N — the read-once paradigm.
+    Returns the hex digests as lowercase strings, aligned to `factories`.
 
     We deliberately do NOT use hashlib.file_digest(): bench measurements showed it is
     5-15% slower than this manual loop on typical media files; the wrapper overhead
     exceeds any internal optimisation it might apply. The manual loop is also
     forward-compatible with xxhash, which file_digest doesn't support anyway.
     """
-    if algo_key not in ALGO_MAP:
-        raise ValueError(f"Unsupported hash algorithm: {algo_key}")
-
-    hasher: _Hasher = ALGO_MAP[algo_key][0]()
+    hashers: list[_Hasher] = [factory() for factory in factories]
     # readinto() reuses one buffer for the whole file instead of allocating a
     # fresh bytes object per chunk, removing per-chunk allocation/GC churn —
     # measured a few percent faster than read() in a loop on the warm-cache path
@@ -164,8 +181,22 @@ def get_hash(filepath: str, algo_key: str) -> str:
             n = f.readinto(buf)
             if not n:
                 break
-            hasher.update(view[:n])
-    return hasher.hexdigest()
+            chunk = view[:n]
+            for hasher in hashers:
+                hasher.update(chunk)
+    return [hasher.hexdigest() for hasher in hashers]
+
+
+def get_hash(filepath: str, algo_key: str) -> str:
+    """
+    Compute the digest of `filepath` using algorithm `algo_key`.
+
+    Returns the hex digest as a lowercase string. Thin single-format wrapper
+    over get_hashes; used by verify (which hashes one format per entry).
+    """
+    if algo_key not in ALGO_MAP:
+        raise ValueError(f"Unsupported hash algorithm: {algo_key}")
+    return get_hashes(filepath, [ALGO_MAP[algo_key][0]])[0]
 
 
 # -----------------------------------------------------------------------------
@@ -256,6 +287,26 @@ def _calibrate_hash_bw(algo_key: str) -> float:
     return done / elapsed if elapsed > 0 else float("inf")
 
 
+def _calibrate_hash_bw_multi(factories: "list[Callable[[], _Hasher]]") -> float:
+    """Combined in-RAM throughput (bytes/sec) of updating every hasher per chunk.
+
+    With read-once multi-hashing each chunk is fed to all hashers, so the effective
+    hash bandwidth is 1/Σ(1/bw_i) — slower than any single algorithm alone. Running
+    the real multi-update loop captures that directly, so the storage probe in
+    _hash_jobs_auto compares against the true per-byte cost rather than one algo's.
+    """
+    buf = bytes(HASH_CHUNK_SIZE)
+    hashers = [factory() for factory in factories]
+    done = 0
+    start = time.perf_counter()
+    while time.perf_counter() - start < _AUTO_CALIBRATION_SECONDS:
+        for hasher in hashers:
+            hasher.update(buf)
+        done += HASH_CHUNK_SIZE
+    elapsed = time.perf_counter() - start
+    return done / elapsed if elapsed > 0 else float("inf")
+
+
 def _probe_read_bw(paths: list[str]) -> float:
     """Measure the volume's read bandwidth (bytes/sec) with a plain buffered read
     of the first files, stopping once we've read >=_AUTO_PROBE_BYTES AND spent
@@ -284,15 +335,17 @@ def _probe_read_bw(paths: list[str]) -> float:
 
 
 def _hash_jobs_auto(
-    paths: list[str], sizes: list[int], jobs: "list[Callable[[], _T]]", calib_algo: str
+    paths: list[str], sizes: list[int], jobs: "list[Callable[[], _T]]", calibrate: "Callable[[], float]"
 ) -> "Iterator[_T]":
     """Yield each job's result in input order, auto-tuning concurrency to the
     storage (see section comment).
 
     `paths[i]`/`sizes[i]` describe the file job `i` will read — `paths` drives
     the disk probe, `sizes` (already known from a stat) carve the recheck
-    windows — and `jobs[i]` does the hashing. `calib_algo` is the algorithm used
-    for the in-RAM hash-speed calibration. Shared by seal and verify.
+    windows — and `jobs[i]` does the hashing. `calibrate` is a zero-arg callable
+    returning the in-RAM hash bandwidth (bytes/sec) the job loop sustains; it is
+    invoked lazily, only past the small-job early-returns. Shared by seal (which
+    measures all its formats combined) and verify (one format).
     """
     n = len(jobs)
     cap = min(_AUTO_MAX_WORKERS, os.cpu_count() or 4)
@@ -302,7 +355,7 @@ def _hash_jobs_auto(
             yield job()
         return
 
-    hash_bw = _calibrate_hash_bw(calib_algo)
+    hash_bw = calibrate()
     read_bw = _probe_read_bw(paths)
 
     # Disk-bound (hash faster than the disk): one core already keeps the disk busy,
@@ -341,14 +394,24 @@ def _hash_jobs_auto(
             return
 
 
-def _hash_files_auto(paths: list[str], sizes: list[int], algo_key: str) -> Iterator[str]:
-    """Seal helper: yield each path's digest in order, auto-tuning concurrency.
+def _hash_files_auto(paths: list[str], sizes: list[int], algorithms: "list[str]") -> "Iterator[tuple[list[str], str]]":
+    """Seal helper: yield (digests, hashdate) per path — one digest per algorithm
+    in order, plus the ISO-8601 UTC instant hashing finished — auto-tuning
+    concurrency.
 
-    Wraps _hash_jobs_auto with one get_hash job per path. get_hash is resolved at
-    call time (module global) so test monkeypatches still intercept it.
+    The hashdate is captured inside the worker the moment get_hashes returns, so
+    it reflects when that file's read-once pass actually completed even when files
+    are hashed concurrently in windows (rather than the later emit-loop time).
+
+    get_hashes is resolved at call time (module global) so test monkeypatches still
+    intercept it; the combined hash bandwidth of all `algorithms` drives the
+    parallelism decision.
     """
-    jobs: list[Callable[[], str]] = [(lambda p=p: get_hash(p, algo_key)) for p in paths]
-    return _hash_jobs_auto(paths, sizes, jobs, algo_key)
+    factories = [ALGO_MAP[a][0] for a in algorithms]
+    jobs: list[Callable[[], tuple[list[str], str]]] = [
+        (lambda p=p: (get_hashes(p, factories), datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"))) for p in paths
+    ]
+    return _hash_jobs_auto(paths, sizes, jobs, lambda: _calibrate_hash_bw_multi(factories))
 
 
 # -----------------------------------------------------------------------------
@@ -461,10 +524,37 @@ def _build_creatorinfo(parent: etree._Element, tool: str, iso_now: str) -> etree
     return info
 
 
-def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) -> None:
+def _resolve_seal_algorithms(algorithms: "list[str]") -> list[str]:
+    """Validate seal algorithm keys and collapse alias duplicates (first wins).
+
+    argparse's type= normally catches bad names, but seal() can be called
+    directly, so we re-validate here and exit 2 on an unknown algorithm. Aliases
+    resolving to the same manifest tag (e.g. xxhash/xxh64/xxhash64be) are deduped,
+    preserving first-appearance order, so each tag is emitted at most once.
+    """
+    for algorithm in algorithms:
+        if algorithm not in ALGO_MAP:
+            sys.stderr.write(f"Error: unsupported algorithm '{algorithm}'\n")
+            sys.exit(2)
+    seen_tags: set[str] = set()
+    resolved: list[str] = []
+    for a in algorithms:
+        tag = ALGO_MAP[a][1]
+        if tag not in seen_tags:
+            seen_tags.add(tag)
+            resolved.append(a)
+    return resolved
+
+
+def seal(root: str, algorithms: "list[str]", dont_reseal: bool, verbose: bool = False) -> None:
     """
     Walk `root`, hash every non-hidden file, and write a dated MHL manifest
     at the root of the directory.
+
+    `algorithms` is one or more hash-algorithm keys (see ALGO_MAP). When more
+    than one is given, every file is read once and all digests are computed from
+    that single stream (read-once multi-hashing), and the manifest records one
+    hash element per format per file.
 
     Behaviour:
       * Manifest filename: <basename>_<UTC-timestamp>.mhl
@@ -489,10 +579,7 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
     here) and lets unexpected OSError on the final write propagate so the
     operator sees the real diagnostic.
     """
-    if algorithm not in ALGO_MAP:
-        # argparse 'choices=' should have caught this, but defend anyway.
-        sys.stderr.write(f"Error: unsupported algorithm '{algorithm}'\n")
-        sys.exit(2)
+    algorithms = _resolve_seal_algorithms(algorithms)
 
     root = os.path.abspath(root)
     if not os.path.isdir(root):
@@ -548,7 +635,9 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
 
     info = _build_creatorinfo(doc, f"simple-mhl {__version__}", iso_now)
 
-    xml_tag = ALGO_MAP[algorithm][1]
+    # xml_tags name the manifest element each digest is written into, in the same
+    # order _hash_files_auto returns them.
+    xml_tags = [ALGO_MAP[a][1] for a in algorithms]
 
     def _on_skip(path: str, reason: str, is_warning: bool) -> None:
         rel = os.path.relpath(path, root)
@@ -567,10 +656,9 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
     # measures the storage and stays sequential whenever that's faster.
     entries = list(_iter_files_for_seal(root, mhl_path, on_skip=_on_skip))
     paths = [fp for fp, _ in entries]
-    digests = _hash_files_auto(paths, [st.st_size for _, st in entries], algorithm)
+    digests = _hash_files_auto(paths, [st.st_size for _, st in entries], algorithms)
 
-    for (filepath, stat_result), digest in zip(entries, digests, strict=True):
-        hashdate = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for (filepath, stat_result), (file_digests, hashdate) in zip(entries, digests, strict=True):
         rel_path = os.path.relpath(filepath, root)
         # The MHL spec requires forward slashes regardless of platform. On
         # Windows, os.path.relpath returns backslashes; replace them so the
@@ -589,9 +677,12 @@ def seal(root: str, algorithm: str, dont_reseal: bool, verbose: bool = False) ->
         etree.SubElement(h, "size").text = str(stat_result.st_size)
         mtime = datetime.fromtimestamp(stat_result.st_mtime, UTC)
         etree.SubElement(h, "lastmodificationdate").text = mtime.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # One hash element per format, in resolved order, then <hashdate>.
+        for xml_tag, digest in zip(xml_tags, file_digests, strict=True):
+            etree.SubElement(h, xml_tag).text = digest
         if verbose:
-            print(f"[OK] {rel_path_posix}  {xml_tag}: {digest}")
-        etree.SubElement(h, xml_tag).text = digest
+            shown = "  ".join(f"{t}: {d}" for t, d in zip(xml_tags, file_digests, strict=True))
+            print(f"[OK] {rel_path_posix}  {shown}")
         etree.SubElement(h, "hashdate").text = hashdate
 
     # Update finishdate to reflect actual completion; useful for auditing
@@ -673,10 +764,11 @@ def _validate_mhl_path(mhl_file: str) -> None:
 def _verify_one_hash(candidate: str, tag: str, expected: str, rel_path: str, verbose: bool) -> tuple[str, str]:
     """Hash `candidate` with `tag` and compare against `expected`.
 
-    Returns ("ok", rel_path) on a match, otherwise ("mismatch", line). Catches
-    the per-file errors verify must report rather than abort on (an unsupported
-    accept-on-read tag like xxhash128, or a file that vanished mid-run), so this
-    can run inside a thread pool without a raise tearing down the whole verify.
+    Returns ("ok", "<path>  <tag>: <digest>") on a match — the verbose log line
+    records which algorithm was verified, otherwise ("mismatch", line).
+    Catches the per-file errors verify must report rather than abort on
+    (an unsupported accept-on-read tag like xxhash128, or a file that vanished mid-run),
+    so this can run inside a thread pool without a raise tearing down the whole verify.
     """
     try:
         calculated = get_hash(candidate, tag)
@@ -692,7 +784,7 @@ def _verify_one_hash(candidate: str, tag: str, expected: str, rel_path: str, ver
         ok = calculated.lower() == expected.lower()
 
     if ok:
-        return ("ok", rel_path)
+        return ("ok", f"{rel_path}  {tag}: {calculated}")
     if verbose:
         return (
             "mismatch",
@@ -701,15 +793,58 @@ def _verify_one_hash(candidate: str, tag: str, expected: str, rel_path: str, ver
     return ("mismatch", f"[ERROR] hash mismatch: {rel_path}")
 
 
-def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat per-entry verify ladder, not nested complexity
+def _manifest_tag_of(localname: str) -> str:
+    """Normalize a hash element's local name to its canonical manifest tag.
+
+    Aliases collapse the way seal records them (xxhash/xxh64/xxhash64 →
+    xxhash64be); unknown / read-only tags pass through unchanged. Lets an
+    `-a xxhash` override match a recorded <xxhash64be> (or legacy <xxhash>).
+    """
+    entry = ALGO_MAP.get(localname)
+    return entry[1] if entry is not None else localname
+
+
+def _select_hash_node(h: "etree._Element", override_tag: "str | None") -> "tuple[etree._Element | None, str]":
+    """Pick which child hash element of `h` to verify.
+
+    On success returns (node, localname). When no element is suitable returns
+    (None, reason): "none" if the entry carries no recognised hash, or "override"
+    if an explicit -a algorithm was requested but isn't recorded for this entry.
+    Without an override the fastest computable hash wins. With an override only
+    the matching format is accepted.
+    """
+    candidates: list[tuple[etree._Element, str]] = []
+    for child in h:
+        name = _localname(child.tag)
+        if name in SUPPORTED_HASH_TAGS:
+            candidates.append((child, name))
+    if not candidates:
+        return None, "none"
+    if override_tag is not None:
+        for child, name in candidates:
+            if _manifest_tag_of(name) == override_tag:
+                return child, name
+        return None, "override"
+    return min(candidates, key=lambda c: _VERIFY_RANK.get(c[1], _VERIFY_RANK_DEFAULT))
+
+
+def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexity
+    mhl_file: str, verbose: bool = False, algorithm: "str | None" = None
+) -> None:
     """
     Verify each file listed in `mhl_file` against its stored hash.
 
     Behaviour:
       * Default mode: silent on success; on failure, prints one line per
         problem file with a structured prefix (`ERROR: <category>: <path>`).
-      * Verbose mode (verbose=True): also prints `OK: <path>` for every
-        successfully verified file, mirroring ascmhl-debug's --verbose.
+      * Verbose mode (verbose=True): also prints `[OK] <path>  <algo>: <digest>`
+        for every successfully verified file — naming the algorithm actually
+        checked (the fastest recorded, or the -a override) — mirroring
+        ascmhl-debug's --verbose.
+      * Algorithm selection: by default each entry is verified with the fastest
+        recorded hash (xxhash > md5 > sha1), `algorithm` (an ALGO_MAP key) forces
+        a specific format instead; an entry that doesn't record it is reported
+        rather than silently skipped.
       * Path traversal attempts (manifest entries with ../ that escape the
         manifest's directory) are blocked and reported as mismatches.
 
@@ -721,6 +856,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
       [ERROR] missing file: <path>                 (file not on disk)
       [ERROR] blocked traversal attempt: <path>    (security)
       [ERROR] no supported hash found: <path>      (manifest malformed)
+      [ERROR] requested hash <algo> not recorded: <path>  (-a override absent)
       [ERROR] cannot verify <path>: <reason>       (algorithm not available)
 
     Exit codes:
@@ -731,6 +867,13 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
       70 = both missing and mismatches
     """
     _validate_mhl_path(mhl_file)
+
+    # Resolve the optional -a override to the manifest tag we'll match against.
+    # argparse's choices= guards the CLI, but defend direct callers too.
+    if algorithm is not None and algorithm not in ALGO_MAP:
+        sys.stderr.write(f"Error: unsupported algorithm '{algorithm}'\n")
+        sys.exit(2)
+    override_tag = ALGO_MAP[algorithm][1] if algorithm is not None else None
 
     # All file references in the manifest are relative to the directory
     # the manifest lives in. We capture this once and use it as the
@@ -802,19 +945,18 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
                 h.clear()
                 continue
 
-            # First direct child whose tag is a recognised hash algorithm.
-            hash_node = None
-            for child in h:
-                if _localname(child.tag) in SUPPORTED_HASH_TAGS:
-                    hash_node = child
-                    break
-
+            # Pick which recorded hash to verify: the fastest computable one by
+            # default, or the -a override when the operator forced a format.
+            hash_node, picked = _select_hash_node(h, override_tag)
             if hash_node is None:
-                results.append(("mismatch", f"[ERROR] no supported hash found: {rel_path}"))
+                if picked == "override":
+                    results.append(("mismatch", f"[ERROR] requested hash {algorithm} not recorded: {rel_path}"))
+                else:
+                    results.append(("mismatch", f"[ERROR] no supported hash found: {rel_path}"))
                 h.clear()
                 continue
 
-            tag = _localname(hash_node.tag)
+            tag = picked
             expected = (hash_node.text or "").strip()
 
             # --- File size pre-check ------------------------------------
@@ -855,7 +997,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
 
             # 'null' tag records no digest: existence + size are the whole check.
             if tag == "null":
-                results.append(("ok", rel_path))
+                results.append(("ok", f"{rel_path}  null (size only)"))
                 h.clear()
                 continue
 
@@ -891,7 +1033,7 @@ def verify(mhl_file: str, verbose: bool = False) -> None:  # noqa: C901 — flat
         if calib_algo is None:
             hashed: list[tuple[str, str]] = [job() for job in hash_jobs]
         else:
-            hashed = list(_hash_jobs_auto(hash_paths, hash_sizes, hash_jobs, calib_algo))
+            hashed = list(_hash_jobs_auto(hash_paths, hash_sizes, hash_jobs, lambda: _calibrate_hash_bw(calib_algo)))
         for slot, outcome in zip(hash_slots, hashed, strict=True):
             results[slot] = outcome
 
@@ -965,6 +1107,33 @@ def validate_schema(mhl_file: str) -> None:
 # -----------------------------------------------------------------------------
 
 
+def parse_algorithms(value: str) -> list[str]:
+    """argparse type= for `seal -a`: parse a comma-separated list of algorithm
+    names into a validated, de-duplicated list of ALGO_MAP keys.
+
+    Aliases resolving to the same manifest tag are collapsed (first wins), so
+    `-a xxhash,xxh64` records a single <xxhash64be>. Unknown names raise
+    argparse.ArgumentTypeError, which argparse turns into a usage error (exit 2).
+    """
+    keys: list[str] = []
+    seen_tags: set[str] = set()
+    for raw in value.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        if name not in ALGO_MAP:
+            raise argparse.ArgumentTypeError(
+                f"unsupported algorithm '{name}' (choose from {', '.join(sorted(ALGO_MAP))})"
+            )
+        tag = ALGO_MAP[name][1]
+        if tag not in seen_tags:
+            seen_tags.add(tag)
+            keys.append(name)
+    if not keys:
+        raise argparse.ArgumentTypeError("no algorithm given")
+    return keys
+
+
 def main() -> None:
     # --- Smart dispatch -------------------------------------------------------
     # When invoked without an explicit subcommand we inspect the sole positional
@@ -1008,9 +1177,12 @@ def main() -> None:
     seal_p.add_argument(
         "-a",
         "--algorithm",
-        choices=sorted(ALGO_MAP),
-        default="xxhash",
-        help="hash algorithm (default: xxhash)",
+        type=parse_algorithms,
+        default=["xxhash"],
+        metavar="ALGO[,ALGO...]",
+        help="hash algorithm(s), comma-separated (default: xxhash); "
+        "e.g. -a md5,xxhash records both per file in a single read pass. "
+        f"Choices: {', '.join(sorted(ALGO_MAP))}",
     )
     seal_p.add_argument(
         "--dont-reseal",
@@ -1021,7 +1193,6 @@ def main() -> None:
         "-v",
         "--verbose",
         action="store_true",
-        help="print each file's hash as it is sealed, and skipped files",
     )
     seal_p.set_defaults(func=lambda a: seal(a.path, a.algorithm, a.dont_reseal, a.verbose))
 
@@ -1029,12 +1200,19 @@ def main() -> None:
     verify_p = subparsers.add_parser("verify", help="verify an MHL file")
     verify_p.add_argument("path", help="path to MHL file")
     verify_p.add_argument(
+        "-a",
+        "--algorithm",
+        choices=sorted(ALGO_MAP),
+        default=None,
+        help="verify with this algorithm instead of the fastest recorded "
+        "(default: fastest available, xxhash > md5 > sha1)",
+    )
+    verify_p.add_argument(
         "-v",
         "--verbose",
         action="store_true",
-        help="print per-file status",
     )
-    verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose))
+    verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose, a.algorithm))
 
     # xsd-schema-check subcommand
     xsd_p = subparsers.add_parser(
