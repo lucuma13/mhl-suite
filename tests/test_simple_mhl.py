@@ -720,13 +720,10 @@ class TestVerify:
             outside.unlink(missing_ok=True)
 
     def test_verify_classicmhl_decimal_xxhash(self, mhl_cli, tmp_path):
-        """Old MHL files stored xxhash as decimal int — must verify correctly."""
+        """Old MHL files stored xxhash as a decimal int (a 32-bit XXH32) — must verify."""
         make_tree(tmp_path, {"a.bin": b"x"})
 
-        h = xxhash.xxh64()
-        h.update(b"x")
-        hex_digest = h.hexdigest()
-        decimal_digest = str(int(hex_digest, 16))
+        decimal_digest = str(xxhash.xxh32(b"x").intdigest())
 
         doc = etree.Element("hashlist", version="1.1")
         etree.SubElement(doc, "creationdate").text = "2025-01-01T00:00:00Z"
@@ -748,6 +745,106 @@ class TestVerify:
 
         rc, _, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# TestVerifyXxhashVariants
+# ---------------------------------------------------------------------------
+
+
+def _le_hex(value: int, nbytes: int) -> str:
+    """Little-endian hex of an integer — the byte order some xxHash tags record."""
+    return value.to_bytes(nbytes, "little").hex()
+
+
+class TestVerifyXxhashVariants:
+    """verify accepts every byte order and width MHL has used for xxHash."""
+
+    def test_xxhash64be_big_endian_verifies(self, mhl_cli, tmp_path):
+        content = b"big endian payload"
+        mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"xxhash64be": xxhash.xxh64(content).hexdigest()})
+        assert mhl_cli(["verify", str(mhl)])[0] == 0
+
+    def test_xxhash64_little_endian_verifies(self, mhl_cli, tmp_path):
+        content = b"little endian payload"
+        le = _le_hex(xxhash.xxh64(content).intdigest(), 8)
+        mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"xxhash64": le})
+        assert mhl_cli(["verify", str(mhl)])[0] == 0
+
+    def test_xxhash64_tag_also_accepts_big_endian(self, mhl_cli, tmp_path):
+        """The xxhash64 tag is read leniently: a big-endian value under it still verifies."""
+        content = b"either byte order"
+        mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"xxhash64": xxhash.xxh64(content).hexdigest()})
+        assert mhl_cli(["verify", str(mhl)])[0] == 0
+
+    def test_xxhash_decimal_is_xxh32(self, mhl_cli, tmp_path):
+        content = b"thirty-two bit decimal"
+        dec = str(xxhash.xxh32(content).intdigest())
+        assert len(dec) <= 10
+        mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"xxhash": dec})
+        assert mhl_cli(["verify", str(mhl)])[0] == 0
+
+    def test_xxhash_hex_is_xxh64_either_order(self, mhl_cli, tmp_path):
+        content = b"old tag, hex value"
+        be = xxhash.xxh64(content).hexdigest()
+        le = _le_hex(xxhash.xxh64(content).intdigest(), 8)
+        mhl_be = make_multi_hash_mhl(tmp_path / "be", "a.bin", content, {"xxhash": be})
+        mhl_le = make_multi_hash_mhl(tmp_path / "le", "a.bin", content, {"xxhash": le})
+        assert mhl_cli(["verify", str(mhl_be)])[0] == 0
+        assert mhl_cli(["verify", str(mhl_le)])[0] == 0
+
+    def test_uppercase_hex_verifies(self, mhl_cli, tmp_path):
+        """Comparison is by integer value, so case does not matter."""
+        content = b"shouty hex"
+        mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"xxhash64be": xxhash.xxh64(content).hexdigest().upper()})
+        assert mhl_cli(["verify", str(mhl)])[0] == 0
+
+    def test_wrong_value_reports_mismatch(self, mhl_cli, tmp_path):
+        content = b"intact"
+        for tag, bad in (("xxhash64be", "0" * 16), ("xxhash64", "0" * 16), ("xxhash", "1")):
+            mhl = make_multi_hash_mhl(tmp_path / tag, "a.bin", content, {tag: bad})
+            assert mhl_cli(["verify", str(mhl)])[0] == 40
+
+    def test_xxhash64be_rejects_little_endian_value(self, mhl_cli, tmp_path):
+        """xxhash64be is strict big-endian: the little-endian form must NOT verify."""
+        content = b"strict big endian"
+        be = xxhash.xxh64(content).hexdigest()
+        le = _le_hex(xxhash.xxh64(content).intdigest(), 8)
+        assert le != be  # palindromic digest would be astronomically unlikely
+        mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"xxhash64be": le})
+        assert mhl_cli(["verify", str(mhl)])[0] == 40
+
+
+# ---------------------------------------------------------------------------
+# TestVerifyUtf16Manifest
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyUtf16Manifest:
+    """UTF-16 manifests (a real, supported MHL encoding) verify in both byte orders."""
+
+    def _write(self, dest: Path, content: bytes, encoding: str, *, corrupt: bool = False) -> Path:
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "clip.bin").write_bytes(content)
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "clip.bin"
+        etree.SubElement(h, "size").text = str(len(content))
+        digest = "0" * 16 if corrupt else xxhash.xxh64(content).hexdigest()
+        etree.SubElement(h, "xxhash64be").text = digest
+        mhl = dest / "clip.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding=encoding)
+        return mhl
+
+    @pytest.mark.parametrize("encoding", ["UTF-16LE", "UTF-16BE", "UTF-16"])
+    def test_utf16_manifest_verifies(self, mhl_cli, tmp_path, encoding):
+        mhl = self._write(tmp_path / encoding, b"utf-16 payload", encoding)
+        assert mhl_cli(["verify", str(mhl)])[0] == 0
+
+    def test_utf16_manifest_detects_mismatch(self, mhl_cli, tmp_path):
+        """Genuinely parsed and compared, not merely accepted."""
+        mhl = self._write(tmp_path, b"utf-16 payload", "UTF-16LE", corrupt=True)
+        assert mhl_cli(["verify", str(mhl)])[0] == 40
 
 
 # ---------------------------------------------------------------------------
@@ -1219,7 +1316,7 @@ class TestGetXsdPathFallbackPaths:
         etree.SubElement(h, "file").text = "x.bin"
         etree.SubElement(h, "size").text = "1"
         etree.SubElement(h, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
-        etree.SubElement(h, "blake3").text = "0" * 64  # not in SUPPORTED_HASH_TAGS
+        etree.SubElement(h, "blake3").text = "0" * 64  # not a computable hash tag
         etree.SubElement(h, "hashdate").text = "2025-01-01T00:00:00Z"
         mhl = tmp_path / "unsupported.mhl"
         etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
@@ -1301,9 +1398,10 @@ class TestGetXsdPathFallbackPaths:
         assert rc == 40
         assert "[ERROR] size mismatch: x.bin" in out
 
-    def test_unsupported_read_only_algorithm_reports_cannot_verify(self, mhl_cli, tmp_path):
-        """An xxhash128 digest (accepted for reading, not writable) must produce
-        the 'cannot verify' mismatch (exit 40) rather than crashing."""
+    def test_uncomputable_hash_tag_is_ignored(self, mhl_cli, tmp_path):
+        """A hash we can't recompute (e.g. xxhash128) is treated like any unknown
+        algorithm: ignored entirely. An entry whose only hash is uncomputable reports
+        'no supported hash found' (exit 40), not a special 'cannot verify'."""
         (tmp_path / "x.bin").write_bytes(b"x")
         root = etree.Element("hashlist", version="1.1")
         h = etree.SubElement(root, "hash")
@@ -1317,7 +1415,38 @@ class TestGetXsdPathFallbackPaths:
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 40
-        assert "cannot verify" in out
+        assert "no supported hash found" in out
+
+    def test_uncomputable_hash_tag_falls_back_to_computable_sibling(self, mhl_cli, tmp_path):
+        """When an entry carries both an uncomputable hash and a computable one, the
+        uncomputable tag is skipped and the computable hash is used (verifies clean)."""
+        content = b"payload"
+        (tmp_path / "x.bin").write_bytes(content)
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "x.bin"
+        etree.SubElement(h, "size").text = str(len(content))
+        etree.SubElement(h, "xxhash128").text = "0" * 32  # ignored
+        etree.SubElement(h, "md5").text = hashlib.md5(content).hexdigest()
+        mhl = tmp_path / "mixed.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        assert mhl_cli(["verify", str(mhl)])[0] == 0
+
+    def test_uncomputable_hash_tag_falls_back_to_null(self, mhl_cli, tmp_path):
+        """An uncomputable hash alongside <null> falls back to the size-only check."""
+        content = b"payload"
+        (tmp_path / "x.bin").write_bytes(content)
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "x.bin"
+        etree.SubElement(h, "size").text = str(len(content))
+        etree.SubElement(h, "xxhash128").text = "0" * 32  # ignored
+        etree.SubElement(h, "null")
+        mhl = tmp_path / "null_fallback.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        assert mhl_cli(["verify", str(mhl)])[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1554,7 +1683,7 @@ class TestAdversarialXML:
         on it, triggering an AttributeError crash.
 
         The fix: _localname() returns '' for non-string tags, making them invisible
-        to the SUPPORTED_HASH_TAGS membership test.
+        to the hash-tag recognition test.
         """
         (tmp_path / "target.bin").write_bytes(b"data")
 

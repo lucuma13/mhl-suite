@@ -79,44 +79,33 @@ class _Hasher(Protocol):
 # not this loop, sets the pace.
 HASH_CHUNK_SIZE = 1024 * 1024
 
-# Map of CLI-accepted algorithm names to (factory, manifest-tag) pairs.
-# Multiple aliases point to xxhash so callers can use whatever spelling they
-# like; the manifest always records "xxhash64be" for consistency.
-ALGO_MAP: dict[str, tuple[Callable[[], _Hasher], str]] = cast(
-    "dict[str, tuple[Callable[[], _Hasher], str]]",
+# Registry of the hash algorithms simple-mhl handles, keyed by every CLI / manifest
+# spelling we accept. Each value is a (factory, manifest_tag, verify_rank) triple, so
+# this one map drives all three jobs at once:
+#   * factory      — constructs the hasher used to compute a digest (seal and verify)
+#   * manifest_tag — the element name seal writes; aliases collapse, so every xxhash
+#                    spelling is recorded as "xxhash64be" for consistency
+#   * verify_rank  — preference when an entry records several hashes, fastest preferred
+#                    (xxhash > md5 > sha1).
+# It is also the recognition set for verify: a hash element whose name isn't a key here
+# (and isn't <null>) is ignored exactly as if absent — an entry whose only hash is
+# uncomputable falls through to "no supported hash found".
+ALGO_MAP: dict[str, tuple[Callable[[], _Hasher], str, int]] = cast(
+    "dict[str, tuple[Callable[[], _Hasher], str, int]]",
     {
-        "xxhash": (xxhash.xxh64, "xxhash64be"),
-        "xxh64": (xxhash.xxh64, "xxhash64be"),
-        "xxhash64": (xxhash.xxh64, "xxhash64be"),
-        "xxhash64be": (xxhash.xxh64, "xxhash64be"),
-        "md5": (hashlib.md5, "md5"),
-        "sha1": (hashlib.sha1, "sha1"),
+        "xxhash": (xxhash.xxh64, "xxhash64be", 0),
+        "xxh64": (xxhash.xxh64, "xxhash64be", 0),
+        "xxhash64": (xxhash.xxh64, "xxhash64be", 0),
+        "xxhash64be": (xxhash.xxh64, "xxhash64be", 0),
+        "md5": (hashlib.md5, "md5", 1),
+        "sha1": (hashlib.sha1, "sha1", 2),
     },
 )
 
-# Tags recognised when reading a manifest — superset of the algorithms we can
-# *write*. We can verify an old manifest that uses xxhash128 or xxhash3_64
-# even if we don't offer those for sealing. "null" records no digest, so
-# verification falls back to existence + file-size check (per the v1.1 schema:
-# <null> means "no hash, only use file size verification").
-SUPPORTED_HASH_TAGS = frozenset(ALGO_MAP) | {"xxhash128", "xxhash3_64", "null"}
-
-# Preference order verify uses to pick which recorded hash to re-compute when an
-# entry carries several: faster algorithms first (xxhash ≫ md5 > sha1), so a
-# multi-format manifest re-verifies cheaply by default regardless of element
-# order. Tags absent here get _VERIFY_RANK_DEFAULT: "null" (size-only) ranks
-# ahead of read-only formats we can't recompute (xxhash128, xxhash3_64), so a
-# real computable hash always wins and null beats "cannot verify".
-_VERIFY_RANK: dict[str, int] = {
-    "xxhash": 0,
-    "xxh64": 0,
-    "xxhash64": 0,
-    "xxhash64be": 0,
-    "md5": 1,
-    "sha1": 2,
-    "null": 8,
-}
-_VERIFY_RANK_DEFAULT = 9
+# <null> is not a real algorithm — it records no digest, so it ranks after every
+# computable algorithm.
+_NULL_TAG = "null"
+_NULL_RANK = max(rank for *_, rank in ALGO_MAP.values()) + 1
 
 
 # -----------------------------------------------------------------------------
@@ -761,27 +750,102 @@ def _validate_mhl_path(mhl_file: str) -> None:
         sys.exit(1)
 
 
+# xxHash tags may be big-endian or little-endian hex, and have historically carried a
+# 32-bit integer, so verify must account for all of those cases:
+#   * xxhash64be — XXH64 as big-endian hex (the canonical modern form)
+#   * xxhash64   — the above, or XXH64 as little-endian hex
+#   * xxhash     — the above, or XXH32 as a decimal integer (very old form!)
+# Only one digest is computed per entry: the stored value's shape selects which.
+_XXH64_BE_ONLY = frozenset({"xxhash64be"})
+_XXH64_BE_OR_LE = frozenset({"xxhash64", "xxh64"})
+# A 32-bit XXH32 in decimal is at most 10 digits (leading zeros might have been stripped).
+# A longer all-digit value under <xxhash> is therefore hex, not a decimal integer.
+_XXH32_MAX_DECIMAL_DIGITS = 10
+
+# Verify-only factories. XXH32 is needed to recompute the oldest decimal xxHash but is
+# never offered for sealing, so it stays out of ALGO_MAP. Cast for the same reason
+# ALGO_MAP is: xxhash's constructor parameter names differ from the _Hasher protocol.
+_XXH64_FACTORY = cast("Callable[[], _Hasher]", xxhash.xxh64)
+_XXH32_FACTORY = cast("Callable[[], _Hasher]", xxhash.xxh32)
+
+
+def _swap64(value: int) -> int:
+    """Return a 64-bit value with its byte order reversed (big-endian <-> little-endian)."""
+    return int.from_bytes(value.to_bytes(8, "big"), "little")
+
+
+def _matches_be(expected: str, computed: int) -> bool:
+    """True if `expected` (hex) equals `computed` (a big-endian intdigest), strictly."""
+    try:
+        return int(expected, 16) == computed
+    except ValueError:
+        return False
+
+
+def _matches_be_or_le(expected: str, computed: int) -> bool:
+    """True if `expected` (hex) equals `computed` in either byte order.
+
+    The two orders are reorderings of the same hash, so accepting both only rescues an
+    intact file recorded in the opposite endianness — it never lets a differing file pass.
+    """
+    try:
+        stored = int(expected, 16)
+    except ValueError:
+        return False
+    return stored == computed or stored == _swap64(computed)
+
+
+def _matches_decimal(expected: str, computed: int) -> bool:
+    """True if `expected` (a decimal integer) equals `computed` (an intdigest)."""
+    try:
+        return int(expected) == computed
+    except ValueError:
+        return False
+
+
+def _xxhash_route(localname: str, expected: str) -> "tuple[Callable[[], _Hasher], Callable[[str], bool]] | None":
+    """Choose the single hash to compute for an xxHash element and the rule that accepts
+    its stored value.
+
+    Returns (factory, matches): `matches` receives the computed big-endian hex digest.
+    Returns None when `localname` is not an xxHash tag (e.g. md5/sha1), so the caller
+    uses its normal path. The stored value's shape decides which algorithm to compute,
+    so a hex digest never pays to compute XXH32: a 16-character hex value is XXH64; a
+    decimal value of up to 10 digits (leading zeros may have been dropped) is a 32-bit XXH32.
+    """
+    name = localname.lower()
+    if name in _XXH64_BE_ONLY:
+        return _XXH64_FACTORY, lambda calc: _matches_be(expected, int(calc, 16))
+    if name in _XXH64_BE_OR_LE:
+        return _XXH64_FACTORY, lambda calc: _matches_be_or_le(expected, int(calc, 16))
+    if name == "xxhash":
+        if expected.isdecimal() and len(expected) <= _XXH32_MAX_DECIMAL_DIGITS:
+            return _XXH32_FACTORY, lambda calc: _matches_decimal(expected, int(calc, 16))
+        return _XXH64_FACTORY, lambda calc: _matches_be_or_le(expected, int(calc, 16))
+    return None
+
+
 def _verify_one_hash(candidate: str, tag: str, expected: str, rel_path: str, verbose: bool) -> tuple[str, str]:
     """Hash `candidate` with `tag` and compare against `expected`.
 
     Returns ("ok", "<path>  <tag>: <digest>") on a match — the verbose log line
     records which algorithm was verified, otherwise ("mismatch", line).
-    Catches the per-file errors verify must report rather than abort on
-    (an unsupported accept-on-read tag like xxhash128, or a file that vanished mid-run),
-    so this can run inside a thread pool without a raise tearing down the whole verify.
+    Catches the per-file errors verify must report rather than abort on (e.g. a file
+    that vanished mid-run), so this can run inside a thread pool without a raise tearing
+    down the whole verify.
     """
+    expected = expected.strip()
+    route = _xxhash_route(tag, expected)
     try:
-        calculated = get_hash(candidate, tag)
+        if route is not None:
+            factory, matches = route
+            calculated = get_hashes(candidate, [factory])[0]
+            ok = matches(calculated)
+        else:
+            calculated = get_hash(candidate, tag)
+            ok = calculated.lower() == expected.lower()
     except (ValueError, OSError) as e:
         return ("mismatch", f"[ERROR] cannot verify {rel_path}: {e}")
-
-    # Some legacy MHL files stored xxhash as a *decimal integer* rather than the
-    # modern big-endian hex. Detect that case and compare numerically, otherwise
-    # compare hex case-insensitively (uppercase hex appears in some tool output).
-    if tag == "xxhash" and expected.isdecimal():
-        ok = int(calculated, 16) == int(expected)
-    else:
-        ok = calculated.lower() == expected.lower()
 
     if ok:
         return ("ok", f"{rel_path}  {tag}: {calculated}")
@@ -804,6 +868,19 @@ def _manifest_tag_of(localname: str) -> str:
     return entry[1] if entry is not None else localname
 
 
+def _verify_rank(name: str) -> "int | None":
+    """Return verify's preference for a hash element's local-name, or None to ignore it.
+
+    Computable algorithms rank by their ALGO_MAP entry; <null> ranks last. Any
+    other tag — one we cannot recompute — returns None, so the selector skips it as if
+    the element were absent.
+    """
+    entry = ALGO_MAP.get(name)
+    if entry is not None:
+        return entry[2]
+    return _NULL_RANK if name == _NULL_TAG else None
+
+
 def _select_hash_node(h: "etree._Element", override_tag: "str | None") -> "tuple[etree._Element | None, str]":
     """Pick which child hash element of `h` to verify.
 
@@ -813,19 +890,21 @@ def _select_hash_node(h: "etree._Element", override_tag: "str | None") -> "tuple
     Without an override the fastest computable hash wins. With an override only
     the matching format is accepted.
     """
-    candidates: list[tuple[etree._Element, str]] = []
+    candidates: list[tuple[int, etree._Element, str]] = []
     for child in h:
         name = _localname(child.tag)
-        if name in SUPPORTED_HASH_TAGS:
-            candidates.append((child, name))
+        rank = _verify_rank(name)
+        if rank is not None:
+            candidates.append((rank, child, name))
     if not candidates:
         return None, "none"
     if override_tag is not None:
-        for child, name in candidates:
+        for _rank, child, name in candidates:
             if _manifest_tag_of(name) == override_tag:
                 return child, name
         return None, "override"
-    return min(candidates, key=lambda c: _VERIFY_RANK.get(c[1], _VERIFY_RANK_DEFAULT))
+    _rank, node, name = min(candidates, key=lambda c: c[0])
+    return node, name
 
 
 def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexity
@@ -843,8 +922,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
         ascmhl-debug's --verbose.
       * Algorithm selection: by default each entry is verified with the fastest
         recorded hash (xxhash > md5 > sha1), `algorithm` (an ALGO_MAP key) forces
-        a specific format instead; an entry that doesn't record it is reported
-        rather than silently skipped.
+        a specific format instead.
       * Path traversal attempts (manifest entries with ../ that escape the
         manifest's directory) are blocked and reported as mismatches.
 
@@ -996,7 +1074,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
                     continue
 
             # 'null' tag records no digest: existence + size are the whole check.
-            if tag == "null":
+            if tag == _NULL_TAG:
                 results.append(("ok", f"{rel_path}  null (size only)"))
                 h.clear()
                 continue
@@ -1010,8 +1088,8 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
             hash_paths.append(candidate)
             hash_sizes.append(actual_size if actual_size is not None else 0)
             hash_jobs.append(lambda c=candidate, t=tag, e=expected, r=rel_path: _verify_one_hash(c, t, e, r, verbose))
-            # Calibrate the storage probe against the first computable algorithm.
-            if calib_algo is None and tag in ALGO_MAP:
+            # Calibrate the storage probe against the first deferred algorithm.
+            if calib_algo is None:
                 calib_algo = tag
 
             # Free this element and all already-processed siblings.
@@ -1025,15 +1103,13 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
         sys.exit(20)
 
     # --- Parallel hash phase -------------------------------------------------
-    # Hash the deferred entries, auto-tuning concurrency to the storage exactly
-    # as seal does. With no computable algorithm (e.g. an all-xxhash128 manifest)
-    # every job is an instant "cannot verify", so a disk probe would be pointless
-    # — run them straight through.
-    if hash_jobs:
-        if calib_algo is None:
-            hashed: list[tuple[str, str]] = [job() for job in hash_jobs]
-        else:
-            hashed = list(_hash_jobs_auto(hash_paths, hash_sizes, hash_jobs, lambda: _calibrate_hash_bw(calib_algo)))
+    # Hash the deferred entries, auto-tuning concurrency to the storage exactly as seal
+    # does. calib_algo is set alongside the first deferred entry, so "is not None" here
+    # is equivalent to "there are entries to hash" and narrows it for the probe.
+    if calib_algo is not None:
+        hashed: list[tuple[str, str]] = list(
+            _hash_jobs_auto(hash_paths, hash_sizes, hash_jobs, lambda: _calibrate_hash_bw(calib_algo))
+        )
         for slot, outcome in zip(hash_slots, hashed, strict=True):
             results[slot] = outcome
 
