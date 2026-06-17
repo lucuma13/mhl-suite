@@ -1533,6 +1533,24 @@ def main() -> None:
     xsd_p.add_argument("path", help="path to MHL file")
     xsd_p.set_defaults(func=lambda a: validate_schema(a.path))
 
+    # --- '-h <algo>' hint -----------------------------------------------------
+    # A user who typed 'seal -h xxhash' probably meant '-a xxhash' ('-h' for "hash"
+    # instead of -a for "algorithm"). So when '-h' is immediately followed by a
+    # valid algorithm name, we prepend a hint to the help menu.
+    _argv = sys.argv[1:]
+    for _i in range(len(_argv) - 1):
+        if _argv[_i] not in ("-h", "--help"):
+            continue
+        _sub = next((t for t in _argv[:_i] if t in _SUBCOMMANDS), None)
+        if _sub not in ("seal", "verify"):
+            continue
+        _valid = set(ALGO_MAP) | ({_VERIFY_ALL} if _sub == "verify" else set())
+        _algo = _argv[_i + 1]
+        if _algo in _valid:
+            print(f"\nDid you mean '-a {_algo}' (-a / --algorithm)?\n", file=sys.stderr)
+            {"seal": seal_p, "verify": verify_p}[_sub].print_help()
+            sys.exit(2)
+
     args = parser.parse_args()
     args.func(args)
 

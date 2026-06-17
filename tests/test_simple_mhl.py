@@ -2429,6 +2429,46 @@ class TestSmartDispatch:
         assert err.strip() != "", "Expected argparse error on stderr, got silence"
 
 
+class TestAlgorithmHelpHint:
+    """'-h <algo>' is a common slip for '-a <algo>' and gets a pointing hint.
+
+    '-h' is argparse's help flag (consumes no value), so the mistake would
+    otherwise silently print help and ignore the algorithm/path.
+    """
+
+    def test_hint_points_to_algorithm_flag_then_shows_help(self, mhl_cli, tmp_path):
+        rc, out, err = mhl_cli(["seal", "-h", "xxhash", str(tmp_path)])
+
+        # Exit 2 (usage error)
+        assert rc == 2
+        # Hint on stderr, naming the exact flag the user meant.
+        assert "Did you mean '-a xxhash' (-a / --algorithm)?" in err
+        # The subcommand's normal help still prints (on stdout).
+        assert "--algorithm" in out
+
+    def test_verify_all_is_recognised_as_an_algorithm_value(self, mhl_cli):
+        # 'all' is a valid verify selection, so 'verify -h all' gets the hint too.
+        rc, _, err = mhl_cli(["verify", "-h", "all"])
+
+        assert rc == 2
+        assert "Did you mean '-a all' (-a / --algorithm)?" in err
+
+    def test_seal_does_not_treat_all_as_an_algorithm(self, mhl_cli):
+        # 'all' is verify-only; for seal, '-h all' is just plain help, no hint.
+        rc, _, err = mhl_cli(["seal", "-h", "all"])
+
+        assert rc == 0
+        assert "Did you mean" not in err
+
+    def test_bare_help_flag_still_shows_help_unchanged(self, mhl_cli):
+        # '-h' with no algorithm after it is ordinary help — no hint.
+        rc, out, err = mhl_cli(["seal", "-h"])
+
+        assert rc == 0
+        assert "Did you mean" not in err
+        assert "--algorithm" in out
+
+
 # ---------------------------------------------------------------------------
 # TestSizePreCheck
 # ---------------------------------------------------------------------------
