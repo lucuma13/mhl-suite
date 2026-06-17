@@ -543,28 +543,52 @@ def _resolve_seal_algorithms(algorithms: "list[str]") -> list[str]:
     return resolved
 
 
-def seal(root: str, algorithms: "list[str]", dont_reseal: bool, verbose: bool = False) -> None:
+def _resolve_output_dir(root: str, output_dir: "str | None") -> str:
+    """Resolve and validate where seal writes the manifest, exiting 2 on a bad choice.
+
+    None keeps the manifest at the sealed root (the historic default). Otherwise it
+    must be `root` itself or a parent directory: verify resolves each <file> entry
+    relative to the manifest's directory and blocks any '..' escape, so only an
+    ancestor keeps the recorded paths traversal-free. Returns the absolute directory.
     """
-    Walk `root`, hash every non-hidden file, and write a dated MHL manifest
-    at the root of the directory.
+    if output_dir is None:
+        return root
+    output_dir = os.path.abspath(output_dir)
+    if not os.path.isdir(output_dir):
+        sys.stderr.write(f"Error: output directory '{output_dir}' is not a directory\n")
+        sys.exit(2)
+    if root != output_dir and not root.startswith(output_dir + os.sep):
+        sys.stderr.write(f"Error: output directory '{output_dir}' must be the sealed directory or a parent directory\n")
+        sys.exit(2)
+    return output_dir
+
+
+def seal(root: str, algorithms: "list[str]", verbose: bool = False, output_dir: "str | None" = None) -> None:
+    """
+    Walk `root`, hash every non-hidden file, and write a dated MHL manifest.
 
     `algorithms` is one or more hash-algorithm keys (see ALGO_MAP). When more
     than one is given, every file is read once and all digests are computed from
     that single stream (read-once multi-hashing), and the manifest records one
     hash element per format per file.
 
+    `output_dir` chooses where the manifest is written. It defaults to the sealed
+    directory root. When given, it must be `root` itself or an ancestor —
+    verify resolves each <file> entry relative to the manifest's own directory and
+    rejects any entry that escapes it via '..', so only an ancestor keeps every
+    recorded path traversal-free. The <file> paths are therefore written relative
+    to `output_dir`, gaining a leading "<sealed-folder>/…" prefix when it is a true ancestor.
+
     Behaviour:
-      * Manifest filename: <basename>_<UTC-timestamp>.mhl
-      * Collisions: if the file already exists and --dont-reseal was passed,
-        exit 0 silently. Otherwise append a numeric suffix until unique.
+      * Manifest filename: <basename>_<UTC-timestamp>.mhl (named after `root`)
+      * Collisions: if the file already exists, append a numeric suffix until
+        unique.
       * Hidden files and directories are included; only OS-generated metadata
         (.DS_Store, macOS ._* resource forks, Spotlight/Trash/Time Machine and
         other volume-internal items — see _internal.ignorelist) is skipped.
       * Files that vanish during the walk are skipped without aborting.
-      * Concurrency is fully automatic and has no operator knob: _hash_files_auto
-        measures the storage and parallelises only when that's faster, staying
-        sequential otherwise. The manifest is identical and deterministically
-        ordered regardless.
+      * Concurrency is fully automatic: _hash_files_auto measures the storage
+        and parallelises only when that's faster, staying sequential otherwise.
 
     Output format:
       [OK] <path>  <algo>: <digest>             (verbose only, per hashed file)
@@ -587,6 +611,8 @@ def seal(root: str, algorithms: "list[str]", dont_reseal: bool, verbose: bool = 
         sys.stderr.write(msg)
         sys.exit(2)
 
+    output_dir = _resolve_output_dir(root, output_dir)
+
     base_name = os.path.basename(root)
 
     # iso_now stamps the run's <creationdate> and <creatorinfo> start/finish.
@@ -604,23 +630,16 @@ def seal(root: str, algorithms: "list[str]", dont_reseal: bool, verbose: bool = 
     # transfer scripts on a shared NAS) will now always land on distinct
     # paths; the second process to attempt any given path gets FileExistsError
     # and moves on to the next suffix.
-    #
-    # The original tool exited 0 with --dont-reseal regardless of whether a
-    # same-second collision was the user's existing manifest or a brand-new
-    # one being written; we preserve that behaviour because automated callers
-    # depend on it.
     mhl_name = f"{base_name}_{timestamp_for_filename}.mhl"
-    mhl_path = os.path.join(root, mhl_name)
+    mhl_path = os.path.join(output_dir, mhl_name)
     suffix = 0
     fd: int | None = None
     while fd is None:
         try:
             fd = os.open(mhl_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
         except FileExistsError:
-            if dont_reseal:
-                sys.exit(0)
             suffix += 1
-            mhl_path = os.path.join(root, f"{base_name}_{timestamp_for_filename}_{suffix}.mhl")
+            mhl_path = os.path.join(output_dir, f"{base_name}_{timestamp_for_filename}_{suffix}.mhl")
 
     # Build the manifest skeleton. We construct in memory and write at the
     # end; for typical shoots (<5000 files) the in-memory tree is a few MB
@@ -656,7 +675,9 @@ def seal(root: str, algorithms: "list[str]", dont_reseal: bool, verbose: bool = 
     digests = _hash_files_auto(paths, [st.st_size for _, st in entries], algorithms)
 
     for (filepath, stat_result), (file_digests, hashdate) in zip(entries, digests, strict=True):
-        rel_path = os.path.relpath(filepath, root)
+        # Paths are relative to the manifest's own directory (output_dir) so
+        # verify resolves them correctly; this equals root in the default case.
+        rel_path = os.path.relpath(filepath, output_dir)
         # The MHL spec requires forward slashes regardless of platform. On
         # Windows, os.path.relpath returns backslashes; replace them so the
         # manifest is portable between operating systems.
@@ -1452,7 +1473,7 @@ def main() -> None:
     # we waste a directory walk on them.
     seal_p = subparsers.add_parser(
         "seal",
-        help="seal directory (MHL file generated at the root)",
+        help="seal a directory",
     )
     seal_p.add_argument("path", help="path to directory to seal")
     seal_p.add_argument(
@@ -1462,19 +1483,22 @@ def main() -> None:
         action="append",
         default=None,
         metavar="ALGO[,ALGO...]",
-        help="hash algorithm: xxhash (default), md5, sha1 (repeatable / comma-separated)",
+        help="hash algorithm: xxhash (default), md5, sha1",
     )
     seal_p.add_argument(
-        "--dont-reseal",
-        action="store_true",
-        help="abort silently if an MHL with the same timestamp already exists",
+        "-o",
+        "--output-dir",
+        dest="output_dir",
+        default=None,
+        metavar="DIR",
+        help="directory to write the MHL into (default: directory root)",
     )
     seal_p.add_argument(
         "-v",
         "--verbose",
         action="store_true",
     )
-    seal_p.set_defaults(func=lambda a: seal(a.path, combine_seal_algorithms(a.algorithm), a.dont_reseal, a.verbose))
+    seal_p.set_defaults(func=lambda a: seal(a.path, combine_seal_algorithms(a.algorithm), a.verbose, a.output_dir))
 
     # verify subcommand
     verify_p = subparsers.add_parser("verify", help="verify an MHL file")
@@ -1486,7 +1510,7 @@ def main() -> None:
         action="append",
         default=None,
         metavar="ALGO[,ALGO...]",
-        help="hash algorithm: xxhash, md5, sha1, or all (repeatable / comma-separated; default: fastest available)",
+        help="hash algorithm: xxhash, md5, sha1, or all (default: fastest)",
     )
     verify_p.add_argument(
         "-S",
@@ -1504,7 +1528,7 @@ def main() -> None:
     # xsd-schema-check subcommand
     xsd_p = subparsers.add_parser(
         "xsd-schema-check",
-        help="validate XML Schema Definition",
+        help="validate against XML Schema Definition",
     )
     xsd_p.add_argument("path", help="path to MHL file")
     xsd_p.set_defaults(func=lambda a: validate_schema(a.path))

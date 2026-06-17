@@ -192,19 +192,6 @@ class TestSeal:
         assert ".DS_Store" not in text
         assert "._visible.bin" not in text
 
-    def test_seal_dont_reseal(self, mhl_cli, tmp_path):
-        """--dont-reseal should bail out if MHL already exists."""
-        make_tree(tmp_path, {"a.bin": b"hello"})
-
-        rc1, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
-        assert rc1 == 0
-
-        rc2, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
-        assert rc2 == 0
-
-        rc3, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "--dont-reseal"])
-        assert rc3 == 0
-
     def test_seal_unicode_filenames(self, mhl_cli, tmp_path):
         """Manifests must handle non-ASCII filenames cleanly (UTF-8)."""
         make_tree(
@@ -241,6 +228,63 @@ class TestSeal:
     def test_seal_nonexistent_directory(self, mhl_cli):
         """Non-existent path should fail cleanly with exit 2."""
         rc, _, _ = mhl_cli(["seal", "/nonexistent/path/xyz", "-a", "md5"])
+        assert rc == 2
+
+    def test_seal_output_dir_writes_manifest_to_ancestor(self, mhl_cli, tmp_path):
+        """-o writes the MHL into the chosen ancestor, with paths relative to it."""
+        shoot = tmp_path / "shoot"
+        make_tree(shoot, {"a.bin": b"hello", "b/c.bin": b"world"})
+        rc, _, _ = mhl_cli(["seal", str(shoot), "-a", "md5", "-o", str(tmp_path)])
+
+        assert rc == 0
+        # Manifest lands in the ancestor, not the sealed directory.
+        assert list(shoot.glob("*.mhl")) == []
+        mhls = list(tmp_path.glob("*.mhl"))
+        assert len(mhls) == 1
+        text = mhls[0].read_text()
+        # <file> paths are relative to the output dir, so they gain the prefix.
+        assert "shoot/a.bin" in text
+        assert "shoot/b/c.bin" in text
+
+    def test_seal_output_dir_ancestor_manifest_round_trips_through_verify(self, mhl_cli, tmp_path):
+        """A manifest sealed into an ancestor verifies cleanly from that location."""
+        shoot = tmp_path / "shoot"
+        make_tree(shoot, {"a.bin": b"hello", "b/c.bin": b"world"})
+        rc, _, _ = mhl_cli(["seal", str(shoot), "-a", "md5", "-o", str(tmp_path)])
+        assert rc == 0
+        mhl = next(tmp_path.glob("*.mhl"))
+
+        rc, _, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0
+
+    def test_seal_output_dir_default_unchanged(self, mhl_cli, tmp_path):
+        """Without -o the manifest stays at the root with bare relative paths."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+
+        assert rc == 0
+        text = next(tmp_path.glob("*.mhl")).read_text()
+        assert "<file>a.bin</file>" in text
+
+    def test_seal_output_dir_rejects_non_ancestor(self, mhl_cli, tmp_path):
+        """-o pointing outside the sealed tree's ancestry is rejected (exit 2)."""
+        shoot = tmp_path / "shoot"
+        make_tree(shoot, {"a.bin": b"x"})
+        sibling = tmp_path / "elsewhere"
+        sibling.mkdir()
+        rc, _, err = mhl_cli(["seal", str(shoot), "-a", "md5", "-o", str(sibling)])
+        assert rc == 2
+        assert "parent directory" in err
+        # A descendant of the sealed tree is likewise rejected.
+        descendant = shoot / "b"
+        descendant.mkdir()
+        rc, _, _ = mhl_cli(["seal", str(shoot), "-a", "md5", "-o", str(descendant)])
+        assert rc == 2
+
+    def test_seal_output_dir_nonexistent_is_rejected(self, mhl_cli, tmp_path):
+        """-o pointing at a non-existent / non-directory path fails with exit 2."""
+        make_tree(tmp_path, {"a.bin": b"x"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "-o", str(tmp_path / "missing")])
         assert rc == 2
 
 
@@ -629,7 +673,7 @@ class TestSealUnsupportedAlgorithm:
 
         (tmp_path / "a.bin").write_bytes(b"data")
         with pytest.raises(SystemExit) as exc:
-            simple_mhl.seal(str(tmp_path), ["blake3"], dont_reseal=False)
+            simple_mhl.seal(str(tmp_path), ["blake3"])
         assert exc.value.code == 2
         assert "blake3" in capsys.readouterr().err
 
@@ -1320,19 +1364,9 @@ class TestSealAtomicCollision:
             mhls[0].name,
         ), f"unexpected filename: {mhls[0].name}"
 
-    def test_dont_reseal_exits_0_when_file_exists(self, mhl_cli, tmp_path):
-        """--dont-reseal must exit 0 whether it collides or picks a fresh timestamp."""
-        make_tree(tmp_path, {"a.bin": b"data"})
-
-        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
-        assert rc == 0
-
-        rc2, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "--dont-reseal"])
-        assert rc2 == 0
-
-    def test_collision_without_dont_reseal_creates_suffix(self, mhl_cli, tmp_path):
-        """Without --dont-reseal a collision must produce a _1.mhl rather than
-        overwriting or failing. Two seals → two distinct files."""
+    def test_collision_creates_suffix(self, mhl_cli, tmp_path):
+        """A collision must produce a _1.mhl rather than overwriting or failing.
+        Two seals → two distinct files."""
         make_tree(tmp_path, {"a.bin": b"data"})
         rc1, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc1 == 0
@@ -1360,26 +1394,6 @@ class TestSealAtomicCollision:
         expected = tmp_path / f"{base}_{frozen_dt.ts}_2.mhl"
         assert expected.exists(), f"Expected _2 collision file not found. Files: {list(tmp_path.glob('*.mhl'))}"
         assert "<hashlist" in expected.read_text()
-
-    def test_dont_reseal_with_injected_collision_exits_0_writes_nothing(self, mhl_cli, tmp_path, frozen_dt):
-        """--dont-reseal with a pre-injected collision must exit 0 immediately
-        and must NOT create any new .mhl files.
-
-        Directly exercises the FileExistsError → dont_reseal → sys.exit(0)
-        branch inside the O_EXCL loop.
-        """
-        make_tree(tmp_path, {"a.bin": b"hello"})
-        base = tmp_path.name
-
-        collider = tmp_path / f"{base}_{frozen_dt.ts}.mhl"
-        collider.write_text("placeholder")
-
-        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5", "--dont-reseal"])
-
-        assert rc == 0
-        mhls = list(tmp_path.glob("*.mhl"))
-        assert mhls == [collider], f"Expected only the injected placeholder; found: {mhls}"
-        assert collider.read_text() == "placeholder"
 
 
 # ---------------------------------------------------------------------------
@@ -3018,7 +3032,7 @@ class TestNormalizationVariantHint:
         )
         typed = os.path.join(self._VOL, self._NFC)  # NFC dir, not on disk
         with pytest.raises(SystemExit) as exc:
-            simple_mhl.seal(typed, ["md5"], dont_reseal=False)
+            simple_mhl.seal(typed, ["md5"])
         assert exc.value.code == 2
         err = capsys.readouterr().err
         assert "did you mean" in err
@@ -3275,7 +3289,7 @@ class TestSealConcurrency:
         monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw_multi", lambda f: 1000.0)
         probed: list[int] = []
         monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 100.0)  # disk-bound
-        simple_mhl.seal(str(tmp_path), ["md5"], dont_reseal=False, verbose=False)
+        simple_mhl.seal(str(tmp_path), ["md5"], verbose=False)
         assert probed == [1], "the default must probe the disk to decide"
 
 
