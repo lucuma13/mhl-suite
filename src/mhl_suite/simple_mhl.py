@@ -107,6 +107,14 @@ ALGO_MAP: dict[str, tuple[Callable[[], _Hasher], str, int]] = cast(
 _NULL_TAG = "null"
 _NULL_RANK = max(rank for *_, rank in ALGO_MAP.values()) + 1
 
+# `verify -a all` sentinel: verify every recorded hash per entry rather than a
+# single fixed format. "all" is reserved — no manifest tag can collide with it.
+_VERIFY_ALL = "all"
+
+# The distinct manifest element names seal writes (aliases collapse to these), used
+# to validate a verify selection passed by a direct caller.
+_CANONICAL_TAGS = frozenset(tag for _factory, tag, _rank in ALGO_MAP.values())
+
 
 # -----------------------------------------------------------------------------
 # XSD location
@@ -825,36 +833,68 @@ def _xxhash_route(localname: str, expected: str) -> "tuple[Callable[[], _Hasher]
     return None
 
 
-def _verify_one_hash(candidate: str, tag: str, expected: str, rel_path: str, verbose: bool) -> tuple[str, str]:
-    """Hash `candidate` with `tag` and compare against `expected`.
+def _make_ci_matcher(expected: str) -> "Callable[[str], bool]":
+    """Return a case-insensitive exact-hex matcher for a non-xxHash digest.
 
-    Returns ("ok", "<path>  <tag>: <digest>") on a match — the verbose log line
-    records which algorithm was verified, otherwise ("mismatch", line).
-    Catches the per-file errors verify must report rather than abort on (e.g. a file
-    that vanished mid-run), so this can run inside a thread pool without a raise tearing
-    down the whole verify.
+    md5/sha1 are plain hex with no endianness or legacy-integer ambiguity, so the
+    rule is a straight case-folded compare — the counterpart to _xxhash_route's
+    shape-aware matchers, in the same (computed hex) -> bool shape so _verify_hashes
+    can treat every check uniformly.
     """
-    expected = expected.strip()
-    route = _xxhash_route(tag, expected)
-    try:
+    lowered = expected.lower()
+    return lambda calc: calc.lower() == lowered
+
+
+def _verify_hashes(candidate: str, checks: "list[tuple[str, str]]", rel_path: str, verbose: bool) -> tuple[str, str]:
+    """Verify `candidate` against every (tag, expected) pair in `checks`, hashing in
+    a single read pass, and return the combined ("ok"|"mismatch", line) result.
+
+    The file is OK only when every check matches; any single mismatch fails the
+    entry. All digests come from one read of the file (read-once via get_hashes), so
+    verifying N recorded hashes costs one disk pass, not N. Per-file ValueError/OSError
+    are caught and returned as a line so a thread-pool worker reports rather than
+    tearing down the whole verify.
+
+    With exactly one check the output is byte-identical to the historic single-hash
+    form, so default and `-a <algo>` verifies are unchanged; the multi-line detail is
+    produced only for `-a all` on an entry that records several hashes.
+    """
+    factories: list[Callable[[], _Hasher]] = []
+    plans: list[tuple[str, str, Callable[[str], bool]]] = []
+    for tag, raw_expected in checks:
+        expected = raw_expected.strip()
+        route = _xxhash_route(tag, expected)
         if route is not None:
             factory, matches = route
-            calculated = get_hashes(candidate, [factory])[0]
-            ok = matches(calculated)
         else:
-            calculated = get_hash(candidate, tag)
-            ok = calculated.lower() == expected.lower()
+            factory, matches = ALGO_MAP[tag][0], _make_ci_matcher(expected)
+        factories.append(factory)
+        plans.append((tag, expected, matches))
+
+    try:
+        calculated = get_hashes(candidate, factories)
     except (ValueError, OSError) as e:
         return ("mismatch", f"[ERROR] cannot verify {rel_path}: {e}")
 
-    if ok:
-        return ("ok", f"{rel_path}  {tag}: {calculated}")
-    if verbose:
+    checked = [
+        (tag, expected, calc, matches(calc)) for (tag, expected, matches), calc in zip(plans, calculated, strict=True)
+    ]
+
+    if all(ok for *_, ok in checked):
+        shown = "  ".join(f"{tag}: {calc}" for tag, _e, calc, _ok in checked)
+        return ("ok", f"{rel_path}  {shown}")
+    if not verbose:
+        return ("mismatch", f"[ERROR] hash mismatch: {rel_path}")
+    if len(checked) == 1:
+        tag, expected, calc, _ok = checked[0]
         return (
             "mismatch",
-            f"[ERROR] hash mismatch: {rel_path}\n        (calc {tag}: {calculated} | stored {tag}: {expected})",
+            f"[ERROR] hash mismatch: {rel_path}\n        (calc {tag}: {calc} | stored {tag}: {expected})",
         )
-    return ("mismatch", f"[ERROR] hash mismatch: {rel_path}")
+    lines = [f"[ERROR] hash mismatch: {rel_path}"]
+    for tag, expected, calc, ok in checked:
+        lines.append(f"        {tag} {'OK' if ok else 'MISMATCH'}: calc {calc} | stored {expected}")
+    return ("mismatch", "\n".join(lines))
 
 
 def _manifest_tag_of(localname: str) -> str:
@@ -881,14 +921,26 @@ def _verify_rank(name: str) -> "int | None":
     return _NULL_RANK if name == _NULL_TAG else None
 
 
-def _select_hash_node(h: "etree._Element", override_tag: "str | None") -> "tuple[etree._Element | None, str]":
-    """Pick which child hash element of `h` to verify.
+def _select_hash_nodes(
+    h: "etree._Element", selection: "str | list[str] | None"
+) -> "tuple[list[tuple[etree._Element, str]], list[str] | None]":
+    """Pick which child hash element(s) of `h` to verify.
 
-    On success returns (node, localname). When no element is suitable returns
-    (None, reason): "none" if the entry carries no recognised hash, or "override"
-    if an explicit -a algorithm was requested but isn't recorded for this entry.
-    Without an override the fastest computable hash wins. With an override only
-    the matching format is accepted.
+    `selection` is one of:
+      * None             — verify the single fastest recorded hash (default)
+      * _VERIFY_ALL      — verify every recorded recognised hash (`-a all`)
+      * list of manifest tags — verify exactly those formats (`-a md5,xxhash`)
+
+    Returns (nodes, missing). On success `nodes` is a non-empty list of
+    (element, localname) and `missing` is None. Otherwise `nodes` is empty and
+    `missing` is: a non-empty (sorted) list of requested tags not recorded for this
+    entry, or [] when nothing recognised is recorded at all.
+
+    For a list selection, requested order is irrelevant — matching nodes are returned
+    in manifest document order, so `-a md5,sha1` and `-a sha1,md5` verify identically.
+
+    A <null> entry carries no digest, so it is only ever selected alone and only when
+    no computable hash is recorded — the caller then verifies it by size.
     """
     candidates: list[tuple[int, etree._Element, str]] = []
     for child in h:
@@ -896,19 +948,64 @@ def _select_hash_node(h: "etree._Element", override_tag: "str | None") -> "tuple
         rank = _verify_rank(name)
         if rank is not None:
             candidates.append((rank, child, name))
-    if not candidates:
-        return None, "none"
-    if override_tag is not None:
-        for _rank, child, name in candidates:
-            if _manifest_tag_of(name) == override_tag:
-                return child, name
-        return None, "override"
-    _rank, node, name = min(candidates, key=lambda c: c[0])
-    return node, name
+    real = [(rank, node, name) for rank, node, name in candidates if name != _NULL_TAG]
+    null = next(((node, name) for _r, node, name in candidates if name == _NULL_TAG), None)
+
+    if isinstance(selection, list):
+        # A specific -a md5,sha1: verify exactly the requested tags, document order.
+        wanted = set(selection)
+        chosen = [(node, name) for _r, node, name in real if _manifest_tag_of(name) in wanted]
+        found = {_manifest_tag_of(name) for _node, name in chosen}
+        missing = sorted(t for t in wanted if t not in found)
+        return ([], missing) if missing else (chosen, None)
+    if not real:
+        # No computable hash: fall back to <null> (size-only) if present.
+        return ([null], None) if null is not None else ([], [])
+    if selection == _VERIFY_ALL:
+        return [(node, name) for _rank, node, name in real], None
+    # Default: the single fastest recorded hash (lowest rank).
+    _rank, node, name = min(real, key=lambda c: c[0])
+    return [(node, name)], None
+
+
+def _size_check(
+    h: "etree._Element", candidate: str, rel_path: str, verbose: bool
+) -> "tuple[int | None, tuple[str, str] | None]":
+    """Compare the manifest's <size> against the file on disk.
+
+    Returns (actual_size, None) when the recorded size matches — actual_size is
+    handed back so the hash phase can reuse it to carve recheck windows without a
+    second stat(). Returns (None, None) when the entry records no <size> at all
+    (nothing to pre-check). Returns (None, outcome) when there is something to
+    report: a malformed <size>, a file that vanished, or a size mismatch.
+    """
+    size_el = h.find("{*}size")
+    if size_el is None or size_el.text is None:
+        return None, None
+    # isdecimal() rejects superscripts/other Unicode "digits" that int() would
+    # silently convert to the wrong value (corruption or tampering).
+    size_text = size_el.text.strip()
+    if not size_text.isdecimal():
+        return None, ("mismatch", f"[ERROR] malformed size field: {rel_path}")
+    try:
+        actual_size = os.path.getsize(candidate)
+    except OSError:
+        # Vanished between resolution and getsize() — report missing rather than
+        # a bare OSError traceback.
+        return None, ("missing", f"[ERROR] missing file: {rel_path}")
+    manifest_size = int(size_text)
+    if manifest_size != actual_size:
+        if verbose:
+            return None, (
+                "mismatch",
+                f"[ERROR] size mismatch: {rel_path}\n        (calc size: {actual_size} | stored size: {manifest_size})",
+            )
+        return None, ("mismatch", f"[ERROR] size mismatch: {rel_path}")
+    return actual_size, None
 
 
 def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexity
-    mhl_file: str, verbose: bool = False, algorithm: "str | None" = None
+    mhl_file: str, verbose: bool = False, algorithm: "str | list[str] | None" = None, size_only: bool = False
 ) -> None:
     """
     Verify each file listed in `mhl_file` against its stored hash.
@@ -921,8 +1018,14 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
         checked (the fastest recorded, or the -a override) — mirroring
         ascmhl-debug's --verbose.
       * Algorithm selection: by default each entry is verified with the fastest
-        recorded hash (xxhash > md5 > sha1), `algorithm` (an ALGO_MAP key) forces
-        a specific format instead.
+        recorded hash (xxhash > md5 > sha1). `algorithm` overrides this — it may be a
+        single ALGO_MAP key, a list of canonical manifest tags, or the sentinel "all""
+        (_VERIFY_ALL) for every recorded hash. Verifying several hashes still reads
+        the file once, and the entry passes only if every checked hash matches.
+      * Size-only mode (size_only=True): skip hashing entirely and verify each
+        entry by comparing its recorded <size> against the file on disk — a fast
+        check that catches missing and wrong-length files without reading their
+        bytes. An entry with no recorded <size> is reported as a mismatch.
       * Path traversal attempts (manifest entries with ../ that escape the
         manifest's directory) are blocked and reported as mismatches.
 
@@ -930,11 +1033,15 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
 
     Output format:
       [OK] <path>  <algo>: <digest>                (verbose only, success)
+      [OK] <path>  <algo>: <digest>  <algo>: <digest>   (verbose, -a all, multi-hash)
+      [OK] <path>  size: <bytes>                   (verbose only, size-only success)
       [ERROR] hash mismatch: <path>                (verify failure)
+      [ERROR] size mismatch: <path>                (size/size-only failure)
       [ERROR] missing file: <path>                 (file not on disk)
+      [ERROR] no size recorded: <path>             (size-only, entry lacks <size>)
       [ERROR] blocked traversal attempt: <path>    (security)
       [ERROR] no supported hash found: <path>      (manifest malformed)
-      [ERROR] requested hash <algo> not recorded: <path>  (-a override absent)
+      [ERROR] requested hash(es) <algo…> not recorded: <path>  (-a selection absent)
       [ERROR] cannot verify <path>: <reason>       (algorithm not available)
 
     Exit codes:
@@ -946,12 +1053,23 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
     """
     _validate_mhl_path(mhl_file)
 
-    # Resolve the optional -a override to the manifest tag we'll match against.
-    # argparse's choices= guards the CLI, but defend direct callers too.
-    if algorithm is not None and algorithm not in ALGO_MAP:
-        sys.stderr.write(f"Error: unsupported algorithm '{algorithm}'\n")
-        sys.exit(2)
-    override_tag = ALGO_MAP[algorithm][1] if algorithm is not None else None
+    # Resolve the optional -a value to a selection: None (fastest single),
+    # _VERIFY_ALL (every recorded hash), or a list of canonical manifest tags.
+    # argparse's type= guards the CLI; normalise + defend direct callers too.
+    selection: str | list[str] | None
+    if algorithm is None or algorithm == _VERIFY_ALL:
+        selection = algorithm
+    elif isinstance(algorithm, str):
+        if algorithm not in ALGO_MAP:
+            sys.stderr.write(f"Error: unsupported algorithm '{algorithm}'\n")
+            sys.exit(2)
+        selection = [ALGO_MAP[algorithm][1]]
+    else:
+        for tag in algorithm:
+            if tag not in _CANONICAL_TAGS:
+                sys.stderr.write(f"Error: unsupported algorithm '{tag}'\n")
+                sys.exit(2)
+        selection = algorithm
 
     # All file references in the manifest are relative to the directory
     # the manifest lives in. We capture this once and use it as the
@@ -1023,74 +1141,82 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
                 h.clear()
                 continue
 
-            # Pick which recorded hash to verify: the fastest computable one by
-            # default, or the -a override when the operator forced a format.
-            hash_node, picked = _select_hash_node(h, override_tag)
-            if hash_node is None:
-                if picked == "override":
-                    results.append(("mismatch", f"[ERROR] requested hash {algorithm} not recorded: {rel_path}"))
+            # --- Size-only mode -----------------------------------------
+            # Skip hashing altogether: existence plus a <size> match is the whole
+            # check. This is the operator opting into size-only from the CLI for a fast
+            # check — the same "existence + size" idea as a <null> tag, but applied
+            # wholesale and explicitly. The no-<size> policy diverges on purpose: here an
+            # entry without a recorded <size> is a mismatch (the operator asked to
+            # check sizes and there's nothing to check), whereas a <null> entry with
+            # no <size> passes on existence alone (XSD lists file sizes as optional).
+            if size_only:
+                actual_size, size_outcome = _size_check(h, candidate, rel_path, verbose)
+                if size_outcome is not None:
+                    results.append(size_outcome)
+                elif actual_size is None:
+                    results.append(
+                        (
+                            "mismatch",
+                            f"[ERROR] no size recorded: {rel_path} "
+                            "(try 'simple-mhl verify' for full hash verification)",
+                        )
+                    )
                 else:
+                    results.append(("ok", f"{rel_path}  size: {actual_size}"))
+                h.clear()
+                continue
+
+            # Pick which recorded hash(es) to verify: the fastest computable one by
+            # default, the -a override's format, or every recorded hash for -a all.
+            nodes, missing = _select_hash_nodes(h, selection)
+            if not nodes:
+                if missing:  # requested tag(s) not recorded for this entry
+                    label = "hash" if len(missing) == 1 else "hashes"
+                    results.append(
+                        ("mismatch", f"[ERROR] requested {label} {', '.join(missing)} not recorded: {rel_path}")
+                    )
+                else:  # nothing recognised recorded at all
                     results.append(("mismatch", f"[ERROR] no supported hash found: {rel_path}"))
                 h.clear()
                 continue
 
-            tag = picked
-            expected = (hash_node.text or "").strip()
-
             # --- File size pre-check ------------------------------------
             # Compare the manifest's <size> against the file before spending a
             # full hash pass — a size mismatch is definitive and costs one stat().
-            # isdecimal() rejects superscripts/other Unicode "digits" that int()
-            # would silently convert to the wrong value (corruption or tampering).
-            actual_size: int | None = None
-            size_el = h.find("{*}size")
-            if size_el is not None and size_el.text is not None:
-                size_text = size_el.text.strip()
-                if not size_text.isdecimal():
-                    results.append(("mismatch", f"[ERROR] malformed size field: {rel_path}"))
-                    h.clear()
-                    continue
-                try:
-                    actual_size = os.path.getsize(candidate)
-                except OSError:
-                    # Vanished between resolution and getsize() — report missing
-                    # rather than a bare OSError traceback.
-                    results.append(("missing", f"[ERROR] missing file: {rel_path}"))
-                    h.clear()
-                    continue
-                manifest_size = int(size_text)
-                if manifest_size != actual_size:
-                    if verbose:
-                        results.append(
-                            (
-                                "mismatch",
-                                f"[ERROR] size mismatch: {rel_path}\n"
-                                f"        (calc size: {actual_size} | stored size: {manifest_size})",
-                            )
-                        )
-                    else:
-                        results.append(("mismatch", f"[ERROR] size mismatch: {rel_path}"))
-                    h.clear()
-                    continue
-
-            # 'null' tag records no digest: existence + size are the whole check.
-            if tag == _NULL_TAG:
-                results.append(("ok", f"{rel_path}  null (size only)"))
+            # actual_size is reused below to size the parallel hash recheck windows.
+            actual_size, size_outcome = _size_check(h, candidate, rel_path, verbose)
+            if size_outcome is not None:
+                results.append(size_outcome)
                 h.clear()
                 continue
 
-            # Needs a hash pass — defer it to the parallel phase. get_hash is NOT
-            # called here, so the size pre-check above still short-circuits a
-            # corrupt-size file before any hashing happens.
+            # 'null' tag records no digest: existence + size are the whole check.
+            # This is the sealer opting one entry into size-only at seal time. Note
+            # the deliberate divergence from -s below: here a missing <size> is fine
+            # (file sizes are optional on the XSD, so existence alone passes), whereas
+            # under -s an absent <size> is a failure because the operator explicitly
+            # asked to check sizes and there's nothing to check.
+            # _select_hash_nodes only ever returns <null> alone and only when no
+            # computable hash is recorded, so a single null node is the whole entry.
+            if len(nodes) == 1 and nodes[0][1] == _NULL_TAG:
+                results.append(("ok", f"{rel_path}  null (no hash stored)"))
+                h.clear()
+                continue
+
+            # Needs a hash pass — defer it to the parallel phase. No hashing happens
+            # here, so the size pre-check above still short-circuits a corrupt-size
+            # file first. `checks` pairs each selected format with its stored digest;
+            # _verify_hashes computes them all in one read pass.
+            checks = [(name, node.text or "") for node, name in nodes]
             slot = len(results)
             results.append(None)
             hash_slots.append(slot)
             hash_paths.append(candidate)
             hash_sizes.append(actual_size if actual_size is not None else 0)
-            hash_jobs.append(lambda c=candidate, t=tag, e=expected, r=rel_path: _verify_one_hash(c, t, e, r, verbose))
+            hash_jobs.append(lambda c=candidate, ck=checks, r=rel_path: _verify_hashes(c, ck, r, verbose))
             # Calibrate the storage probe against the first deferred algorithm.
             if calib_algo is None:
-                calib_algo = tag
+                calib_algo = checks[0][0]
 
             # Free this element and all already-processed siblings.
             h.clear()
@@ -1210,6 +1336,36 @@ def parse_algorithms(value: str) -> list[str]:
     return keys
 
 
+def parse_verify_algorithms(value: str) -> "str | list[str]":
+    """argparse type= for `verify -a`: parse a comma-separated list of algorithm names
+    or the keyword 'all'.
+
+    Returns the _VERIFY_ALL sentinel if 'all' appears anywhere (it supersedes any
+    specific names), otherwise a de-duplicated list of canonical manifest tags
+    (aliases collapse, e.g. xxhash/xxh64 → xxhash64be). Requested order is preserved
+    for the error message only; selection itself is order-independent. Unknown names
+    raise argparse.ArgumentTypeError, which argparse turns into a usage error (exit 2).
+    """
+    names = [raw.strip().lower() for raw in value.split(",")]
+    names = [n for n in names if n]
+    if not names:
+        raise argparse.ArgumentTypeError("no algorithm given")
+    if _VERIFY_ALL in names:
+        return _VERIFY_ALL
+    tags: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if name not in ALGO_MAP:
+            raise argparse.ArgumentTypeError(
+                f"unsupported algorithm '{name}' (choose from all, {', '.join(sorted(ALGO_MAP))})"
+            )
+        tag = ALGO_MAP[name][1]
+        if tag not in seen:
+            seen.add(tag)
+            tags.append(tag)
+    return tags
+
+
 def main() -> None:
     # --- Smart dispatch -------------------------------------------------------
     # When invoked without an explicit subcommand we inspect the sole positional
@@ -1256,9 +1412,7 @@ def main() -> None:
         type=parse_algorithms,
         default=["xxhash"],
         metavar="ALGO[,ALGO...]",
-        help="hash algorithm(s), comma-separated (default: xxhash); "
-        "e.g. -a md5,xxhash records both per file in a single read pass. "
-        f"Choices: {', '.join(sorted(ALGO_MAP))}",
+        help="hash algorithm: xxhash (default), md5, sha1",
     )
     seal_p.add_argument(
         "--dont-reseal",
@@ -1278,17 +1432,23 @@ def main() -> None:
     verify_p.add_argument(
         "-a",
         "--algorithm",
-        choices=sorted(ALGO_MAP),
+        type=parse_verify_algorithms,
         default=None,
-        help="verify with this algorithm instead of the fastest recorded "
-        "(default: fastest available, xxhash > md5 > sha1)",
+        metavar="ALGO[,ALGO...]",
+        help="hash algorithm: xxhash, md5, sha1, or all (default: fastest available)",
+    )
+    verify_p.add_argument(
+        "-S",
+        "--size-only",
+        action="store_true",
+        help="check file sizes only (skip hashing)",
     )
     verify_p.add_argument(
         "-v",
         "--verbose",
         action="store_true",
     )
-    verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose, a.algorithm))
+    verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose, a.algorithm, a.size_only))
 
     # xsd-schema-check subcommand
     xsd_p = subparsers.add_parser(

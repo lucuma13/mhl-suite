@@ -437,6 +437,81 @@ class TestVerifyAlgorithmSelection:
         assert mhl_cli(["verify", mhl, "-a", "md5"])[0] == 0
         assert mhl_cli(["verify", mhl, "-a", "xxhash"])[0] == 0
 
+    def test_all_clean_checks_every_recorded_format(self, mhl_cli, tmp_path):
+        """-a all verifies every recorded hash in one pass; verbose names each one."""
+        content = b"hello world"
+        mhl = make_multi_hash_mhl(
+            tmp_path,
+            "clip.bin",
+            content,
+            {
+                "md5": hashlib.md5(content).hexdigest(),
+                "sha1": hashlib.sha1(content).hexdigest(),
+                "xxhash64be": xxhash.xxh64(content).hexdigest(),
+            },
+        )
+        rc, out, _ = mhl_cli(["verify", "-a", "all", "-v", str(mhl)])
+        assert rc == 0
+        assert "[OK] clip.bin" in out
+        assert "md5:" in out
+        assert "sha1:" in out
+        assert "xxhash64be:" in out
+
+    def test_all_fails_on_any_bad_recorded_hash(self, mhl_cli, tmp_path):
+        """-a all checks ALL recorded hashes, so one wrong stored digest fails the
+        entry even when the fastest (default) hash matches. Verbose marks per format
+        which matched and which didn't."""
+        content = b"hello world"
+        mhl = make_multi_hash_mhl(
+            tmp_path,
+            "clip.bin",
+            content,
+            {
+                "md5": hashlib.md5(content).hexdigest(),
+                "sha1": "0" * 40,  # wrong on purpose; the file itself is intact
+                "xxhash64be": xxhash.xxh64(content).hexdigest(),
+            },
+        )
+        # Default verifies only the fastest (xxhash), which matches → clean.
+        assert mhl_cli(["verify", str(mhl)])[0] == 0
+        # -a all checks every recorded hash, so the bad sha1 fails the entry.
+        rc, out, _ = mhl_cli(["verify", "-a", "all", "-v", str(mhl)])
+        assert rc == 40
+        assert "hash mismatch: clip.bin" in out
+        assert "sha1 MISMATCH" in out
+        assert "md5 OK" in out
+        assert "xxhash64be OK" in out
+
+    def test_comma_list_checks_each_selected_hash_order_independent(self, mhl_cli, tmp_path):
+        """-a md5,sha1 verifies exactly those two; the unrequested xxhash is skipped,
+        and requested order doesn't change the result (output stays in manifest order)."""
+        content = b"hello world"
+        mhl = make_multi_hash_mhl(
+            tmp_path,
+            "clip.bin",
+            content,
+            {
+                "md5": hashlib.md5(content).hexdigest(),
+                "sha1": hashlib.sha1(content).hexdigest(),
+                "xxhash64be": xxhash.xxh64(content).hexdigest(),
+            },
+        )
+        for order in ("md5,sha1", "sha1,md5"):
+            rc, out, _ = mhl_cli(["verify", "-a", order, "-v", str(mhl)])
+            assert rc == 0, f"order {order!r}"
+            assert "md5:" in out
+            assert "sha1:" in out
+            assert "xxhash64be:" not in out  # not requested → not checked
+
+    def test_comma_list_reports_missing_requested_tags(self, mhl_cli, tmp_path):
+        """Requesting tags the entry doesn't record fails it, naming each missing one;
+        the list is sorted so the message is stable regardless of requested order."""
+        content = b"hello"
+        mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"xxhash64be": xxhash.xxh64(content).hexdigest()})
+        rc, out, _ = mhl_cli(["verify", "-a", "sha1,md5", str(mhl)])
+        assert rc == 40
+        assert "requested hashes md5, sha1 not recorded" in out
+
 
 class TestParseAlgorithms:
     """The seal -a comma-list parser."""
@@ -600,6 +675,61 @@ class TestVerify:
         assert "hash mismatch: a.bin" in out
         assert "calc" in out
         assert "stored" in out
+
+    def test_size_only_clean_skips_hashing(self, mhl_cli, tmp_path):
+        """-s verifies on <size> alone: a same-length content change (which a hash
+        pass would catch) passes clean, proving no bytes are hashed."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        mhl = seal_helper(mhl_cli, tmp_path)
+        (tmp_path / "a.bin").write_bytes(b"world")  # same length, different bytes
+
+        rc, out, _ = mhl_cli(["verify", "-S", str(mhl)])
+        assert rc == 0
+        assert out == ""
+
+    def test_size_only_detects_wrong_length(self, mhl_cli, tmp_path):
+        """A file whose byte-length no longer matches <size> is a size mismatch (exit 40)."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        mhl = seal_helper(mhl_cli, tmp_path)
+        (tmp_path / "a.bin").write_bytes(b"hello world")
+
+        rc, out, _ = mhl_cli(["verify", "--size-only", str(mhl)])
+        assert rc == 40
+        assert "[ERROR] size mismatch: a.bin" in out
+
+    def test_size_only_missing_file(self, mhl_cli, tmp_path):
+        """A deleted file is reported missing (exit 30) in size-only mode too."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        mhl = seal_helper(mhl_cli, tmp_path)
+        (tmp_path / "a.bin").unlink()
+
+        rc, out, _ = mhl_cli(["verify", "-S", str(mhl)])
+        assert rc == 30
+        assert "[ERROR] missing file: a.bin" in out
+
+    def test_size_only_entry_without_size_is_mismatch(self, mhl_cli, tmp_path):
+        """An entry that records no <size> can't be size-checked, so -s reports it
+        as a mismatch rather than passing it silently."""
+        (tmp_path / "a.bin").write_bytes(b"hello")
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "a.bin"
+        etree.SubElement(h, "xxhash64be").text = xxhash.xxh64(b"hello").hexdigest()
+        mhl = tmp_path / "nosize.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, out, _ = mhl_cli(["verify", "-S", str(mhl)])
+        assert rc == 40
+        assert "[ERROR] no size recorded: a.bin" in out
+
+    def test_size_only_verbose_output(self, mhl_cli, tmp_path):
+        """--verbose -s prints one '[OK] <path>  size: <bytes>' line per file."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        mhl = seal_helper(mhl_cli, tmp_path)
+
+        rc, out, _ = mhl_cli(["verify", "-S", "-v", str(mhl)])
+        assert rc == 0
+        assert "[OK] a.bin  size: 5" in out
 
     def test_iter_files_without_on_skip_skips_os_junk(self, tmp_path):
         """_iter_files_for_seal's on_skip callback is optional. With on_skip=None
@@ -1738,9 +1868,9 @@ class TestTOCTOURaceCondition:
          Requires a manifest <size> element; the OSError is caught by the size
          pre-check handler and reported as 'missing file' (exit 30).
 
-      2. getsize() -> get_hash(): covered by test_file_deleted_during_get_hash.
+      2. getsize() -> hash read: covered by test_file_deleted_before_hash_read.
          Requires NO <size> element so the size block is skipped entirely; the
-         OSError is caught by the get_hash handler and reported as 'cannot verify'
+         OSError is caught by the get_hashes handler and reported as 'cannot verify'
          (exit 40).
 
     Both handlers must produce a structured error message, not an unhandled exception.
@@ -1771,26 +1901,27 @@ class TestTOCTOURaceCondition:
         assert rc == 30, f"Expected exit 30 (missing file), got {rc}"
         assert "[ERROR] missing file: vanishing.bin" in out
 
-    def test_file_deleted_during_get_hash(self, mhl_cli, tmp_path, monkeypatch):
-        """Race window 2: file disappears after getsize() but before get_hash() opens it.
+    def test_file_deleted_before_hash_read(self, mhl_cli, tmp_path, monkeypatch):
+        """Race window 2: file disappears after getsize() but before the hash read opens it.
 
-        The get_hash OSError handler must catch this and report 'cannot verify'
-        (exit 40), not propagate the exception.
+        verify() hashes through get_hashes (one read pass for one-or-many formats);
+        its OSError handler must catch this and report 'cannot verify' (exit 40),
+        not propagate the exception.
 
-        Manifest has NO <size> element so the size pre-check is skipped and the
-        race happens at get_hash() as intended. get_hash is patched to delete the
+        Manifest has NO <size> element so the size pre-check is skipped and the race
+        happens at the hash read as intended. get_hashes is patched to delete the
         file then attempt the real open, which raises OSError.
         """
         target = tmp_path / "vanishing.bin"
         target.write_bytes(b"data")
 
-        real_get_hash = simple_mhl.get_hash
+        real_get_hashes = simple_mhl.get_hashes
 
-        def _get_hash_after_delete(filepath, algo_key):
+        def _get_hashes_after_delete(filepath, factories):
             target.unlink(missing_ok=True)
-            return real_get_hash(filepath, algo_key)
+            return real_get_hashes(filepath, factories)
 
-        monkeypatch.setattr(simple_mhl, "get_hash", _get_hash_after_delete)
+        monkeypatch.setattr(simple_mhl, "get_hashes", _get_hashes_after_delete)
 
         # No <size> element — size pre-check block is not entered.
         root = etree.Element("hashlist", version="1.1")
@@ -2240,28 +2371,29 @@ class TestSizePreCheck:
         assert "size" in out.lower(), f"Expected a size-related error message, got: {out!r}"
 
     def test_size_mismatch_skips_hash_computation(self, mhl_cli, tmp_path, monkeypatch):
-        """get_hash() must NOT be called when the size pre-check already fails.
+        """get_hashes() must NOT be called when the size pre-check already fails.
 
-        A size mismatch is a definitive failure signal.  Calling get_hash()
-        afterwards wastes I/O on a file that is already known to be wrong.
-        This test uses a spy to confirm get_hash is never reached.
+        A size mismatch is a definitive failure signal.  Hashing afterwards wastes
+        I/O on a file that is already known to be wrong. verify() hashes through
+        get_hashes (one read pass for one-or-many formats), so the spy watches that
+        to confirm hashing is never reached.
         """
-        get_hash_calls: list[str] = []
-        real_get_hash = simple_mhl.get_hash
+        get_hashes_calls: list[str] = []
+        real_get_hashes = simple_mhl.get_hashes
 
-        def spy_get_hash(filepath, algo_key):
-            get_hash_calls.append(filepath)
-            return real_get_hash(filepath, algo_key)
+        def spy_get_hashes(filepath, factories):
+            get_hashes_calls.append(filepath)
+            return real_get_hashes(filepath, factories)
 
-        monkeypatch.setattr(simple_mhl, "get_hash", spy_get_hash)
+        monkeypatch.setattr(simple_mhl, "get_hashes", spy_get_hashes)
 
         mhl = make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="9999")
 
         rc, _, _ = mhl_cli(["verify", str(mhl)])
 
         assert rc == 40, f"Expected exit 40, got {rc}"
-        assert get_hash_calls == [], (
-            f"get_hash() was called {len(get_hash_calls)} time(s) despite size mismatch — "
+        assert get_hashes_calls == [], (
+            f"get_hashes() was called {len(get_hashes_calls)} time(s) despite size mismatch — "
             "the pre-check must short-circuit before hashing"
         )
 
@@ -2287,9 +2419,9 @@ class TestSizePreCheck:
 
         xxhash64 is non-cryptographic and constructing a real same-digest
         collision for two files of different lengths is impractical without
-        specialised tooling.  Instead we monkeypatch get_hash() to return the
+        specialised tooling.  Instead we monkeypatch get_hashes() to return the
         *correct* digest for the on-disk file regardless, then verify that the
-        size check still fires before get_hash is reached.
+        size check still fires before hashing is reached.
 
         This is the adversarially interesting case: a tool that only checks the
         hash would silently pass a file whose size is wrong (e.g. a truncated
@@ -2302,12 +2434,12 @@ class TestSizePreCheck:
         # Record the correct digest but a wrong size.
         mhl = make_mhl_with_size(tmp_path, "clip.bin", content, size_override="9999")
 
-        # Ensure get_hash would return the correct digest if ever called,
+        # Ensure get_hashes would return the correct digest if ever called,
         # so the only thing that can trigger the failure is the size check.
-        def always_correct_hash(filepath, algo_key):
-            return correct_digest
+        def always_correct_hash(filepath, factories):
+            return [correct_digest for _ in factories]
 
-        monkeypatch.setattr(simple_mhl, "get_hash", always_correct_hash)
+        monkeypatch.setattr(simple_mhl, "get_hashes", always_correct_hash)
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
 
