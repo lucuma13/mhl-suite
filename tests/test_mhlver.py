@@ -1254,13 +1254,13 @@ class TestMhlTotalBytes:
     """Tests for _mhl_total_bytes."""
 
     def test_sums_size_elements(self, tmp_path):
-        """Returns the sum of all <size> values in a manifest."""
+        """Returns the sum of <size> values for entries with a recomputable hash."""
         mhl = tmp_path / "test.mhl"
         mhl.write_text(
             '<?xml version="1.0"?>\n'
             '<hashlist version="1.1">'
-            "<hash><file>a.bin</file><size>100</size></hash>"
-            "<hash><file>b.bin</file><size>200</size></hash>"
+            "<hash><file>a.bin</file><size>100</size><xxhash64be>aa</xxhash64be></hash>"
+            "<hash><file>b.bin</file><size>200</size><xxhash64be>bb</xxhash64be></hash>"
             "</hashlist>"
         )
         assert mhlver._mhl_total_bytes(mhl) == 300
@@ -1281,11 +1281,32 @@ class TestMhlTotalBytes:
         mhl.write_text(
             '<?xml version="1.0"?>\n'
             '<hashlist version="1.1">'
-            "<hash><file>a.bin</file><size>bad</size></hash>"
-            "<hash><file>b.bin</file><size>50</size></hash>"
+            "<hash><file>a.bin</file><size>bad</size><xxhash64be>aa</xxhash64be></hash>"
+            "<hash><file>b.bin</file><size>50</size><xxhash64be>bb</xxhash64be></hash>"
             "</hashlist>"
         )
         assert mhlver._mhl_total_bytes(mhl) == 50
+
+    def test_null_entry_excluded(self, tmp_path):
+        """A <null> (size-only) entry reads zero bytes at verify time, so its
+        <size> is excluded — only the hashed entry's size is counted."""
+        mhl = tmp_path / "mixed.mhl"
+        mhl.write_text(
+            '<?xml version="1.0"?>\n'
+            '<hashlist version="1.1">'
+            "<hash><file>a.bin</file><size>100</size><xxhash64be>aa</xxhash64be></hash>"
+            "<hash><file>b.bin</file><size>200</size><null></null></hash>"
+            "</hashlist>"
+        )
+        assert mhlver._mhl_total_bytes(mhl) == 100
+
+    def test_existence_only_entry_is_zero(self, tmp_path):
+        """A <null> entry with no <size> (existence-only) contributes nothing."""
+        mhl = tmp_path / "existence.mhl"
+        mhl.write_text(
+            '<?xml version="1.0"?>\n<hashlist version="1.1"><hash><file>a.bin</file><null></null></hash></hashlist>'
+        )
+        assert mhlver._mhl_total_bytes(mhl) == 0
 
     @pytest.mark.parametrize(
         "fixture_name",

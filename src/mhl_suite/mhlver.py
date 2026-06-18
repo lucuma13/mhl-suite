@@ -7,8 +7,8 @@
 # mhlver walks a path looking for MHL manifests and verifies each one by
 # delegating to the right backend:
 #
-#     Classic MHL (1.x)  -> shells out to `simple-mhl verify`
-#     ASC-MHL  (2.0)    -> shells out to `ascmhl-debug verify`
+#     Classic MHL (v1)  -> shells out to `simple-mhl verify`
+#     ASC-MHL  (v2)    -> shells out to `ascmhl-debug verify`
 #
 # It detects ASC-MHL packages by the conventional `ascmhl/` folder containing
 # the manifest. Each backend's exit code is translated into a human-readable
@@ -749,7 +749,7 @@ def verify_item(
     )
 
 
-# --- Classic MHL (1.x) path ----------------------------------------------------
+# --- Classic MHL (v1) path -----------------------------------------------------
 
 
 def _verify_classicmhl(
@@ -839,7 +839,7 @@ def _verify_classicmhl(
     return step.exit_code, mr
 
 
-# --- ASC-MHL (2.0) path -------------------------------------------------------
+# --- ASC-MHL (v2) path --------------------------------------------------------
 
 
 def _verify_ascmhl(
@@ -1069,22 +1069,44 @@ def _select_mhl_files(root: Path) -> list[Path]:
 # Progress bar helpers
 # -----------------------------------------------------------------------------
 
+# Hash element local-names simple-mhl can recompute (mirrors ALGO_MAP keys in
+# simple_mhl). An entry whose only hash child is <null> — or which records no
+# computable hash — is verified by size/existence alone and reads zero bytes,
+# so its <size> must not weight the byte-based progress total.
+_COMPUTABLE_HASH_TAGS = frozenset({"md5", "sha1", "xxhash", "xxh64", "xxhash64", "xxhash64be"})
+
 
 def _mhl_total_bytes(mhl_file: Path) -> int:
     """
-    Sum the <size> elements in a classic MHL 1.x manifest to get the total
-    byte weight of the files it covers.
+    Sum the <size> of every recomputable-hash entry in a classic MHL
+    manifest to get the byte weight of the files verify will actually read.
 
     Used to weight progress-bar units by actual data volume rather than
     manifest count, giving a more accurate ETA when manifests vary wildly
     in size (e.g. 500 GB camera originals vs 2 GB proxies).
+
+    A <null> (size-only / existence-only) entry is verified with a single
+    stat() and reads zero bytes, so its <size> is excluded — counting it would
+    surge the bar ahead of real hashing progress.
     """
 
     try:
         tree = etree.parse(str(mhl_file))
-        return sum(int(el.text) for el in tree.iterfind(".//{*}size") if el.text and el.text.strip().isdecimal())
-    except (OSError, ValueError, etree.XMLSyntaxError):
+    except (OSError, etree.XMLSyntaxError):
         return 0
+    total = 0
+    for h in tree.iterfind(".//{*}hash"):
+        size_el = h.find("{*}size")
+        if size_el is None or not size_el.text or not size_el.text.strip().isdecimal():
+            continue
+        # Only count entries verify reads bytes for (skip <null>-only / no-hash entries).
+        if any(
+            isinstance(c.tag, str)
+            and (c.tag.rpartition("}")[2] if "}" in c.tag else c.tag).lower() in _COMPUTABLE_HASH_TAGS
+            for c in h
+        ):
+            total += int(size_el.text)
+    return total
 
 
 def _ascmhl_total_bytes(latest_mhl: Path) -> int:
