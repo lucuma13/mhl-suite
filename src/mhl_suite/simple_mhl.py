@@ -1608,9 +1608,26 @@ def main() -> None:
         # Anything else falls through to argparse, which will produce its
         # normal "argument command: invalid choice" error message.
 
+    # -v / --verbose is a global flag: sharing it through a parent parser lets it
+    # appear either before or after the subcommand, so "simple-mhl -v seal ." and
+    # "simple-mhl seal -v ." behave identically. default=SUPPRESS is essential:
+    # without it the subparser's own default would clobber a True set by the
+    # top-level parser. With SUPPRESS, the attribute is only written when -v is
+    # actually present, so whichever parser sees it wins; we fall back to False
+    # below when it appears nowhere.
+    global_opts = argparse.ArgumentParser(add_help=False)
+    global_opts.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="enable verbose output (accepted before or after the subcommand)",
+    )
+
     parser = argparse.ArgumentParser(
         prog="simple-mhl",
         description="Modern verification and sealing tool for classic MHL files",
+        parents=[global_opts],
     )
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1620,6 +1637,7 @@ def main() -> None:
     seal_p = subparsers.add_parser(
         "seal",
         help="seal a directory",
+        parents=[global_opts],
     )
     seal_p.add_argument("path", help="path to directory to seal")
     seal_p.add_argument(
@@ -1639,15 +1657,10 @@ def main() -> None:
         metavar="DIR",
         help="directory to write the MHL into (default: directory root)",
     )
-    seal_p.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-    )
     seal_p.set_defaults(func=lambda a: seal(a.path, combine_seal_algorithms(a.algorithm), a.verbose, a.output_dir))
 
     # verify subcommand
-    verify_p = subparsers.add_parser("verify", help="verify an MHL file")
+    verify_p = subparsers.add_parser("verify", help="verify an MHL file", parents=[global_opts])
     verify_p.add_argument("path", help="path to MHL file")
     verify_p.add_argument(
         "-a",
@@ -1664,17 +1677,13 @@ def main() -> None:
         action="store_true",
         help="check file sizes only (skip hashing)",
     )
-    verify_p.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-    )
     verify_p.set_defaults(func=lambda a: verify(a.path, a.verbose, combine_verify_algorithms(a.algorithm), a.size_only))
 
     # xsd-schema-check subcommand
     xsd_p = subparsers.add_parser(
         "xsd-schema-check",
         help="validate against XML Schema Definition",
+        parents=[global_opts],
     )
     xsd_p.add_argument("path", help="path to MHL file")
     xsd_p.set_defaults(func=lambda a: validate_schema(a.path))
@@ -1698,6 +1707,9 @@ def main() -> None:
             sys.exit(2)
 
     args = parser.parse_args()
+    # SUPPRESS leaves verbose unset when -v is given nowhere; normalise to False.
+    if not hasattr(args, "verbose"):
+        args.verbose = False
     args.func(args)
 
 
