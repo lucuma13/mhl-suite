@@ -180,6 +180,8 @@ class FileResult:
     path: str  # relative path as recorded in the manifest
     status: str  # "ok" | "missing" | "mismatch" | "new" | "error"
     detail: str = ""  # extra info: mismatch hashes, error reason, etc.
+    size_only: bool = False  # size-only check (<null> tag), no hash checked
+    existence_only: bool = False  # existence-only check <null> tag with no recorded <size>
 
 
 @dataclass
@@ -213,6 +215,14 @@ class ManifestResult:
         return sum(1 for r in self.file_results if r.status == "error")
 
     @property
+    def n_size_only(self) -> int:
+        return sum(1 for r in self.file_results if r.status == "ok" and r.size_only)
+
+    @property
+    def n_existence_only(self) -> int:
+        return sum(1 for r in self.file_results if r.status == "ok" and r.existence_only)
+
+    @property
     def n_files(self) -> int:
         return len(self.file_results)
 
@@ -236,6 +246,15 @@ class ManifestResult:
 #   [ERROR] no supported hash found: <path>
 #   [ERROR] blocked traversal attempt: <path>
 #   [ERROR] cannot verify <path>: <reason>
+
+# A null (size-only) OK line ends with this marker, e.g.
+#   [OK] clip.mxf  size: 4170 (size-only check - no hash stored)
+_CLASSICMHL_SIZE_ONLY_MARKER = "(size-only check - no hash stored)"
+
+# A null entry that records no <size> passes on existence alone — neither hash
+# nor size was checked. Its OK line ends with this marker, e.g.
+#   [OK] clip.mxf  (existence-only check — no hash or size stored)
+_CLASSICMHL_EXISTENCE_ONLY_MARKER = "(existence-only check — no hash or size stored)"
 
 _CLASSICMHL_OK = re.compile(r"^\[OK\] (.+)$")
 _CLASSICMHL_MISSING = re.compile(r"^\[ERROR\] missing file: (.+)$")
@@ -267,7 +286,15 @@ def _parse_classicmhl_output(output: str) -> list[FileResult]:
         stripped = lines[i].strip()
 
         if m := _CLASSICMHL_OK.match(stripped):
-            results.append(FileResult(path=m.group(1), status="ok"))
+            body = m.group(1)
+            results.append(
+                FileResult(
+                    path=body,
+                    status="ok",
+                    size_only=body.endswith(_CLASSICMHL_SIZE_ONLY_MARKER),
+                    existence_only=body.endswith(_CLASSICMHL_EXISTENCE_ONLY_MARKER),
+                )
+            )
 
         elif m := _CLASSICMHL_MISSING.match(stripped):
             results.append(FileResult(path=m.group(1), status="missing"))
@@ -1184,12 +1211,35 @@ def _summary_line(
     n_mismatch: int,
     n_error: int,
     n_new: int,
+    n_size_only: int = 0,
+    n_existence_only: int = 0,
+    warn_weak: bool = False,
     n_manifests: int | None = None,
 ) -> str:
     """Build the ' | '-joined verdict line shared by the global summary and
     each per-manifest sub-summary. Pass n_manifests=None to omit the manifest
-    count (per-manifest lines don't repeat it)."""
-    parts = ["✅ VERIFIED" if passed else "❌ FAILED"]
+    count (per-manifest lines don't repeat it).
+
+    When the run passed but relied on weak (non-hash) checks — size-only or
+    existence-only <null> entries — the verdict names which kinds were used and,
+    when warn_weak is set, is downgraded to ⚠️ VERIFIED WITH WARNINGS. The two
+    kinds are labelled distinctly: an existence-only entry checked neither hash
+    nor size, so it must not read as a SIZE-ONLY check."""
+    n_weak = n_size_only + n_existence_only
+    if not passed:
+        verdict = "❌ FAILED"
+    elif n_weak:
+        head = "⚠️ VERIFIED WITH WARNINGS" if warn_weak else "✅ VERIFIED"
+        kinds = []
+        if n_size_only:
+            kinds.append("SIZE-ONLY")
+        if n_existence_only:
+            kinds.append("EXISTENCE-ONLY")
+        prefix = "SOME " if n_weak != n_ok else ""
+        verdict = f"{head} ({prefix}{' AND '.join(kinds)} CHECKS)"
+    else:
+        verdict = "✅ VERIFIED"
+    parts = [verdict]
     if n_manifests is not None:
         parts.append(f"{n_manifests} {'manifest' if n_manifests == 1 else 'manifests'}")
     parts.append(f"{n_files} {'file' if n_files == 1 else 'files'}")
@@ -1249,6 +1299,8 @@ def _render_report(
     n_mismatch = sum(mr.n_mismatch for mr in manifest_results)
     n_new = sum(mr.n_new for mr in manifest_results)
     n_error = sum(mr.n_error for mr in manifest_results)
+    n_size_only = sum(mr.n_size_only for mr in manifest_results)
+    n_existence_only = sum(mr.n_existence_only for mr in manifest_results)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     line("Summary")
@@ -1263,6 +1315,9 @@ def _render_report(
             n_mismatch=n_mismatch,
             n_error=n_error,
             n_new=n_new,
+            n_size_only=n_size_only,
+            n_existence_only=n_existence_only,
+            warn_weak=True,
         )
     )
     line()
@@ -1310,6 +1365,8 @@ def _render_report(
                 n_mismatch=mr.n_mismatch,
                 n_error=mr.n_error,
                 n_new=mr.n_new,
+                n_size_only=mr.n_size_only,
+                n_existence_only=mr.n_existence_only,
             )
         )
 
@@ -1545,8 +1602,15 @@ def _run(src: Path, verbose: bool, schema: bool) -> "tuple[int, list[ManifestRes
         console = None
 
     if exit_status == 0:
+        # Flag when any manifest relied on non-hash checks (<null>) — the ✨ becomes a
+        # ⚠️ warning and the qualifier is appended.
+        has_size_only = any(mr.n_size_only for mr in manifest_results)
+        has_existence_only = any(mr.n_existence_only for mr in manifest_results)
+        kinds = [k for k, present in (("size-only", has_size_only), ("existence-only", has_existence_only)) if present]
+        emoji = "⚠️" if kinds else "✨️"
+        suffix = f" (some of them with {' and '.join(kinds)} checks)." if kinds else "."
         log_success(
-            "✨️ All MHL manifests have been successfully verified.",
+            f"{emoji} All MHL manifests have been successfully verified{suffix}",
             console=console,
         )
     else:
