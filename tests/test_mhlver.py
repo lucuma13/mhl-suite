@@ -1358,6 +1358,40 @@ class TestRun:
         assert rc == 0
         assert "successfully verified" in capsys.readouterr().out
 
+    def test_run_success_notes_size_only_checks(self, tmp_path, monkeypatch, capsys):
+        """A clean run that relied on a size-only (<null>) check appends the
+        size-only qualifier to the success summary."""
+        mr = mhlver.ManifestResult(
+            manifest_path=tmp_path / "manifest.mhl",
+            manifest_status="ok",
+            file_results=[mhlver.FileResult(path="a.bin", status="ok", size_only=True)],
+        )
+        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, mr))
+        mhl = tmp_path / "manifest.mhl"
+        mhl.write_text("")
+        rc, _ = mhlver._run(mhl, verbose=False, schema=False)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "⚠️ All MHL manifests have been successfully verified (some of them with size-only checks)." in out
+        assert "✨️" not in out
+
+    def test_run_success_notes_existence_only_checks(self, tmp_path, monkeypatch, capsys):
+        """A clean run that relied on an existence-only (<null>, no <size>) check warns
+        and names the existence-only qualifier distinctly from size-only."""
+        mr = mhlver.ManifestResult(
+            manifest_path=tmp_path / "manifest.mhl",
+            manifest_status="ok",
+            file_results=[mhlver.FileResult(path="a.bin", status="ok", existence_only=True)],
+        )
+        monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, mr))
+        mhl = tmp_path / "manifest.mhl"
+        mhl.write_text("")
+        rc, _ = mhlver._run(mhl, verbose=False, schema=False)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "⚠️ All MHL manifests have been successfully verified (some of them with existence-only checks)." in out
+        assert "✨️" not in out
+
     def test_run_with_single_file_failure(self, tmp_path, monkeypatch, capsys):
         """_run with a file path returns the non-zero exit code on failure."""
         self._stub_verify_item(monkeypatch, 40)
@@ -1783,6 +1817,29 @@ class TestParseClassicMhlOutput:
         results = mhlver._parse_classicmhl_output("[OK] a/b.mxf")
         assert results == [mhlver.FileResult(path="a/b.mxf", status="ok")]
 
+    def test_size_only_ok_line_sets_flag(self):
+        """A null (size-only) verbose OK line is flagged size_only; a hashed one isn't."""
+        out = "[OK] a.mxf  size: 5 (size-only check - no hash stored)\n[OK] b.mxf  xxhash64be: abc123"
+        results = mhlver._parse_classicmhl_output(out)
+        assert results == [
+            mhlver.FileResult(path="a.mxf  size: 5 (size-only check - no hash stored)", status="ok", size_only=True),
+            mhlver.FileResult(path="b.mxf  xxhash64be: abc123", status="ok", size_only=False),
+        ]
+
+    def test_existence_only_ok_line_sets_flag(self):
+        """A null entry with no recorded <size> verifies on existence alone; its OK
+        line is flagged existence_only (not size_only) — neither hash nor size checked."""
+        out = "[OK] a.mxf  (existence-only check — no hash or size stored)"
+        results = mhlver._parse_classicmhl_output(out)
+        assert results == [
+            mhlver.FileResult(
+                path="a.mxf  (existence-only check — no hash or size stored)",
+                status="ok",
+                size_only=False,
+                existence_only=True,
+            ),
+        ]
+
     def test_missing_line(self):
         results = mhlver._parse_classicmhl_output("[ERROR] missing file: gone.mxf")
         assert results == [mhlver.FileResult(path="gone.mxf", status="missing")]
@@ -1951,6 +2008,76 @@ class TestRenderReportDetails:
         # Per-file lines come from _format_file_result.
         assert "gone.mxf" in out
         assert "extra.mxf" in out
+
+    def test_summary_all_size_only_verdict(self):
+        """All-size-only: the global summary is downgraded to a warning while the
+        per-manifest line keeps the plain ✅ VERIFIED prefix."""
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("m.mhl"),
+            manifest_status="ok",
+            file_results=[
+                mhlver.FileResult(path="a.mxf", status="ok", size_only=True),
+                mhlver.FileResult(path="b.mxf", status="ok", size_only=True),
+            ],
+        )
+        out = self._render([mr], exit_status=0)
+        assert "⚠️ VERIFIED WITH WARNINGS (SIZE-ONLY CHECKS)" in out  # global summary
+        assert "✅ VERIFIED (SIZE-ONLY CHECKS)" in out  # per-manifest, unchanged
+        assert "PARTIAL" not in out
+
+    def test_summary_partial_size_only_verdict(self):
+        """Partial size-only: global downgraded to a warning, per-manifest stays plain."""
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("m.mhl"),
+            manifest_status="ok",
+            file_results=[
+                mhlver.FileResult(path="a.mxf", status="ok"),
+                mhlver.FileResult(path="b.mxf", status="ok", size_only=True),
+            ],
+        )
+        out = self._render([mr], exit_status=0)
+        assert "⚠️ VERIFIED WITH WARNINGS (SOME SIZE-ONLY CHECKS)" in out  # global
+        assert "✅ VERIFIED (SOME SIZE-ONLY CHECKS)" in out  # per-manifest
+
+    def test_summary_no_size_only_is_plain_verified(self):
+        """A fully hash-verified manifest keeps the plain VERIFIED verdict."""
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("m.mhl"),
+            manifest_status="ok",
+            file_results=[mhlver.FileResult(path="a.mxf", status="ok")],
+        )
+        out = self._render([mr], exit_status=0)
+        assert "✅ VERIFIED" in out
+        assert "SIZE-ONLY" not in out
+
+    def test_summary_existence_only_verdict_is_labelled_distinctly(self):
+        """An existence-only entry (null, no <size>) downgrades the global verdict to a
+        warning and is labelled EXISTENCE-ONLY — never SIZE-ONLY, since no size was checked."""
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("m.mhl"),
+            manifest_status="ok",
+            file_results=[
+                mhlver.FileResult(path="a.mxf", status="ok"),
+                mhlver.FileResult(path="b.mxf", status="ok", existence_only=True),
+            ],
+        )
+        out = self._render([mr], exit_status=0)
+        assert "⚠️ VERIFIED WITH WARNINGS (SOME EXISTENCE-ONLY CHECKS)" in out  # global
+        assert "✅ VERIFIED (SOME EXISTENCE-ONLY CHECKS)" in out  # per-manifest
+        assert "SIZE-ONLY" not in out
+
+    def test_summary_mixed_size_and_existence_only_names_both(self):
+        """When a run mixes size-only and existence-only entries, the verdict names both."""
+        mr = mhlver.ManifestResult(
+            manifest_path=Path("m.mhl"),
+            manifest_status="ok",
+            file_results=[
+                mhlver.FileResult(path="a.mxf", status="ok", size_only=True),
+                mhlver.FileResult(path="b.mxf", status="ok", existence_only=True),
+            ],
+        )
+        out = self._render([mr], exit_status=0)
+        assert "⚠️ VERIFIED WITH WARNINGS (SIZE-ONLY AND EXISTENCE-ONLY CHECKS)" in out
 
     def test_manifest_level_error_renders_error_line(self):
         """A manifest whose own status is 'error' prints the manifest error and

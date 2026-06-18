@@ -210,14 +210,90 @@ class TestSeal:
         assert "rosé/résumé.txt" in text
         assert "🎬.mp4" in text
 
-    def test_seal_empty_file(self, mhl_cli, tmp_path):
-        """Zero-byte files should still get a hash entry."""
+    def test_seal_aborts_on_empty_file(self, mhl_cli, tmp_path):
+        """A zero-byte file can't be represented (XSD <size> >= 1), so the whole
+        seal is refused, names the offender, and writes no manifest."""
+        make_tree(tmp_path, {"good.bin": b"hello", "empty.bin": b""})
+        rc, _, err = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+
+        assert rc == 2
+        assert "empty.bin" in err
+        assert list(tmp_path.glob("*.mhl")) == []
+
+    def test_seal_null_aborts_on_empty_file(self, mhl_cli, tmp_path):
+        """The empty-file refusal is universal — it applies to a null seal too."""
         make_tree(tmp_path, {"empty.bin": b""})
-        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        rc, _, err = mhl_cli(["seal", str(tmp_path), "-a", "null"])
+
+        assert rc == 2
+        assert "empty.bin" in err
+        assert list(tmp_path.glob("*.mhl")) == []
+
+    def test_seal_null_produces_null_tag(self, mhl_cli, tmp_path):
+        """`-a null` records <null> entries with <size> and no computed digest."""
+        make_tree(tmp_path, {"a.bin": b"hello", "b/c.bin": b"world"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "null"])
 
         assert rc == 0
         text = next(tmp_path.glob("*.mhl")).read_text()
-        assert "d41d8cd98f00b204e9800998ecf8427e" in text
+        assert "<null>" in text or "<null/>" in text
+        assert "<size>" in text
+        assert "<md5>" not in text
+        assert "<sha1>" not in text
+        assert "<xxhash" not in text
+
+    def test_seal_null_manifest_is_xsd_valid(self, mhl_cli, tmp_path):
+        """A null manifest must validate against the bundled XSD (guards the
+        fixed="" / positiveInteger constraints)."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "null"])
+        assert rc == 0
+        mhl = next(tmp_path.glob("*.mhl"))
+        rc, _, _ = mhl_cli(["xsd-schema-check", str(mhl)])
+        assert rc == 0
+
+    def test_seal_null_round_trips_through_verify(self, mhl_cli, tmp_path):
+        """A null manifest verifies clean (existence + size)."""
+        make_tree(tmp_path, {"a.bin": b"hello", "b/c.bin": b"world"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "null"])
+        assert rc == 0
+        mhl = next(tmp_path.glob("*.mhl"))
+        rc, _, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0
+
+    def test_seal_null_verbose_shows_size(self, mhl_cli, tmp_path):
+        """`seal -v -a null` reports each file by size, not a hash."""
+        make_tree(tmp_path, {"a.bin": b"hello"})  # 5 bytes
+        rc, out, _ = mhl_cli(["seal", "-v", "-a", "null", str(tmp_path)])
+        assert rc == 0
+        assert "[OK] a.bin  size: 5" in out
+
+    def test_seal_null_does_not_read_files(self, mhl_cli, tmp_path, monkeypatch):
+        """A null seal records no digest, so it must never read file bytes."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+
+        def _boom(*_a, **_k):
+            raise AssertionError("null seal must not hash files")
+
+        monkeypatch.setattr(simple_mhl, "get_hashes", _boom)
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "null"])
+        assert rc == 0
+
+    def test_seal_null_rejects_combination_one_flag(self, mhl_cli, tmp_path):
+        """`-a null,md5` is contradictory (null is size-only) and rejected."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, err = mhl_cli(["seal", str(tmp_path), "-a", "null,md5"])
+        assert rc == 2
+        assert "null" in err
+        assert list(tmp_path.glob("*.mhl")) == []
+
+    def test_seal_null_rejects_combination_repeated_flags(self, mhl_cli, tmp_path):
+        """`-a null -a md5` (separate flags) is rejected the same way."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        rc, _, err = mhl_cli(["seal", str(tmp_path), "-a", "null", "-a", "md5"])
+        assert rc == 2
+        assert "null" in err
+        assert list(tmp_path.glob("*.mhl")) == []
 
     def test_seal_invalid_algorithm(self, mhl_cli, tmp_path):
         """Unknown algorithm should be rejected by argparse with exit 2."""
@@ -495,7 +571,7 @@ class TestVerifyAlgorithmSelection:
         mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"md5": hashlib.md5(content).hexdigest()})
         rc, out, _ = mhl_cli(["verify", str(mhl), "-a", "sha1"])
         assert rc == 40
-        assert "requested hash sha1 not recorded" in out
+        assert "requested hash sha1 not stored" in out
 
     def test_sealed_multi_format_default_is_clean(self, mhl_cli, tmp_path):
         """End-to-end: a real md5,xxhash seal verifies clean by default and per -a."""
@@ -580,7 +656,7 @@ class TestVerifyAlgorithmSelection:
         mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"xxhash64be": xxhash.xxh64(content).hexdigest()})
         rc, out, _ = mhl_cli(["verify", "-a", "sha1,md5", str(mhl)])
         assert rc == 40
-        assert "requested hashes md5, sha1 not recorded" in out
+        assert "requested hashes md5, sha1 not stored" in out
 
     def test_repeated_flag_checks_each_selected_hash(self, mhl_cli, tmp_path):
         """-a md5 -a sha1 verifies both, order-independent, like -a md5,sha1."""
@@ -1163,7 +1239,7 @@ class TestSchemaCheck:
         )
         rc, _, err = mhl_cli(["xsd-schema-check", str(bad_mhl)])
         assert rc == 10
-        assert "schema error" in err.lower()
+        assert "XSD validation failed" in err
 
 
 # ---------------------------------------------------------------------------
@@ -1551,8 +1627,9 @@ class TestGetXsdPathFallbackPaths:
         assert rc == 40
         assert "no supported hash found" in out
 
-    def test_null_tag_present_file_silent(self, mhl_cli, tmp_path):
-        """A <null> entry for a file that exists must pass silently (exit 0, no output)."""
+    def test_null_tag_present_file_passes_with_size_only_notice(self, mhl_cli, tmp_path):
+        """A <null> entry for a file that exists passes (exit 0) and, even without
+        -v, prints the size-only notice — there are no per-file [OK] lines."""
         (tmp_path / "x.bin").write_bytes(b"x")
         root = etree.Element("hashlist", version="1.1")
         h = etree.SubElement(root, "hash")
@@ -1566,7 +1643,8 @@ class TestGetXsdPathFallbackPaths:
 
         rc, out, _err = mhl_cli(["verify", str(mhl)])
         assert rc == 0
-        assert out == ""
+        assert "Verified with size-only checks (hashes missing from the manifest)." in out
+        assert "[OK]" not in out  # no per-file lines without -v
 
     def test_null_tag_present_file_verbose_shows_ok(self, mhl_cli, tmp_path):
         """A <null> entry for a file that exists must print 'OK:' in verbose mode."""
@@ -1583,7 +1661,27 @@ class TestGetXsdPathFallbackPaths:
 
         rc, out, _ = mhl_cli(["verify", "-v", str(mhl)])
         assert rc == 0
-        assert "[OK] x.bin" in out
+        assert "[OK] x.bin  size: 1 (size-only check - no hash stored)" in out
+        assert "Verified with size-only checks (hashes missing from the manifest)." in out
+
+    def test_null_tag_without_size_reports_existence_only(self, mhl_cli, tmp_path):
+        """A <null> entry that records no <size> passed on existence alone — nothing
+        about its size was checked, so the report line must not quote one."""
+        (tmp_path / "x.bin").write_bytes(b"xxxx")
+        root = etree.Element("hashlist", version="1.1")
+        h = etree.SubElement(root, "hash")
+        etree.SubElement(h, "file").text = "x.bin"
+        etree.SubElement(h, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
+        etree.SubElement(h, "null")
+        mhl = tmp_path / "null_no_size.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, out, _ = mhl_cli(["verify", "-v", str(mhl)])
+        assert rc == 0
+        assert "[OK] x.bin  (existence-only check — no hash or size stored)" in out
+        assert "size:" not in out
+        assert "Verified with existence-only checks (hashes and sizes missing from the manifest)." in out
+        assert "size-only" not in out
 
     def test_null_tag_missing_file_reports_error(self, mhl_cli, tmp_path):
         """A <null> entry for a file that does NOT exist must exit 30."""
@@ -1623,6 +1721,66 @@ class TestGetXsdPathFallbackPaths:
         rc, out, _ = mhl_cli(["verify", str(mhl)])
         assert rc == 40
         assert "[ERROR] size mismatch: x.bin" in out
+
+    def test_mixed_null_and_hash_manifest_shows_partial_notice(self, mhl_cli, tmp_path):
+        """A manifest mixing a hashed entry and a <null> entry prints the partial
+        size-only notice (not the all-size-only one)."""
+        (tmp_path / "a.bin").write_bytes(b"hello")
+        (tmp_path / "b.bin").write_bytes(b"world")
+        root = etree.Element("hashlist", version="1.1")
+        ha = etree.SubElement(root, "hash")
+        etree.SubElement(ha, "file").text = "a.bin"
+        etree.SubElement(ha, "size").text = "5"
+        etree.SubElement(ha, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
+        etree.SubElement(ha, "xxhash64be").text = xxhash.xxh64(b"hello").hexdigest()
+        etree.SubElement(ha, "hashdate").text = "2025-01-01T00:00:00Z"
+        hb = etree.SubElement(root, "hash")
+        etree.SubElement(hb, "file").text = "b.bin"
+        etree.SubElement(hb, "size").text = "5"
+        etree.SubElement(hb, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
+        etree.SubElement(hb, "null")
+        etree.SubElement(hb, "hashdate").text = "2025-01-01T00:00:00Z"
+        mhl = tmp_path / "mixed.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0
+        assert "Partially verified with size-only checks (some hashes missing from the manifest)." in out
+        assert "(hashes missing from the manifest)" not in out  # not the all-null notice
+
+    def test_mixed_size_only_and_existence_only_notice_names_both(self, mhl_cli, tmp_path):
+        """A manifest with one <null>+<size> entry and one <null> entry lacking <size>
+        names both check kinds in the all-null notice."""
+        (tmp_path / "a.bin").write_bytes(b"hello")
+        (tmp_path / "b.bin").write_bytes(b"world")
+        root = etree.Element("hashlist", version="1.1")
+        ha = etree.SubElement(root, "hash")
+        etree.SubElement(ha, "file").text = "a.bin"
+        etree.SubElement(ha, "size").text = "5"
+        etree.SubElement(ha, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
+        etree.SubElement(ha, "null")
+        hb = etree.SubElement(root, "hash")
+        etree.SubElement(hb, "file").text = "b.bin"  # no <size>: existence-only
+        etree.SubElement(hb, "lastmodificationdate").text = "2025-01-01T00:00:00Z"
+        etree.SubElement(hb, "null")
+        mhl = tmp_path / "mixed_null.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+
+        rc, out, _ = mhl_cli(["verify", str(mhl)])
+        assert rc == 0
+        assert (
+            "Verified with size-only and existence-only checks (hashes and some sizes missing from the manifest)."
+            in out
+        )
+
+    def test_hashed_manifest_has_no_size_only_notice(self, mhl_cli, tmp_path):
+        """A normal hash-verified manifest prints no size-only notice."""
+        make_tree(tmp_path, {"a.bin": b"hello"})
+        mhl = seal_helper(mhl_cli, tmp_path, algo="md5")
+        rc, out, _ = mhl_cli(["verify", "-v", str(mhl)])
+        assert rc == 0
+        assert "size-only" not in out
+        assert "No hashes stored" not in out
 
     def test_uncomputable_hash_tag_is_ignored(self, mhl_cli, tmp_path):
         """A hash we can't recompute (e.g. xxhash128) is treated like any unknown
