@@ -817,8 +817,8 @@ def _validate_mhl_path(mhl_file: str) -> None:
         if os.path.basename(os.path.normpath(mhl_file)) == "ascmhl":
             sys.stderr.write(
                 f"Error: '{mhl_file}' is an ASC-MHL v2 package directory.\n"
-                "simple-mhl only handles MHL v1 (.mhl) files. "
-                "You may want to use mhlver to verify ASC-MHL packages.\n"
+                "simple-mhl only handles classic MHL files. "
+                "You may want to use mhlver to verify this ASC-MHL.\n"
             )
         else:
             sys.stderr.write(
@@ -832,6 +832,43 @@ def _validate_mhl_path(mhl_file: str) -> None:
             "The verify command requires a path to an MHL file (e.g. manifest.mhl).\n"
         )
         sys.exit(1)
+
+
+def _is_newer_than_classic(version: str) -> bool:
+    """
+    True if a `version` attribute's major component is newer than classic MHL:
+    classic manifests are 1.x, ASC-MHL is 2.0+. Comparing only the major part
+    means minor differences within v1 don't matter and multi-part future versions
+    like 2.1.1 are handled. An empty or unparsable value is treated as not-newer.
+    """
+    try:
+        return int(version.split(".", maxsplit=1)[0]) > 1
+    except ValueError:
+        return False
+
+
+def _reject_ascmhl_v2(mhl_file: str) -> None:
+    """
+    Reject an ASC-MHL v2 manifest, redirecting the operator to mhlver.
+
+    We detect the v2 root up front: a root namespace of urn:ASC:MHL:v2.0, or a
+    `version` higher than classic MHL's 1.1 (so future 2.x/3.x/10.x are caught
+    even without the namespace). Malformed XML is left to verify()'s main loop,
+    which maps it to exit 20 — so swallow parse errors here.
+    """
+    try:
+        for _, root in etree.iterparse(mhl_file, events=("start",)):
+            ns = etree.QName(root).namespace
+            if ns == "urn:ASC:MHL:v2.0" or _is_newer_than_classic(root.get("version", "")):
+                sys.stderr.write(
+                    f"Error: '{mhl_file}' is an ASC-MHL v2 manifest.\n"
+                    "simple-mhl only handles classic MHL files. "
+                    "You may want to use mhlver to verify this ASC-MHL.\n"
+                )
+                sys.exit(1)
+            break  # the root element is all we need
+    except (etree.XMLSyntaxError, OSError):
+        return
 
 
 # xxHash tags may be big-endian or little-endian hex, and have historically carried a
@@ -1129,6 +1166,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
       70 = both missing and mismatches
     """
     _validate_mhl_path(mhl_file)
+    _reject_ascmhl_v2(mhl_file)
 
     # Resolve the optional -a value to a selection: None (fastest single),
     # _VERIFY_ALL (every recorded hash), or a list of canonical manifest tags.

@@ -1010,6 +1010,17 @@ class TestVerify:
         assert rc == 1
         assert "mhlver" in err.lower()
 
+    def test_verify_ascmhl_v2_manifest(self, mhl_cli):
+        """An ASC-MHL v2 .mhl manifest must be rejected (exit 1, mhlver hint).
+
+        Its <hash> entries use <path> not <file>, so the v1 verify loop would
+        skip them all and falsely exit 0 — this guards that regression.
+        """
+        fixture = Path(__file__).parent / "fixtures" / "silverstack_ascmhl_example.mhl"
+        rc, _, err = mhl_cli(["verify", str(fixture)])
+        assert rc == 1
+        assert "mhlver" in err.lower()
+
     def test_verify_non_mhl_file(self, mhl_cli, tmp_path):
         """Passing a file without a .mhl extension should exit 1 with an error on stderr."""
         bad = tmp_path / "manifest.xml"
