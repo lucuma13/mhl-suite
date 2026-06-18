@@ -107,6 +107,16 @@ ALGO_MAP: dict[str, tuple[Callable[[], _Hasher], str, int]] = cast(
 _NULL_TAG = "null"
 _NULL_RANK = max(rank for *_, rank in ALGO_MAP.values()) + 1
 
+
+def _seal_tag(key: str) -> str:
+    """Manifest element name for a seal algorithm key.
+
+    `null` is a valid seal selection but has no ALGO_MAP entry (it records no
+    digest), so it can't go through the normal ALGO_MAP[key][1] lookup.
+    """
+    return _NULL_TAG if key == _NULL_TAG else ALGO_MAP[key][1]
+
+
 # `verify -a all` sentinel: verify every recorded hash per entry rather than a
 # single fixed format. "all" is reserved — no manifest tag can collide with it.
 _VERIFY_ALL = "all"
@@ -528,15 +538,21 @@ def _resolve_seal_algorithms(algorithms: "list[str]") -> list[str]:
     directly, so we re-validate here and exit 2 on an unknown algorithm. Aliases
     resolving to the same manifest tag (e.g. xxhash/xxh64/xxhash64be) are deduped,
     preserving first-appearance order, so each tag is emitted at most once.
+
+    `null` records no digest, so combining it with any computable algorithm is
+    contradictory and rejected (exit 2).
     """
     for algorithm in algorithms:
-        if algorithm not in ALGO_MAP:
+        if algorithm != _NULL_TAG and algorithm not in ALGO_MAP:
             sys.stderr.write(f"Error: unsupported algorithm '{algorithm}'\n")
             sys.exit(2)
+    if _NULL_TAG in algorithms and any(a != _NULL_TAG for a in algorithms):
+        sys.stderr.write("Error: 'null' cannot be combined with other algorithms\n")
+        sys.exit(2)
     seen_tags: set[str] = set()
     resolved: list[str] = []
     for a in algorithms:
-        tag = ALGO_MAP[a][1]
+        tag = _seal_tag(a)
         if tag not in seen_tags:
             seen_tags.add(tag)
             resolved.append(a)
@@ -563,9 +579,33 @@ def _resolve_output_dir(root: str, output_dir: "str | None") -> str:
     return output_dir
 
 
+def _reject_empty_files(entries: "list[tuple[str, os.stat_result]]", root: str, fd: int, mhl_path: str) -> None:
+    """Abort the seal (exit 2) if any walked entry is a zero-byte file.
+
+    The XSD makes <size> mandatory and xs:positiveInteger (>= 1) — so an empty file
+    (zero bytes) must not be represented in any seal mode. The scan is a pure in-memory
+    pass over the stat info the walk already collected (no extra syscalls), running before
+    any hashing so no compute is wasted. On abort it closes + unlinks the O_EXCL manifest
+    the caller already claimed.
+    """
+    empty = [fp for fp, st in entries if st.st_size == 0]
+    if not empty:
+        return
+    os.close(fd)
+    os.unlink(mhl_path)
+
+    for fp in empty:
+        rel = os.path.relpath(fp, root)
+        filename = rel.replace(os.sep, "/") if os.sep != "/" else rel
+        sys.stderr.write(f"[ERROR] cannot seal empty file: {filename}\n")
+
+    sys.stderr.write("Remove or exclude any empty files and retry.\n")
+    sys.exit(2)
+
+
 def seal(root: str, algorithms: "list[str]", verbose: bool = False, output_dir: "str | None" = None) -> None:
     """
-    Walk `root`, hash every non-hidden file, and write a dated MHL manifest.
+    Walk `root`, hash every non-excluded file, and write an MHL manifest.
 
     `algorithms` is one or more hash-algorithm keys (see ALGO_MAP). When more
     than one is given, every file is read once and all digests are computed from
@@ -653,7 +693,7 @@ def seal(root: str, algorithms: "list[str]", verbose: bool = False, output_dir: 
 
     # xml_tags name the manifest element each digest is written into, in the same
     # order _hash_files_auto returns them.
-    xml_tags = [ALGO_MAP[a][1] for a in algorithms]
+    xml_tags = [_seal_tag(a) for a in algorithms]
 
     def _on_skip(path: str, reason: str, is_warning: bool) -> None:
         rel = os.path.relpath(path, root)
@@ -671,8 +711,20 @@ def seal(root: str, algorithms: "list[str]", verbose: bool = False, output_dir: 
     # alongside it. Concurrency is decided entirely by _hash_files_auto, which
     # measures the storage and stays sequential whenever that's faster.
     entries = list(_iter_files_for_seal(root, mhl_path, on_skip=_on_skip))
+
+    # Refuse zero-byte files before any hashing (see _reject_empty_files); on abort
+    # it releases the O_EXCL manifest fd we claimed above.
+    _reject_empty_files(entries, root, fd, mhl_path)
+
     paths = [fp for fp, _ in entries]
-    digests = _hash_files_auto(paths, [st.st_size for _, st in entries], algorithms)
+    # `null` records no digest, so a null seal reads no bytes — each entry just gets
+    # an empty <null> and the run timestamp. Any other selection hashes for real,
+    # auto-tuning concurrency to the storage.
+    is_null = algorithms == [_NULL_TAG]
+    if is_null:
+        digests: Iterator[tuple[list[str], str]] = (([""], iso_now) for _ in entries)
+    else:
+        digests = _hash_files_auto(paths, [st.st_size for _, st in entries], algorithms)
 
     for (filepath, stat_result), (file_digests, hashdate) in zip(entries, digests, strict=True):
         # Paths are relative to the manifest's own directory (output_dir) so
@@ -699,8 +751,11 @@ def seal(root: str, algorithms: "list[str]", verbose: bool = False, output_dir: 
         for xml_tag, digest in zip(xml_tags, file_digests, strict=True):
             etree.SubElement(h, xml_tag).text = digest
         if verbose:
-            shown = "  ".join(f"{t}: {d}" for t, d in zip(xml_tags, file_digests, strict=True))
-            print(f"[OK] {rel_path_posix}  {shown}")
+            if is_null:
+                print(f"[OK] {rel_path_posix}  size: {stat_result.st_size}")
+            else:
+                shown = "  ".join(f"{t}: {d}" for t, d in zip(xml_tags, file_digests, strict=True))
+                print(f"[OK] {rel_path_posix}  {shown}")
         etree.SubElement(h, "hashdate").text = hashdate
 
     # Update finishdate to reflect actual completion; useful for auditing
@@ -751,7 +806,7 @@ def _validate_mhl_path(mhl_file: str) -> None:
       - path lacks a .mhl extension
     """
     if not os.path.exists(mhl_file):
-        msg = f"Verification Error: {mhl_file} not found\n"
+        msg = f"Error: {mhl_file} not found\n"
         variant = normalization_variant_on_disk(mhl_file)
         if variant is not None:
             shown = variant if os.path.isabs(mhl_file) else os.path.relpath(variant)
@@ -761,19 +816,19 @@ def _validate_mhl_path(mhl_file: str) -> None:
     if os.path.isdir(mhl_file):
         if os.path.basename(os.path.normpath(mhl_file)) == "ascmhl":
             sys.stderr.write(
-                f"Verification Error: '{mhl_file}' is an ASC-MHL v2 package directory.\n"
+                f"Error: '{mhl_file}' is an ASC-MHL v2 package directory.\n"
                 "simple-mhl only handles MHL v1 (.mhl) files. "
                 "You may want to use mhlver to verify ASC-MHL packages.\n"
             )
         else:
             sys.stderr.write(
-                f"Verification Error: '{mhl_file}' is a directory.\n"
+                f"Error: '{mhl_file}' is a directory.\n"
                 "The verify command requires a path to an MHL file (e.g. manifest.mhl).\n"
             )
         sys.exit(1)
     if not mhl_file.lower().endswith(".mhl"):
         sys.stderr.write(
-            f"Verification Error: '{mhl_file}' does not have a .mhl extension.\n"
+            f"Error: '{mhl_file}' does not have a .mhl extension.\n"
             "The verify command requires a path to an MHL file (e.g. manifest.mhl).\n"
         )
         sys.exit(1)
@@ -1056,6 +1111,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
       [OK] <path>  <algo>: <digest>                (verbose only, success)
       [OK] <path>  <algo>: <digest>  <algo>: <digest>   (verbose, -a all, multi-hash)
       [OK] <path>  size: <bytes>                   (verbose only, size-only success)
+      [OK] <path>  (existence-only check — …)      (verbose, <null> entry lacking <size>)
       [ERROR] hash mismatch: <path>                (verify failure)
       [ERROR] size mismatch: <path>                (size/size-only failure)
       [ERROR] missing file: <path>                 (file not on disk)
@@ -1120,6 +1176,15 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
     # Per-call cache of directory listings ({dir: {NFC(name): real_name}}),
     # populated lazily by resolve_on_disk when a literal path lookup misses.
     dir_index: dict[str, dict[str, str]] = {}
+
+    # Track which weak (non-hash) <null> checks were relied on and whether any entry
+    # was hash-verified, so the emit phase can print a one-time notice that names the
+    # kinds used and distinguishes a fully weak-checked manifest from a mixed one. A
+    # <null> with a recorded <size> is a size-only check; one without is existence-only
+    # (neither hash nor size verified) — the two are surfaced distinctly.
+    saw_size_only = False
+    saw_existence_only = False
+    saw_hash = False
 
     # iterparse yields each <hash> element as its closing tag is read, then we
     # free it — peak DOM memory stays proportional to one element, not the whole
@@ -1191,15 +1256,28 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
             # default, the -a override's format, or every recorded hash for -a all.
             nodes, missing = _select_hash_nodes(h, selection)
             if not nodes:
-                if missing:  # requested tag(s) not recorded for this entry
+                if missing:  # requested hash(es) not stored for this entry
                     label = "hash" if len(missing) == 1 else "hashes"
                     results.append(
-                        ("mismatch", f"[ERROR] requested {label} {', '.join(missing)} not recorded: {rel_path}")
+                        ("mismatch", f"[ERROR] requested {label} {', '.join(missing)} not stored: {rel_path}")
                     )
                 else:  # nothing recognised recorded at all
                     results.append(("mismatch", f"[ERROR] no supported hash found: {rel_path}"))
                 h.clear()
                 continue
+
+            # A single <null> node means this entry carries no hash. Flag which kind
+            # of weak check it is now (before the size check) so the notice fires even
+            # when the size mismatches; _select_hash_nodes only returns <null> alone.
+            # A recorded <size> makes it size-only; its absence (mirroring _size_check)
+            # makes it existence-only.
+            is_null_entry = len(nodes) == 1 and nodes[0][1] == _NULL_TAG
+            if is_null_entry:
+                size_el = h.find("{*}size")
+                if size_el is not None and size_el.text is not None:
+                    saw_size_only = True
+                else:
+                    saw_existence_only = True
 
             # --- File size pre-check ------------------------------------
             # Compare the manifest's <size> against the file before spending a
@@ -1213,14 +1291,17 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
 
             # 'null' tag records no digest: existence + size are the whole check.
             # This is the sealer opting one entry into size-only at seal time. Note
-            # the deliberate divergence from -s below: here a missing <size> is fine
+            # the deliberate divergence from -S below: here a missing <size> is fine
             # (file sizes are optional on the XSD, so existence alone passes), whereas
-            # under -s an absent <size> is a failure because the operator explicitly
+            # under -S an absent <size> is a failure because the operator explicitly
             # asked to check sizes and there's nothing to check.
             # _select_hash_nodes only ever returns <null> alone and only when no
             # computable hash is recorded, so a single null node is the whole entry.
-            if len(nodes) == 1 and nodes[0][1] == _NULL_TAG:
-                results.append(("ok", f"{rel_path}  null (no hash stored)"))
+            if is_null_entry:
+                if actual_size is not None:
+                    results.append(("ok", f"{rel_path}  size: {actual_size} (size-only check - no hash stored)"))
+                else:
+                    results.append(("ok", f"{rel_path}  (existence-only check — no hash or size stored)"))
                 h.clear()
                 continue
 
@@ -1228,6 +1309,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
             # here, so the size pre-check above still short-circuits a corrupt-size
             # file first. `checks` pairs each selected format with its stored digest;
             # _verify_hashes computes them all in one read pass.
+            saw_hash = True
             checks = [(name, node.text or "") for node, name in nodes]
             slot = len(results)
             results.append(None)
@@ -1278,6 +1360,30 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
         else:
             mismatches.append(payload)
 
+    # A <null> entry carries no hash — surface that the manifest verified some or all
+    # files on size or existence alone, naming the kinds used so an existence-only pass
+    # (no size checked either) doesn't read as a size-only one. Printed regardless of
+    # -v and before any failure exit, so it shows on success and failure alike.
+    if saw_size_only or saw_existence_only:
+        kinds = []
+        if saw_size_only:
+            kinds.append("size-only")
+        if saw_existence_only:
+            kinds.append("existence-only")
+        kind_phrase = " and ".join(kinds)
+        if saw_hash:
+            print(f"Partially verified with {kind_phrase} checks (some hashes missing from the manifest).")
+        else:
+            # No hashes are stored either way. Sizes are: all present (size-only only),
+            # all absent (existence-only only), or partial (a mix of both null kinds).
+            if not saw_existence_only:
+                stored = "hashes"
+            elif saw_size_only:
+                stored = "hashes and some sizes"
+            else:
+                stored = "hashes and sizes"
+            print(f"Verified with {kind_phrase} checks ({stored} missing from the manifest).")
+
     if missing or mismatches:
         for line in missing:
             print(line)
@@ -1313,15 +1419,15 @@ def validate_schema(mhl_file: str) -> None:
         tree = etree.parse(mhl_file)
         xsd = etree.XMLSchema(etree.parse(xsd_path))
     except etree.XMLSyntaxError as e:
-        sys.stderr.write(f"XML Parsing Error: {e}\n")
+        sys.stderr.write(f"Error: XML parsing failed - {e}\n")
         sys.exit(20)
     except OSError as e:
-        sys.stderr.write(f"File Error: {e}\n")
+        sys.stderr.write(f"Error: file read failed - {e}\n")
         sys.exit(20)
 
     if not xsd.validate(tree):
         for err in xsd.error_log:
-            sys.stderr.write(f"Schema Error: {err.message} (line {err.line})\n")
+            sys.stderr.write(f"Error: XSD validation failed - {err.message} (line {err.line})\n")
         sys.exit(10)
 
 
@@ -1339,7 +1445,7 @@ def _dedup_keys_by_tag(keys: list[str]) -> list[str]:
     out: list[str] = []
     seen_tags: set[str] = set()
     for name in keys:
-        tag = ALGO_MAP[name][1]
+        tag = _seal_tag(name)
         if tag not in seen_tags:
             seen_tags.add(tag)
             out.append(name)
@@ -1351,17 +1457,19 @@ def parse_algorithms(value: str) -> list[str]:
     names into a validated, de-duplicated list of ALGO_MAP keys.
 
     Aliases resolving to the same manifest tag are collapsed (first wins), so
-    `-a xxhash,xxh64` records a single <xxhash64be>. Unknown names raise
-    argparse.ArgumentTypeError, which argparse turns into a usage error (exit 2).
+    `-a xxhash,xxh64` records a single <xxhash64be>. `null` (no digest) is accepted
+    here; its exclusivity is enforced later in _resolve_seal_algorithms.
+    Unknown names raise argparse.ArgumentTypeError, which argparse turns into a
+    usage error (exit 2).
     """
     keys: list[str] = []
     for raw in value.split(","):
         name = raw.strip().lower()
         if not name:
             continue
-        if name not in ALGO_MAP:
+        if name != _NULL_TAG and name not in ALGO_MAP:
             raise argparse.ArgumentTypeError(
-                f"unsupported algorithm '{name}' (choose from {', '.join(sorted(ALGO_MAP))})"
+                f"unsupported algorithm '{name}' (choose from {', '.join(sorted([*ALGO_MAP, _NULL_TAG]))})"
             )
         keys.append(name)
     if not keys:
@@ -1483,7 +1591,7 @@ def main() -> None:
         action="append",
         default=None,
         metavar="ALGO[,ALGO...]",
-        help="hash algorithm: xxhash (default), md5, sha1",
+        help="hash algorithm: xxhash (default), md5, sha1, null (size-only)",
     )
     seal_p.add_argument(
         "-o",
@@ -1533,7 +1641,7 @@ def main() -> None:
     xsd_p.add_argument("path", help="path to MHL file")
     xsd_p.set_defaults(func=lambda a: validate_schema(a.path))
 
-    # --- '-h <algo>' hint -----------------------------------------------------
+    # --- '-h <algo>' (instead of -a <algo>) hint ------------------------------
     # A user who typed 'seal -h xxhash' probably meant '-a xxhash' ('-h' for "hash"
     # instead of -a for "algorithm"). So when '-h' is immediately followed by a
     # valid algorithm name, we prepend a hint to the help menu.
@@ -1544,7 +1652,7 @@ def main() -> None:
         _sub = next((t for t in _argv[:_i] if t in _SUBCOMMANDS), None)
         if _sub not in ("seal", "verify"):
             continue
-        _valid = set(ALGO_MAP) | ({_VERIFY_ALL} if _sub == "verify" else set())
+        _valid = set(ALGO_MAP) | ({_VERIFY_ALL} if _sub == "verify" else {_NULL_TAG})
         _algo = _argv[_i + 1]
         if _algo in _valid:
             print(f"\nDid you mean '-a {_algo}' (-a / --algorithm)?\n", file=sys.stderr)
