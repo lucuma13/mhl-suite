@@ -15,6 +15,7 @@ from hypothesis import HealthCheck, assume, given, settings, strategies
 from lxml import etree
 
 from mhl_suite import mhlver
+from mhl_suite._internal import ascmhl_sizecheck
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -411,9 +412,12 @@ class TestSelectMhlFiles:
             for name in mhl_names:
                 (root / f"{name}.mhl").write_text("")
 
+            # Distinct names can still collide on a case-insensitive filesystem (e.g. APFS),
+            # so compare against the files on disk.
+            on_disk = list(root.glob("*.mhl"))
             selected = mhlver._select_mhl_files(root)
-            assert len(selected) == len(mhl_names), (
-                f"Expected {len(mhl_names)} loose files, got {len(selected)}: {[p.name for p in selected]}"
+            assert len(selected) == len(on_disk), (
+                f"Expected {len(on_disk)} loose files, got {len(selected)}: {[p.name for p in selected]}"
             )
 
     @given(
@@ -801,6 +805,246 @@ class TestAscMhlTotalBytes:
 
 
 # ---------------------------------------------------------------------------
+# TestAscMhlSizeOnly
+# ---------------------------------------------------------------------------
+
+
+_CHAIN_TMPL = (
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<ascmhldirectory xmlns="urn:ASC:MHL:DIRECTORY:v2.0">\n'
+    "{entries}"
+    "</ascmhldirectory>\n"
+)
+_CHAIN_ENTRY = '  <hashlist sequencenr="{seq}">\n    <path>{name}</path>\n    <c4>c4dummy</c4>\n  </hashlist>\n'
+
+
+def _write_chain(ascdir: Path, manifests: list[str]) -> Path:
+    """Write a minimal ascmhl_chain.xml listing *manifests* in sequence order.
+
+    The size-only checker reads this only for generation order; its c4 values are
+    dummies because manifest integrity is gated separately (via `ascmhl info`).
+    """
+    entries = "".join(_CHAIN_ENTRY.format(seq=i + 1, name=name) for i, name in enumerate(manifests))
+    chain = ascdir / "ascmhl_chain.xml"
+    chain.write_text(_CHAIN_TMPL.format(entries=entries))
+    return chain
+
+
+def _build_ascmhl_package(root: Path, files: dict[str, int]) -> Path:
+    """Create an ASC-MHL package under *root* (one generation + chain) and write files.
+
+    *files* maps each relative path to the byte size to create on disk. A single
+    generation (0001.mhl) records each file at that same size and is listed in the
+    chain, so a plain size-only verify passes; tests then mutate disk or manifest
+    to provoke failures. Returns the manifest path.
+    """
+    ascdir = root / "ascmhl"
+    ascdir.mkdir(parents=True)
+    entries = []
+    for rel, size in files.items():
+        disk = root / rel
+        disk.parent.mkdir(parents=True, exist_ok=True)
+        disk.write_bytes(b"x" * size)
+        entries.append({"path": rel, "size": str(size), "action": "original", "digest": "aabbccdd"})
+    body = "".join(_HASH_ENTRY.format(**e) for e in entries)
+    manifest = ascdir / "0001.mhl"
+    manifest.write_text(_MHL_TMPL.format(entries=body))
+    _write_chain(ascdir, ["0001.mhl"])
+    return manifest
+
+
+class TestAscMhlSizeOnly:
+    """The ASC-MHL size-only checker (verify_ascmhl_sizes) and its mhlver wiring
+    (_ascmhl_verify_sizeonly, _verify_ascmhl size_only=True). The helper-level tests
+    call verify_ascmhl_sizes directly (no integrity gate); the wiring tests go through
+    _verify_ascmhl and stub the `ascmhl info` gate via _run_step."""
+
+    def test_all_sizes_match_passes(self, tmp_path):
+        """Every recorded size matches disk -> all ok."""
+        manifest = _build_ascmhl_package(tmp_path / "pkg", {"a.mov": 100, "sub/b.mov": 200})
+        results = ascmhl_sizecheck.verify_ascmhl_sizes(manifest)
+        assert {r.path: r.status for r in results} == {"a.mov": "ok", "sub/b.mov": "ok"}
+
+    def test_size_mismatch_reported(self, tmp_path):
+        """A file whose on-disk size differs from the manifest is a mismatch."""
+        pkg = tmp_path / "pkg"
+        manifest = _build_ascmhl_package(pkg, {"a.mov": 100})
+        (pkg / "a.mov").write_bytes(b"x" * 99)  # shrink on disk
+        (result,) = ascmhl_sizecheck.verify_ascmhl_sizes(manifest)
+        assert result.status == "mismatch"
+        assert "calc size: 99" in result.detail
+        assert "stored size: 100" in result.detail
+
+    def test_missing_file_reported(self, tmp_path):
+        """A recorded file absent from disk is reported missing."""
+        pkg = tmp_path / "pkg"
+        manifest = _build_ascmhl_package(pkg, {"a.mov": 100})
+        (pkg / "a.mov").unlink()
+        (result,) = ascmhl_sizecheck.verify_ascmhl_sizes(manifest)
+        assert result.status == "missing"
+
+    def test_entry_without_size_fails(self, tmp_path):
+        """A recorded file with no stored size fails (mirrors simple-mhl -S)."""
+        pkg = tmp_path / "pkg"
+        ascdir = pkg / "ascmhl"
+        ascdir.mkdir(parents=True)
+        (pkg / "a.mov").write_bytes(b"x" * 100)
+        _write_ascmhl(ascdir / "0001.mhl", [{"size": "", "path": "a.mov", "action": "original", "digest": "aa"}])
+        # _write_ascmhl emits size="" — strip it to model a truly absent attribute.
+        text = (ascdir / "0001.mhl").read_text().replace(' size=""', "")
+        (ascdir / "0001.mhl").write_text(text)
+        _write_chain(ascdir, ["0001.mhl"])
+        (result,) = ascmhl_sizecheck.verify_ascmhl_sizes(ascdir / "0001.mhl")
+        assert result.status == "mismatch"
+        assert result.detail == "no size recorded"
+
+    def test_directory_hashes_are_skipped(self, tmp_path):
+        """<directoryhash> entries carry no size and must not be size-checked."""
+        pkg = tmp_path / "pkg"
+        ascdir = pkg / "ascmhl"
+        ascdir.mkdir(parents=True)
+        (pkg / "a.mov").write_bytes(b"x" * 100)
+        (ascdir / "0001.mhl").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<hashlist version="2.0" xmlns="{_ASCMHL_NAMESPACE}">\n'
+            "  <hashes>\n"
+            "    <hash>\n"
+            '      <path size="100">a.mov</path>\n'
+            '      <xxh64 action="original">aa</xxh64>\n'
+            "    </hash>\n"
+            "    <directoryhash>\n"
+            "      <path>subfolder</path>\n"
+            "      <content/>\n"
+            "      <structure/>\n"
+            "    </directoryhash>\n"
+            "  </hashes>\n"
+            "</hashlist>\n",
+            encoding="utf-8",
+        )
+        _write_chain(ascdir, ["0001.mhl"])
+        results = ascmhl_sizecheck.verify_ascmhl_sizes(ascdir / "0001.mhl")
+        assert [r.path for r in results] == ["a.mov"]  # subfolder skipped
+
+    def test_original_generation_size_wins(self, tmp_path, write_mhl):
+        """A file's expected size is its FIRST-recorded size; later generations don't override."""
+        pkg = tmp_path / "pkg"
+        ascdir = pkg / "ascmhl"
+        ascdir.mkdir(parents=True)
+        write_mhl(ascdir, "0001.mhl", [{"path": "a.mov", "size": "100", "action": "original", "digest": "aa"}])
+        write_mhl(ascdir, "0002.mhl", [{"path": "a.mov", "size": "200", "action": "verified", "digest": "bb"}])
+        _write_chain(ascdir, ["0001.mhl", "0002.mhl"])
+
+        (pkg / "a.mov").write_bytes(b"x" * 100)  # matches the ORIGINAL (gen1) size
+        (result,) = ascmhl_sizecheck.verify_ascmhl_sizes(ascdir / "0002.mhl")
+        assert result.status == "ok"  # checked against 100 (original), not 200 (gen2)
+
+        (pkg / "a.mov").write_bytes(b"x" * 200)  # gen2's size — must NOT be accepted
+        (result,) = ascmhl_sizecheck.verify_ascmhl_sizes(ascdir / "0002.mhl")
+        assert result.status == "mismatch"
+
+    def test_renamed_file_not_reported_missing(self, tmp_path, write_mhl):
+        """A <previousPath> rename drops the old name and carries the original size forward."""
+        pkg = tmp_path / "pkg"
+        ascdir = pkg / "ascmhl"
+        ascdir.mkdir(parents=True)
+        (pkg / "b.mov").write_bytes(b"x" * 100)  # only the renamed (new) name exists on disk
+        write_mhl(ascdir, "0001.mhl", [{"path": "a.mov", "size": "100", "action": "original", "digest": "aa"}])
+        (ascdir / "0002.mhl").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<hashlist version="2.0" xmlns="{_ASCMHL_NAMESPACE}">\n'
+            "  <hashes>\n"
+            "    <hash>\n"
+            '      <path size="100">b.mov</path>\n'
+            "      <previousPath>a.mov</previousPath>\n"
+            '      <xxh64 action="verified">bb</xxh64>\n'
+            "    </hash>\n"
+            "  </hashes>\n"
+            "</hashlist>\n",
+            encoding="utf-8",
+        )
+        _write_chain(ascdir, ["0001.mhl", "0002.mhl"])
+        results = ascmhl_sizecheck.verify_ascmhl_sizes(ascdir / "0002.mhl")
+        assert {r.path: r.status for r in results} == {"b.mov": "ok"}  # a.mov dropped, not missing
+
+    def test_generation_order_follows_chain_not_filename(self, tmp_path, write_mhl):
+        """Original-wins order comes from the chain's sequencenr, even with custom basenames."""
+        pkg = tmp_path / "pkg"
+        ascdir = pkg / "ascmhl"
+        ascdir.mkdir(parents=True)
+        # "later.mhl" sorts before "zzz.mhl" by filename, but the chain says zzz is gen 1.
+        write_mhl(ascdir, "zzz.mhl", [{"path": "a.mov", "size": "100", "action": "original", "digest": "aa"}])
+        write_mhl(ascdir, "later.mhl", [{"path": "a.mov", "size": "200", "action": "verified", "digest": "bb"}])
+        _write_chain(ascdir, ["zzz.mhl", "later.mhl"])  # gen1 = zzz (size 100), gen2 = later
+
+        (pkg / "a.mov").write_bytes(b"x" * 100)  # original (zzz) size
+        (result,) = ascmhl_sizecheck.verify_ascmhl_sizes(ascdir / "later.mhl")
+        assert result.status == "ok"
+
+    def test_traversal_attempt_blocked(self, tmp_path):
+        """A manifest path escaping the package root is blocked, never resolved."""
+        pkg = tmp_path / "pkg"
+        ascdir = pkg / "ascmhl"
+        ascdir.mkdir(parents=True)
+        _write_ascmhl(
+            ascdir / "0001.mhl",
+            [{"size": "100", "path": "../../escape.mov", "action": "original", "digest": "aa"}],
+        )
+        _write_chain(ascdir, ["0001.mhl"])
+        (result,) = ascmhl_sizecheck.verify_ascmhl_sizes(ascdir / "0001.mhl")
+        assert result.status == "mismatch"
+        assert result.detail == "blocked traversal attempt"
+
+    def test_size_phase_runs_when_gate_passes(self, tmp_path, monkeypatch):
+        """`ascmhl info` exit 0 -> size phase runs; OK entries are flagged size-only."""
+        manifest = _build_ascmhl_package(tmp_path / "pkg", {"a.mov": 100})
+        stub_run_step(monkeypatch, 0)  # integrity gate (ascmhl info) passes
+        rc, mr = mhlver._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
+        assert rc == 0
+        assert mr is not None
+        assert mr.manifest_status == "ok"
+        assert mr.n_size_only == 1
+
+    def test_size_mismatch_through_wiring(self, tmp_path, monkeypatch):
+        """With the gate passing, a size mismatch yields exit 10 and a failed manifest."""
+        pkg = tmp_path / "pkg"
+        manifest = _build_ascmhl_package(pkg, {"a.mov": 100})
+        (pkg / "a.mov").write_bytes(b"x" * 50)
+        stub_run_step(monkeypatch, 0)  # gate passes
+        rc, mr = mhlver._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
+        assert rc == 10
+        assert mr is not None
+        assert mr.manifest_status == "failed"
+        assert mr.n_mismatch == 1
+
+    @pytest.mark.parametrize("gate_code", [30, 31, 32, 33])
+    def test_integrity_gate_failure_skips_size_checks(self, tmp_path, monkeypatch, gate_code):
+        """A non-zero `ascmhl info` (tamper/missing chain or manifest) fails before sizes."""
+        manifest = _build_ascmhl_package(tmp_path / "pkg", {"a.mov": 100})
+        stub_run_step(monkeypatch, gate_code, "Modified ASC MHL manifest in history")
+        monkeypatch.setattr(
+            mhlver,
+            "verify_ascmhl_sizes",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("size phase must be skipped")),
+        )
+        rc, mr = mhlver._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
+        assert rc == gate_code
+        assert mr is not None
+        assert mr.manifest_status == "error"
+
+    def test_malformed_manifest_is_manifest_error(self, tmp_path, monkeypatch):
+        """With the gate passing, a manifest that won't parse becomes a manifest error (exit 20)."""
+        ascdir = tmp_path / "pkg" / "ascmhl"
+        ascdir.mkdir(parents=True)
+        (ascdir / "0001.mhl").write_text("<hashlist><not closed")
+        _write_chain(ascdir, ["0001.mhl"])
+        stub_run_step(monkeypatch, 0)  # gate passes; size phase hits the malformed manifest
+        rc, mr = mhlver._verify_ascmhl(ascdir / "0001.mhl", verbose=False, schema=False, size_only=True)
+        assert rc == 20
+        assert mr is not None
+        assert mr.manifest_status == "error"
+
+
+# ---------------------------------------------------------------------------
 # TestAscMhlDispatch
 # ---------------------------------------------------------------------------
 
@@ -1003,6 +1247,33 @@ class TestClassicMhlDispatch:
         assert rc == 20
         assert mr is not None
         assert mr.manifest_status == "error"
+
+    def test_size_only_adds_S_flag_and_flags_results(self, classic_mhl, monkeypatch):
+        """size_only adds -S to the simple-mhl verify command and marks OK results."""
+        seen: dict[str, list[str]] = {}
+
+        def _capture(cmd, cwd=None, **kw):
+            seen["cmd"] = cmd
+            return mhlver.StepResult(exit_code=0, output="[OK] clip.mxf  size: 4170")
+
+        monkeypatch.setattr(mhlver, "_run_step", _capture)
+        rc, mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False, size_only=True)
+        assert rc == 0
+        assert "-S" in seen["cmd"]
+        assert mr is not None
+        assert mr.n_size_only == 1
+
+    def test_no_S_flag_without_size_only(self, classic_mhl, monkeypatch):
+        """Without size_only the -S flag is not passed to simple-mhl."""
+        seen: dict[str, list[str]] = {}
+
+        def _capture(cmd, cwd=None, **kw):
+            seen["cmd"] = cmd
+            return mhlver.StepResult(exit_code=0, output="")
+
+        monkeypatch.setattr(mhlver, "_run_step", _capture)
+        mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
+        assert "-S" not in seen["cmd"]
 
     def test_verify_classicmhl_dispatch_table_covers_all_known_codes(self):
         """_CLASSICMHL_RESULTS must cover every exit code simple-mhl can emit."""
@@ -1703,7 +1974,7 @@ class TestMain:
         """Omitting the path argument defaults to the current directory."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema):
+        def _stub_run(src, verbose, schema, size_only=False):
             called_with["src"] = src
             return 0, []
 
@@ -1717,7 +1988,7 @@ class TestMain:
         """An explicit path is resolved and forwarded to _run."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema):
+        def _stub_run(src, verbose, schema, size_only=False):
             called_with["src"] = src
             return 0, []
 
@@ -1732,7 +2003,7 @@ class TestMain:
         """--verbose is passed through to _run."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema):
+        def _stub_run(src, verbose, schema, size_only=False):
             called_with["verbose"] = verbose
             return 0, []
 
@@ -1746,7 +2017,7 @@ class TestMain:
         """--xsd-schema-check is passed through to _run."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema):
+        def _stub_run(src, verbose, schema, size_only=False):
             called_with["schema"] = schema
             return 0, []
 

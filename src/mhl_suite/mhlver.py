@@ -14,6 +14,12 @@
 # the manifest. Each backend's exit code is translated into a human-readable
 # status line via dispatch tables (see _CLASSICMHL_RESULTS, _ASCMHL_VERIFY_RESULTS).
 #
+# With -S/--size-only the files are size-checked only (no hashing): for classic
+# manifests it passes -S to `simple-mhl verify`, while for ASC-MHL  — first gates
+# on manifest integrity via `ascmhl info` (which verifies the chain and each
+# manifest's hash without hashing media), then compares sizes in-process via
+# _internal.ascmhl_sizecheck (since ascmhl does not check sizes).
+#
 # Exit code policy: the first non-zero backend exit code becomes mhlver's
 # exit code, so an automation script gets a meaningful signal even when many
 # rolls verify together.
@@ -40,6 +46,7 @@ from rich.live import Live
 from rich.progress import BarColumn, Progress, TextColumn
 from rich.text import Text
 
+from mhl_suite._internal.ascmhl_sizecheck import verify_ascmhl_sizes
 from mhl_suite._internal.hostinfo import friendly_hostname
 from mhl_suite._internal.unicodepaths import normalization_variant_on_disk
 
@@ -711,6 +718,7 @@ def verify_item(
     target: Path,
     verbose: bool,
     schema: bool,
+    size_only: bool = False,
     console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
@@ -722,6 +730,10 @@ def verify_item(
     belongs to an ASC-MHL package; otherwise it's classic MHL. This matches
     the convention used by ascmhl-debug, where manifests live at
     `<root>/ascmhl/manifest.mhl`.
+
+    `size_only` requests a fast size-only check. For classic MHL it passes -S to
+    `simple-mhl verify`; for ASC-MHL it uses an in-process parser since ascmhl does
+    not check sizes.
 
     `progress_active` suppresses per-manifest success lines on the terminal
     when a rich progress bar is already communicating progress visually.
@@ -735,6 +747,7 @@ def verify_item(
             target,
             verbose,
             schema,
+            size_only=size_only,
             console=console,
             progress_active=progress_active,
             poll_event=poll_event,
@@ -743,6 +756,7 @@ def verify_item(
         target,
         verbose,
         schema,
+        size_only=size_only,
         console=console,
         progress_active=progress_active,
         poll_event=poll_event,
@@ -756,6 +770,7 @@ def _verify_classicmhl(
     target: Path,
     verbose: bool,
     schema: bool,
+    size_only: bool = False,
     console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
@@ -777,10 +792,14 @@ def _verify_classicmhl(
 
     sub = "xsd-schema-check" if schema else "verify"
     cmd = [cmd_path, sub, str(target)]
+    # -S asks simple-mhl to check sizes only (skip hashing); irrelevant to schema-check.
+    if size_only and not schema:
+        cmd.append("-S")
 
     if schema:
         # xsd-schema-check has no per-file -v output and nothing to parse for the
-        # report — a single plain run is all that's needed.
+        # report — a single plain run is all that's needed. (-S never reaches schema
+        # mode: it's CLI-exclusive with -s, and the -S flag is gated on `not schema`.)
         _verbose_announce(cmd, cwd=None, verbose=verbose, console=console)
         step = _run_step(cmd, on_poll=poll_event)
         step_terminal = step
@@ -822,6 +841,12 @@ def _verify_classicmhl(
         return step.exit_code, None
 
     file_results = _parse_classicmhl_output(step.output)
+    # Under -S every verified entry was checked by size alone, so flag each OK
+    # result accordingly.
+    if size_only:
+        for fr in file_results:
+            if fr.status == "ok":
+                fr.size_only = True
     if step.exit_code == 0:
         mstatus = "ok"
     elif file_results:
@@ -846,11 +871,18 @@ def _verify_ascmhl(
     target: Path,
     verbose: bool,
     schema: bool,
+    size_only: bool = False,
     console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
     """Run ascmhl-debug against an ASC-MHL manifest and translate the result."""
+    # Size-only is handled in-process (ascmhl does not check sizes).
+    if size_only and not schema:
+        return _ascmhl_verify_sizeonly(
+            target, verbose, console=console, progress_active=progress_active, poll_event=poll_event
+        )
+
     cmd_path = get_command_path("ascmhl-debug")
     if not cmd_path:
         msg, sev = _ASCMHL_VERIFY_RESULTS[127]
@@ -1017,6 +1049,104 @@ def _ascmhl_verify(
     return step_terminal.exit_code, mr
 
 
+def _ascmhl_verify_sizeonly(
+    target: Path,
+    verbose: bool,
+    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    progress_active: bool = False,
+    poll_event: "threading.Event | None" = None,
+) -> "tuple[int, ManifestResult]":
+    """
+    Size-only verify an ASC-MHL package, gating on manifest integrity first.
+
+    Two phases:
+
+      1. Integrity gate — `ascmhl info` loads the history, which verifies the chain
+         file and every generation manifest's own hash without hashing any media.
+         This catches a tampered or missing manifest/chain before we trust their
+         contents.
+      2. Size phase — ascmhl does not check file sizes, so we use our own
+         'ascmhl_sizecheck.py': verify_ascmhl_sizes parses the manifests and compares
+         each recorded <path size> against the file on disk, reading no file bytes.
+    """
+    package_dir = target.parent.parent
+
+    # --- Phase 1: manifest-integrity gate ---
+    info_cmd = ["ascmhl", "info", str(package_dir)]
+    _verbose_announce(info_cmd, cwd=None, verbose=verbose, console=console)
+    info_step = _run_step(info_cmd, on_poll=poll_event)
+    if info_step.exit_code != 0:
+        template, _sev = _ASCMHL_VERIFY_RESULTS.get(
+            info_step.exit_code,
+            ("🚨 ASC-MHL manifest integrity check failed: {target}", "error"),
+        )
+        _report_via_table(
+            _ASCMHL_VERIFY_RESULTS,
+            info_step.exit_code,
+            str(package_dir),
+            info_step.output,
+            show_backend_output=True,
+            show_status_on_terminal=not progress_active,
+            console=console,
+        )
+        mr = ManifestResult(
+            manifest_path=target,
+            manifest_status="error",
+            manifest_error=template.format(target=package_dir),
+        )
+        return info_step.exit_code, mr
+
+    # --- Phase 2: size checks (manifests proven intact above) ---
+    try:
+        size_results = verify_ascmhl_sizes(target)
+    except (etree.XMLSyntaxError, OSError):
+        msg = f"🚨 Malformed XML: {package_dir} cannot be parsed."
+        log_error(msg, console=console)
+        mr = ManifestResult(manifest_path=target, manifest_status="error", manifest_error=msg)
+        return 20, mr
+
+    # Translate to FileResult, flagging every OK entry as size-only so the report
+    # summary reads "VERIFIED (SIZE-ONLY CHECKS)". The OK path carries its size in
+    # the displayed path, matching the output from simple-mhl: "<path>  size: <n>" form.
+    file_results: list[FileResult] = []
+    out_lines: list[str] = []
+    for r in size_results:
+        if r.status == "ok":
+            file_results.append(FileResult(path=f"{r.path}  {r.detail}", status="ok", size_only=True))
+            if verbose:
+                out_lines.append(f"[OK] {r.path}  {r.detail}")
+        elif r.status == "missing":
+            file_results.append(FileResult(path=r.path, status="missing"))
+            out_lines.append(f"[ERROR] missing file: {r.path}")
+        else:  # mismatch — detail is "size mismatch: …", "no size recorded", or "blocked …"
+            file_results.append(FileResult(path=r.path, status="mismatch", detail=r.detail))
+            if ": " in r.detail:
+                label, paren = r.detail.split(": ", 1)
+                out_lines.append(f"[ERROR] {label}: {r.path}")
+                if verbose:
+                    out_lines.append(f"        ({paren})")
+            else:
+                out_lines.append(f"[ERROR] {r.detail}: {r.path}")
+
+    code = 0 if all(fr.status == "ok" for fr in file_results) else 10
+    _report_via_table(
+        _ASCMHL_VERIFY_RESULTS,
+        code,
+        str(package_dir),
+        "\n".join(out_lines),
+        show_backend_output=True,
+        show_status_on_terminal=not progress_active,
+        console=console,
+    )
+
+    mr = ManifestResult(
+        manifest_path=target,
+        manifest_status="ok" if code == 0 else "failed",
+        file_results=file_results,
+    )
+    return code, mr
+
+
 # -----------------------------------------------------------------------------
 # Filesystem walking
 # -----------------------------------------------------------------------------
@@ -1153,6 +1283,19 @@ def _ascmhl_total_bytes(latest_mhl: Path) -> int:
         except (OSError, ValueError, etree.XMLSyntaxError):
             pass  # skip unreadable generation files; others still count
     return total
+
+
+def _manifest_weights(mhl_files: "list[Path]", size_only: bool) -> "dict[Path, int]":
+    """Per-manifest progress-bar weights: byte volume normally, count under -S.
+
+    Size-only reads no file bytes (one stat() per entry), so byte weights are
+    meaningless — every manifest finishes near-instantly. Weighting each manifest
+    equally then makes the bar track manifest count instead of a byte total that
+    would jump straight to full.
+    """
+    if size_only:
+        return dict.fromkeys(mhl_files, 1)
+    return {f: (_ascmhl_total_bytes(f) if "ascmhl" in f.parts else _mhl_total_bytes(f)) for f in mhl_files}
 
 
 def _build_live() -> "tuple[Live, Progress, Text, Console]":
@@ -1458,6 +1601,12 @@ def main() -> None:
         help="validate XML Schema Definition",
     )
     parser.add_argument(
+        "-S",
+        "--size-only",
+        action="store_true",
+        help="check file sizes only (skip hashing)",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -1485,22 +1634,28 @@ def main() -> None:
         log_error(msg)
         sys.exit(2)
 
+    # -s (schema-check) and -S (size-only) are mutually exclusive modes
+    if args.xsd_schema_check and args.size_only:
+        msg = "Error: the XSD schema check (-s) and the size-only check (-S) cannot be executed together"
+        log_error(msg)
+        sys.exit(2)
+
     # Open the report file if requested. Using a context manager means we
     # don't have to remember to close it on every exit path.
     if args.report:
         started_at = datetime.now().astimezone()
         with _open_report(src) as (rf, rp):
-            exit_status, manifest_results = _run(src, args.verbose, args.xsd_schema_check)
+            exit_status, manifest_results = _run(src, args.verbose, args.xsd_schema_check, args.size_only)
             finished_at = datetime.now().astimezone()
             _render_report(rf, src, started_at, finished_at, manifest_results, exit_status)
         print(f"report saved to: {rp}")
     else:
-        exit_status, _ = _run(src, args.verbose, args.xsd_schema_check)
+        exit_status, _ = _run(src, args.verbose, args.xsd_schema_check, args.size_only)
 
     sys.exit(exit_status)
 
 
-def _run(src: Path, verbose: bool, schema: bool) -> "tuple[int, list[ManifestResult]]":
+def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tuple[int, list[ManifestResult]]":
     """
     Execute the verification pass on `src`.
 
@@ -1532,7 +1687,7 @@ def _run(src: Path, verbose: bool, schema: bool) -> "tuple[int, list[ManifestRes
     manifest_results: list[ManifestResult] = []
 
     if src.is_file():
-        code, mr = verify_item(src, verbose, schema)
+        code, mr = verify_item(src, verbose, schema, size_only)
         exit_status = code
         if mr is not None:
             manifest_results.append(mr)
@@ -1554,7 +1709,7 @@ def _run(src: Path, verbose: bool, schema: bool) -> "tuple[int, list[ManifestRes
             # <directoryhash> entries, so a low/zero weight can be legitimate —
             # never an error, just a less precise ETA. Verify, not this
             # pre-read, is the source of truth; the weight only paces the bar.
-            weights = {f: (_ascmhl_total_bytes(f) if "ascmhl" in f.parts else _mhl_total_bytes(f)) for f in mhl_files}
+            weights = _manifest_weights(mhl_files, size_only)
 
             live, progress, label, stdout_console = _build_live()
             total_n = len(mhl_files)
@@ -1595,6 +1750,7 @@ def _run(src: Path, verbose: bool, schema: bool) -> "tuple[int, list[ManifestRes
                         f,
                         verbose,
                         schema,
+                        size_only,
                         console=con,
                         poll_event=poll_event,
                     )
@@ -1613,7 +1769,7 @@ def _run(src: Path, verbose: bool, schema: bool) -> "tuple[int, list[ManifestRes
             console = stdout_console
         else:
             for f in mhl_files:
-                code, mr = verify_item(f, verbose, schema)
+                code, mr = verify_item(f, verbose, schema, size_only)
                 if mr is not None:
                     manifest_results.append(mr)
                 if exit_status == 0:
