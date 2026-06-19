@@ -42,20 +42,26 @@ Verify MHL files (both classic and ASC-MHL):
 
 ```bash
 mhlver path/to/file.mhl
-mhlver path/to/directory/
-mhlver                                     # verify current directory
+mhlver path/to/directory/                  # every manifest found
+mhlver                                     # current directory
 ```
 
-Verify directory and create a log report:
+Create a report after verification:
 ```bash
 mhlver --report path/to/directory/
+```
+
+Quick size-only check:
+```bash
+mhlver --size-only path/to/directory/
 ```
 
 Seal a directory:
 
 ```bash
 simple-mhl seal path/to/directory/
-simple-mhl seal -a md5,xxhash path/to/directory/   # use both MD5 and xxhash algorithms
+simple-mhl seal -a md5 -a xxhash path/to/directory/        # use both MD5 and xxhash algorithms
+simple-mhl seal -o path/to/output/mhl path/to/directory/   # write the MHL into a parent directory
 ```
 
 Validate XML Schema Definition of a file:
