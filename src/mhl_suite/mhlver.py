@@ -1592,19 +1592,19 @@ def main() -> None:
         "-r",
         "--report",
         action="store_true",
-        help="export a report log to the target directory",
-    )
-    parser.add_argument(
-        "-s",
-        "--xsd-schema-check",
-        action="store_true",
-        help="validate XML Schema Definition",
+        help="export a verification report to the target directory",
     )
     parser.add_argument(
         "-S",
         "--size-only",
         action="store_true",
         help="check file sizes only (skip hashing)",
+    )
+    parser.add_argument(
+        "-s",
+        "--xsd-schema-check",
+        action="store_true",
+        help="validate XML Schema Definition",
     )
     parser.add_argument(
         "-v",
@@ -1640,26 +1640,111 @@ def main() -> None:
         log_error(msg)
         sys.exit(2)
 
-    # Open the report file if requested. Using a context manager means we
-    # don't have to remember to close it on every exit path.
+    # Verification reports are meaningless with -s (schema-check) mode
+    if args.xsd_schema_check and args.report:
+        print("\nDid you mean 'mhlver -S -r'?\n")
+        msg = "Error: reports (-r) for XSD schema checks (-s) are not supported"
+        log_error(msg)
+        sys.exit(2)
+
+    # Write a report only if requested *and* at least one manifest was found.
+    # Verify first, then open the file — opening it up front would leave an
+    # empty log behind when a directory turns up no MHL files.
     if args.report:
         started_at = datetime.now().astimezone()
-        with _open_report(src) as (rf, rp):
-            exit_status, manifest_results = _run(src, args.verbose, args.xsd_schema_check, args.size_only)
-            finished_at = datetime.now().astimezone()
-            _render_report(rf, src, started_at, finished_at, manifest_results, exit_status)
-        print(f"report saved to: {rp}")
+        exit_status, manifest_results, found = _run(src, args.verbose, args.xsd_schema_check, args.size_only)
+        finished_at = datetime.now().astimezone()
+        if found:
+            with _open_report(src) as (rf, rp):
+                _render_report(rf, src, started_at, finished_at, manifest_results, exit_status)
+            print(f"report saved to: {rp}")
     else:
-        exit_status, _ = _run(src, args.verbose, args.xsd_schema_check, args.size_only)
+        exit_status, _, _ = _run(src, args.verbose, args.xsd_schema_check, args.size_only)
 
     sys.exit(exit_status)
 
 
-def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tuple[int, list[ManifestResult]]":
+def _verify_dir_with_progress(
+    mhl_files: "list[Path]",
+    weights: "dict[Path, int]",
+    verbose: bool,
+    schema: bool,
+    size_only: bool,
+) -> "tuple[int, list[ManifestResult], object]":
+    """
+    Verify each manifest in `mhl_files` with a live rich progress bar.
+
+    Returns (exit_status, manifest_results, console). exit_status follows the
+    first-non-zero rule (see _run); console is the stdout-bound rich Console
+    that callers reuse for the post-scan summary line so it lands below the bar.
+    """
+    exit_status = 0
+    manifest_results: list[ManifestResult] = []
+
+    live, progress, label, stdout_console = _build_live()
+    total_n = len(mhl_files)
+    total_bytes = sum(weights.values())
+    bar_task = progress.add_task(" ", total=total_bytes, done=0, total_n=total_n)
+    # poll_event is set() every ~100 ms while a subprocess runs,
+    # causing the Live display to refresh and animate the bar.
+    # stop_event is a separate signal used only to tell the refresh
+    # thread to exit — keeping it distinct from poll_event avoids a
+    # race where the thread clears the stop signal after it is set:
+    #
+    #   main: poll_event.set()        <- shutdown signal
+    #   thread: poll_event.wait() returns
+    #   thread: poll_event.clear()    <- signal gone, loop continues
+    #   main: refresh_thread.join()   <- blocks forever
+    #
+    # With a dedicated stop_event that is never cleared, the thread
+    # sees it reliably on the next loop iteration.
+    poll_event = threading.Event()
+    stop_event = threading.Event()
+
+    def _refresh_on_poll() -> None:
+        """Background thread: refresh Live display on each poll tick."""
+        while not stop_event.is_set():
+            live.refresh()
+            poll_event.wait(timeout=0.1)
+            poll_event.clear()
+
+    with live:
+        con = stdout_console
+        refresh_thread = threading.Thread(target=_refresh_on_poll, daemon=True)
+        refresh_thread.start()
+        for i, f in enumerate(mhl_files):
+            label.plain = ""
+            label.append("🔎 Verifying… ", style="bold")
+            label.append(f.name, style="cyan")
+            code, mr = verify_item(
+                f,
+                verbose,
+                schema,
+                size_only,
+                console=con,
+                poll_event=poll_event,
+            )
+            if mr is not None:
+                manifest_results.append(mr)
+            progress.advance(bar_task, weights[f])
+            progress.update(bar_task, done=i + 1)
+            if exit_status == 0:
+                exit_status = code
+        # Signal refresh thread to stop and wait for it to exit.
+        stop_event.set()
+        refresh_thread.join()
+        label.plain = ""
+        label.append("🔎 Verifying… ", style="bold")
+        label.append("done", style="green")
+
+    return exit_status, manifest_results, stdout_console
+
+
+def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tuple[int, list[ManifestResult], bool]":
     """
     Execute the verification pass on `src`.
 
-    Returns (exit_status, manifest_results).
+    Returns (exit_status, manifest_results, found).
 
     exit_status: 0 if every MHL verified, otherwise the first non-zero code
     encountered in walk order. The first-non-zero rule gives automation a
@@ -1669,6 +1754,12 @@ def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tu
     manifest_results: collected per-manifest outcomes used to render the
     structured report when --report is active. Always populated regardless of
     whether --report was requested (cheap to collect, free to discard).
+
+    found: True if at least one manifest was located to verify. False only
+    when a directory scan turns up no MHL files (or src is neither file nor
+    directory). manifest_results can't stand in for this: schema-check mode
+    produces no per-manifest result even when manifests were found, so the
+    report decision needs an explicit signal.
 
     Note: because the exit code is the *first* failure rather than the
     *worst*, a later more-severe failure (e.g. exit 40 hash mismatch) can
@@ -1685,8 +1776,10 @@ def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tu
     """
     exit_status = 0
     manifest_results: list[ManifestResult] = []
+    found = False
 
     if src.is_file():
+        found = True
         code, mr = verify_item(src, verbose, schema, size_only)
         exit_status = code
         if mr is not None:
@@ -1695,6 +1788,7 @@ def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tu
 
     elif src.is_dir():
         mhl_files = _select_mhl_files(src)
+        found = bool(mhl_files)
         if not mhl_files:
             log_warning(f"No MHL files found under {src}")
 
@@ -1710,63 +1804,9 @@ def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tu
             # never an error, just a less precise ETA. Verify, not this
             # pre-read, is the source of truth; the weight only paces the bar.
             weights = _manifest_weights(mhl_files, size_only)
-
-            live, progress, label, stdout_console = _build_live()
-            total_n = len(mhl_files)
-            total_bytes = sum(weights.values())
-            bar_task = progress.add_task(" ", total=total_bytes, done=0, total_n=total_n)
-            # poll_event is set() every ~100 ms while a subprocess runs,
-            # causing the Live display to refresh and animate the bar.
-            # stop_event is a separate signal used only to tell the refresh
-            # thread to exit — keeping it distinct from poll_event avoids a
-            # race where the thread clears the stop signal after it is set:
-            #
-            #   main: poll_event.set()        <- shutdown signal
-            #   thread: poll_event.wait() returns
-            #   thread: poll_event.clear()    <- signal gone, loop continues
-            #   main: refresh_thread.join()   <- blocks forever
-            #
-            # With a dedicated stop_event that is never cleared, the thread
-            # sees it reliably on the next loop iteration.
-            poll_event = threading.Event()
-            stop_event = threading.Event()
-
-            def _refresh_on_poll() -> None:
-                """Background thread: refresh Live display on each poll tick."""
-                while not stop_event.is_set():
-                    live.refresh()
-                    poll_event.wait(timeout=0.1)
-                    poll_event.clear()
-
-            with live:
-                con = stdout_console
-                refresh_thread = threading.Thread(target=_refresh_on_poll, daemon=True)
-                refresh_thread.start()
-                for i, f in enumerate(mhl_files):
-                    label.plain = ""
-                    label.append("🔎 Verifying… ", style="bold")
-                    label.append(f.name, style="cyan")
-                    code, mr = verify_item(
-                        f,
-                        verbose,
-                        schema,
-                        size_only,
-                        console=con,
-                        poll_event=poll_event,
-                    )
-                    if mr is not None:
-                        manifest_results.append(mr)
-                    progress.advance(bar_task, weights[f])
-                    progress.update(bar_task, done=i + 1)
-                    if exit_status == 0:
-                        exit_status = code
-                # Signal refresh thread to stop and wait for it to exit.
-                stop_event.set()
-                refresh_thread.join()
-                label.plain = ""
-                label.append("🔎 Verifying… ", style="bold")
-                label.append("done", style="green")
-            console = stdout_console
+            exit_status, manifest_results, console = _verify_dir_with_progress(
+                mhl_files, weights, verbose, schema, size_only
+            )
         else:
             for f in mhl_files:
                 code, mr = verify_item(f, verbose, schema, size_only)
@@ -1779,7 +1819,11 @@ def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tu
     else:
         console = None
 
-    if exit_status == 0:
+    # With no manifests found, the "No MHL files found" warning already stands
+    # on its own — there's nothing to declare verified or failed.
+    if not found:
+        pass
+    elif exit_status == 0:
         # Flag when any manifest relied on non-hash checks (<null>) — the ✨ becomes a
         # ⚠️ warning and the qualifier is appended.
         has_size_only = any(mr.n_size_only for mr in manifest_results)
@@ -1796,7 +1840,7 @@ def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tu
             "❌ Verification failed for some of the MHL files. See details above.",
             console=console,
         )
-    return exit_status, manifest_results
+    return exit_status, manifest_results, found
 
 
 if __name__ == "__main__":  # pragma: no cover

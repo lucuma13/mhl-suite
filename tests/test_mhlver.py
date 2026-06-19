@@ -1646,7 +1646,7 @@ class TestRun:
         self._stub_verify_item(monkeypatch, 0)
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
-        rc, _ = mhlver._run(mhl, verbose=False, schema=False)
+        rc, _, _ = mhlver._run(mhl, verbose=False, schema=False)
         assert rc == 0
         assert "successfully verified" in capsys.readouterr().out
 
@@ -1661,7 +1661,7 @@ class TestRun:
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, mr))
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
-        rc, _ = mhlver._run(mhl, verbose=False, schema=False)
+        rc, _, _ = mhlver._run(mhl, verbose=False, schema=False)
         assert rc == 0
         out = capsys.readouterr().out
         assert "⚠️ All MHL manifests have been successfully verified (some of them with size-only checks)." in out
@@ -1678,7 +1678,7 @@ class TestRun:
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, mr))
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
-        rc, _ = mhlver._run(mhl, verbose=False, schema=False)
+        rc, _, _ = mhlver._run(mhl, verbose=False, schema=False)
         assert rc == 0
         out = capsys.readouterr().out
         assert "⚠️ All MHL manifests have been successfully verified (some of them with existence-only checks)." in out
@@ -1689,7 +1689,7 @@ class TestRun:
         self._stub_verify_item(monkeypatch, 40)
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
-        rc, _ = mhlver._run(mhl, verbose=False, schema=False)
+        rc, _, _ = mhlver._run(mhl, verbose=False, schema=False)
         assert rc == 40
         assert "failed" in capsys.readouterr().err.lower()
 
@@ -1697,10 +1697,14 @@ class TestRun:
         """_run on a dir with no MHL files logs a warning and returns 0."""
         # Force use_progress=False so we stay in the simple branch.
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
-        rc, _ = mhlver._run(tmp_path, verbose=False, schema=False)
+        rc, _, found = mhlver._run(tmp_path, verbose=False, schema=False)
         assert rc == 0
+        assert found is False
         captured = capsys.readouterr()
-        assert "no mhl" in (captured.out + captured.err).lower()
+        out = captured.out + captured.err
+        assert "no mhl" in out.lower()
+        # No manifests found means nothing to declare verified.
+        assert "successfully verified" not in out
 
     def test_run_directory_first_failure_wins(self, tmp_path, monkeypatch, capsys):
         """First non-zero exit code is returned; subsequent failures don't override."""
@@ -1709,7 +1713,7 @@ class TestRun:
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (next(results), None))
         for name in ["a.mhl", "b.mhl"]:
             (tmp_path / name).write_text("")
-        rc, _ = mhlver._run(tmp_path, verbose=False, schema=False)
+        rc, _, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         assert rc == 30
 
     def test_run_directory_all_pass(self, tmp_path, monkeypatch, capsys):
@@ -1718,7 +1722,7 @@ class TestRun:
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, None))
         (tmp_path / "a.mhl").write_text("")
         (tmp_path / "b.mhl").write_text("")
-        rc, _ = mhlver._run(tmp_path, verbose=False, schema=False)
+        rc, _, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         assert rc == 0
         assert "successfully verified" in capsys.readouterr().out
 
@@ -1730,7 +1734,7 @@ class TestRun:
         pipe = tmp_path / "fifo.mhl"
         os.mkfifo(pipe)
         # verify_item is never called — exit_status stays 0.
-        rc, _ = mhlver._run(pipe, verbose=False, schema=False)
+        rc, _, _ = mhlver._run(pipe, verbose=False, schema=False)
         assert rc == 0
 
     def test_run_writes_structured_report(self, tmp_path, monkeypatch):
@@ -1739,7 +1743,7 @@ class TestRun:
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: False)
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, None))
         (tmp_path / "a.mhl").write_text("")
-        rc, mrs = mhlver._run(tmp_path, verbose=False, schema=False)
+        rc, mrs, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         buf = io.StringIO()
         mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mhlver.datetime.now(), mrs, rc)
         report = buf.getvalue()
@@ -1900,7 +1904,7 @@ class TestRunWithProgress:
         monkeypatch.setattr(mhlver, "verify_item", _counting_verify)
         (tmp_path / "a.mhl").write_text("")
         (tmp_path / "b.mhl").write_text("")
-        rc, _ = mhlver._run(tmp_path, verbose=False, schema=False)
+        rc, _, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         assert rc == 0
         assert call_count == 2
 
@@ -1912,7 +1916,7 @@ class TestRunWithProgress:
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: next(results))
         (tmp_path / "a.mhl").write_text("")
         (tmp_path / "b.mhl").write_text("")
-        rc, _ = mhlver._run(tmp_path, verbose=False, schema=False)
+        rc, _, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         assert rc == 30
 
     def test_progress_branch_advances_bar_per_manifest(self, tmp_path, monkeypatch):
@@ -1932,7 +1936,7 @@ class TestRunWithProgress:
         self._stub_build_live(monkeypatch)
         monkeypatch.setattr(mhlver, "verify_item", lambda *a, **kw: (0, None))
         (tmp_path / "a.mhl").write_text("")
-        rc, mrs = mhlver._run(tmp_path, verbose=False, schema=False)
+        rc, mrs, _ = mhlver._run(tmp_path, verbose=False, schema=False)
         buf = io.StringIO()
         mhlver._render_report(buf, tmp_path, mhlver.datetime.now(), mhlver.datetime.now(), mrs, rc)
         assert "---" in buf.getvalue()
@@ -1976,7 +1980,7 @@ class TestMain:
 
         def _stub_run(src, verbose, schema, size_only=False):
             called_with["src"] = src
-            return 0, []
+            return 0, [], True
 
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(mhlver, "_run", _stub_run)
@@ -1990,7 +1994,7 @@ class TestMain:
 
         def _stub_run(src, verbose, schema, size_only=False):
             called_with["src"] = src
-            return 0, []
+            return 0, [], True
 
         monkeypatch.setattr(mhlver, "_run", _stub_run)
         mhl = tmp_path / "manifest.mhl"
@@ -2005,7 +2009,7 @@ class TestMain:
 
         def _stub_run(src, verbose, schema, size_only=False):
             called_with["verbose"] = verbose
-            return 0, []
+            return 0, [], True
 
         monkeypatch.setattr(mhlver, "_run", _stub_run)
         mhl = tmp_path / "manifest.mhl"
@@ -2019,7 +2023,7 @@ class TestMain:
 
         def _stub_run(src, verbose, schema, size_only=False):
             called_with["schema"] = schema
-            return 0, []
+            return 0, [], True
 
         monkeypatch.setattr(mhlver, "_run", _stub_run)
         mhl = tmp_path / "manifest.mhl"
@@ -2029,7 +2033,7 @@ class TestMain:
 
     def test_exit_code_propagated_from_run(self, mhlver_cli, monkeypatch, tmp_path):
         """The exit code returned by _run becomes mhlver's exit code."""
-        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (40, []))
+        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (40, [], True))
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
         rc, _, _ = mhlver_cli([str(mhl)])
@@ -2037,7 +2041,7 @@ class TestMain:
 
     def test_report_flag_creates_report_file(self, mhlver_cli, monkeypatch, tmp_path):
         """--report causes a report file to be created and its path printed."""
-        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (0, []))
+        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (0, [], True))
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
         rc, out, _ = mhlver_cli(["--report", str(mhl)])
@@ -2050,7 +2054,7 @@ class TestMain:
 
     def test_report_file_contains_exit_status(self, mhlver_cli, monkeypatch, tmp_path):
         """The report file includes the overall PASSED/FAILED status."""
-        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (0, []))
+        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (0, [], True))
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
         mhlver_cli(["--report", str(mhl)])
@@ -2059,13 +2063,30 @@ class TestMain:
 
     def test_report_flag_with_failure_records_nonzero_exit(self, mhlver_cli, monkeypatch, tmp_path):
         """A non-zero exit from _run is reflected as FAILED in the report file."""
-        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (40, []))
+        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (40, [], True))
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
         rc, _, _ = mhlver_cli(["--report", str(mhl)])
         assert rc == 40
         report = next(tmp_path.glob("mhlver_report_*.log"))
         assert "FAILED" in report.read_text(encoding="utf-8")
+
+    def test_schema_and_report_are_mutually_exclusive(self, mhlver_cli, tmp_path):
+        """-s and -r cannot be combined: schema-check has no per-manifest detail."""
+        mhl = tmp_path / "manifest.mhl"
+        mhl.write_text("")
+        rc, _, err = mhlver_cli(["-s", "-r", str(mhl)])
+        assert rc == 2
+        assert "are not supported" in err
+        assert list(tmp_path.glob("mhlver_report_*.log")) == []
+
+    def test_report_not_created_when_no_manifests_found(self, mhlver_cli, monkeypatch, tmp_path):
+        """An empty directory leaves no report log behind."""
+        monkeypatch.setattr(mhlver, "_run", lambda *a, **kw: (0, [], False))
+        rc, out, _ = mhlver_cli(["--report", str(tmp_path)])
+        assert rc == 0
+        assert list(tmp_path.glob("mhlver_report_*.log")) == []
+        assert "report saved to" not in out
 
     def test_version_flag_exits_0(self, mhlver_cli):
         """--version prints the version string and exits 0."""
