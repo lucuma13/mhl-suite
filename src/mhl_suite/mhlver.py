@@ -38,7 +38,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol, TextIO
+from typing import Protocol, TextIO
 
 from lxml import etree
 from rich.console import Console, Group
@@ -84,12 +84,27 @@ else:
 # routed through rich's rendering pipeline instead.
 
 
+class _ConsoleLike(Protocol):
+    """Structural type for the `console` argument threaded through this module.
+
+    Output is routed through a rich Console when a progress bar is live, but the
+    only method ever used is .print(). Typing against this minimal Protocol
+    rather than the concrete rich Console keeps the annotation honest about what
+    is required and lets the test doubles (e.g. FakeConsole) satisfy it without
+    an `Any` escape hatch or a cast (mirrors _PollEvent). markup/highlight are
+    declared keyword-only so their call sites stay type-checked; msg is
+    positional-only so a single-positional double like FakeConsole conforms.
+    """
+
+    def print(self, msg: object, /, *, markup: bool = ..., highlight: bool = ...) -> None: ...
+
+
 def _log(
     msg: str,
     *,
     colour: str,
     stream: TextIO | None,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
 ) -> None:
     """Print to a stream with colour, or route through a rich Console.
 
@@ -107,21 +122,21 @@ def _log(
 
 def log_success(
     msg: str,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
 ) -> None:
     _log(msg, colour="", stream=sys.stdout, console=console)
 
 
 def log_warning(
     msg: str,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
 ) -> None:
     _log(msg, colour=ORANGE, stream=sys.stderr, console=console)
 
 
 def log_error(
     msg: str,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
 ) -> None:
     _log(msg, colour=RED, stream=sys.stderr, console=console)
 
@@ -270,6 +285,12 @@ _CLASSICMHL_ERROR = re.compile(
     r"^\[ERROR\] (?:malformed size field|no supported hash found|blocked traversal attempt): (.+)$"
 )
 _CLASSICMHL_CANNOT_VERIFY = re.compile(r"^\[ERROR\] cannot verify (.+?): (.+)$")
+# -S only: an entry that records no <size> when sizes were the whole check. The
+# path carries a trailing "(try …)" hint, which we drop.
+_CLASSICMHL_NO_SIZE = re.compile(r"^\[ERROR\] no size recorded: (.+?)(?: \(try .+\))?$")
+# -a only: the requested format(s) aren't recorded for this entry. group(1) is the
+# category label (incl. which tags), group(2) the path.
+_CLASSICMHL_NOT_STORED = re.compile(r"^\[ERROR\] (requested hashes? .+? not stored): (.+)$")
 _CLASSICMHL_DETAIL = re.compile(r"^\s+\((.+)\)$")  # indented detail line after a mismatch
 
 
@@ -325,6 +346,12 @@ def _parse_classicmhl_output(output: str) -> list[FileResult]:
 
         elif m := _CLASSICMHL_CANNOT_VERIFY.match(stripped):
             results.append(FileResult(path=m.group(1), status="error", detail=m.group(2)))
+
+        elif m := _CLASSICMHL_NO_SIZE.match(stripped):
+            results.append(FileResult(path=m.group(1), status="error", detail="no size recorded"))
+
+        elif m := _CLASSICMHL_NOT_STORED.match(stripped):
+            results.append(FileResult(path=m.group(2), status="error", detail=m.group(1)))
 
         i += 1
     return results
@@ -512,7 +539,7 @@ def _emit_step_output(
     exit_code: int,
     *,
     show_on_terminal: bool,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
 ) -> None:
     """
     Write captured backend output to the terminal when show_on_terminal is True.
@@ -634,7 +661,7 @@ _ASCMHL_SCHEMA_RESULTS: dict[int, tuple[str, str]] = {
 def _log_by_severity(
     severity: str,
     msg: str,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
 ) -> None:
     """Dispatch a message to the right logger based on its severity label."""
     if severity == "success":
@@ -653,7 +680,7 @@ def _report_via_table(
     *,
     show_backend_output: bool,
     show_status_on_terminal: bool = True,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
 ) -> None:
     """
     Look up exit_code in `table`, log the appropriate message, and emit any
@@ -688,7 +715,7 @@ def _verbose_announce(
     cmd: list[str],
     cwd: Path | None,
     verbose: bool,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
 ) -> None:
     """
     When --verbose, print the exact command (and cwd) that's about to run.
@@ -719,7 +746,7 @@ def verify_item(
     verbose: bool,
     schema: bool,
     size_only: bool = False,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
@@ -771,7 +798,7 @@ def _verify_classicmhl(
     verbose: bool,
     schema: bool,
     size_only: bool = False,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
@@ -872,7 +899,7 @@ def _verify_ascmhl(
     verbose: bool,
     schema: bool,
     size_only: bool = False,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
@@ -928,7 +955,7 @@ def _ascmhl_schema_check(
     cmd_path: str,
     cwd: Path | None,
     verbose: bool,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> int:
@@ -982,7 +1009,7 @@ def _ascmhl_verify(
     cmd_path: str,
     cwd: Path | None,
     verbose: bool,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> "tuple[int, ManifestResult]":
@@ -1052,7 +1079,7 @@ def _ascmhl_verify(
 def _ascmhl_verify_sizeonly(
     target: Path,
     verbose: bool,
-    console: Any = None,  # noqa: ANN401 — duck-typed: accepts Console or test doubles
+    console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
 ) -> "tuple[int, ManifestResult]":
@@ -1670,7 +1697,7 @@ def _verify_dir_with_progress(
     verbose: bool,
     schema: bool,
     size_only: bool,
-) -> "tuple[int, list[ManifestResult], object]":
+) -> "tuple[int, list[ManifestResult], Console]":
     """
     Verify each manifest in `mhl_files` with a live rich progress bar.
 

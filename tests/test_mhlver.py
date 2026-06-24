@@ -2186,6 +2186,17 @@ class TestParseClassicMhlOutput:
         results = mhlver._parse_classicmhl_output("[ERROR] cannot verify x.mxf: unsupported algo")
         assert results == [mhlver.FileResult(path="x.mxf", status="error", detail="unsupported algo")]
 
+    def test_no_size_recorded_drops_hint_suffix(self):
+        out = "[ERROR] no size recorded: clip.mxf (try 'simple-mhl verify' for full hash verification)"
+        results = mhlver._parse_classicmhl_output(out)
+        assert results == [mhlver.FileResult(path="clip.mxf", status="error", detail="no size recorded")]
+
+    def test_requested_hashes_not_stored(self):
+        results = mhlver._parse_classicmhl_output("[ERROR] requested hashes md5, sha1 not stored: clip.mxf")
+        assert results == [
+            mhlver.FileResult(path="clip.mxf", status="error", detail="requested hashes md5, sha1 not stored")
+        ]
+
     def test_unrecognized_lines_are_ignored(self):
         results = mhlver._parse_classicmhl_output("some banner\n\nVerifying...")
         assert results == []

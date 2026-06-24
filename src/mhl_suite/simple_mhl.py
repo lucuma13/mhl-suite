@@ -330,8 +330,8 @@ def _probe_read_bw(paths: list[str]) -> float:
     for p in paths:
         try:
             with open(p, "rb") as f:
-                while f.readinto(buf):
-                    read += len(buf)
+                while n := f.readinto(buf):
+                    read += n
                     elapsed = time.perf_counter() - start
                     if read >= _AUTO_PROBE_BYTES and elapsed >= _AUTO_PROBE_SECONDS:
                         return read / elapsed
@@ -1117,6 +1117,23 @@ def _size_check(
     return actual_size, None
 
 
+def _free_processed(h: "etree._Element") -> None:
+    """Release `h` and every already-processed sibling during iterparse.
+
+    Clearing the element alone empties its content but leaves an empty node
+    attached to the root, so a manifest with no entries that reach the hash
+    phase (all-missing, all-<null>, or -S size-only) would still accumulate one
+    dead element per file. Dropping the preceding siblings too keeps peak DOM
+    memory proportional to a single element regardless of which branch handled
+    the entry.
+    """
+    h.clear()
+    parent = h.getparent()
+    if parent is not None:
+        while h.getprevious() is not None:
+            del parent[0]
+
+
 def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexity
     mhl_file: str, verbose: bool = False, algorithm: "str | list[str] | None" = None, size_only: bool = False
 ) -> None:
@@ -1237,7 +1254,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
             # are silently skipped (xsd-schema-check would have caught them).
             file_el = h.find("{*}file")
             if file_el is None or file_el.text is None:
-                h.clear()
+                _free_processed(h)
                 continue
 
             # Manifests use forward slashes; convert to the platform separator
@@ -1253,7 +1270,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
             jailed = os.path.normpath(os.path.join(mhl_dir, rel_path))
             if jailed != mhl_dir and not jailed.startswith(mhl_dir_with_sep):
                 results.append(("mismatch", f"[ERROR] blocked traversal attempt: {rel_path}"))
-                h.clear()
+                _free_processed(h)
                 continue
 
             # --- Resolve to the real on-disk path -----------------------
@@ -1262,7 +1279,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
             candidate = resolve_on_disk(mhl_dir, os.path.relpath(jailed, mhl_dir), dir_index)
             if candidate is None:
                 results.append(("missing", f"[ERROR] missing file: {rel_path}"))
-                h.clear()
+                _free_processed(h)
                 continue
 
             # --- Size-only mode -----------------------------------------
@@ -1287,7 +1304,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
                     )
                 else:
                     results.append(("ok", f"{rel_path}  size: {actual_size}"))
-                h.clear()
+                _free_processed(h)
                 continue
 
             # Pick which recorded hash(es) to verify: the fastest computable one by
@@ -1301,7 +1318,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
                     )
                 else:  # nothing recognised recorded at all
                     results.append(("mismatch", f"[ERROR] no supported hash found: {rel_path}"))
-                h.clear()
+                _free_processed(h)
                 continue
 
             # A single <null> node means this entry carries no hash. Flag which kind
@@ -1324,7 +1341,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
             actual_size, size_outcome = _size_check(h, candidate, rel_path, verbose)
             if size_outcome is not None:
                 results.append(size_outcome)
-                h.clear()
+                _free_processed(h)
                 continue
 
             # 'null' tag records no digest: existence + size are the whole check.
@@ -1340,7 +1357,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
                     results.append(("ok", f"{rel_path}  size: {actual_size} (size-only check - no hash stored)"))
                 else:
                     results.append(("ok", f"{rel_path}  (existence-only check — no hash or size stored)"))
-                h.clear()
+                _free_processed(h)
                 continue
 
             # Needs a hash pass — defer it to the parallel phase. No hashing happens
@@ -1359,12 +1376,7 @@ def verify(  # noqa: C901 — flat per-entry verify ladder, not nested complexit
             if calib_algo is None:
                 calib_algo = checks[0][0]
 
-            # Free this element and all already-processed siblings.
-            h.clear()
-            parent = h.getparent()
-            if parent is not None:
-                while h.getprevious() is not None:
-                    del parent[0]
+            _free_processed(h)
 
     except (etree.XMLSyntaxError, OSError):
         sys.exit(20)
