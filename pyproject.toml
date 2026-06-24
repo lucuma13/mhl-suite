@@ -45,7 +45,7 @@ dependencies = [
   "ascmhl>=1.2",
   "lxml>=6.1.1",
   "rich>=15",
-  "xxhash>=3.7",
+  "xxhash>=3.7.1",
 ]
 urls.Homepage = "https://github.com/lucuma13/mhl-suite"
 scripts.mhlver = "mhl_suite.mhlver:main"
