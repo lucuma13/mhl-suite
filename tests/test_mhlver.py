@@ -4,7 +4,6 @@ import io
 import os
 import sys
 import tempfile
-import threading
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -95,24 +94,25 @@ def _write_ascmhl(path: Path, entries: list[dict]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def stub_run_step(monkeypatch, exit_code: int, output: str = ""):
-    """Replace _run_step with a stub that returns a fixed StepResult."""
+def stub_verify_package(monkeypatch, code, entries=None):
+    """Replace ascmhl.verify.verify_package with a stub returning a fixed report.
 
-    def _stub(cmd, cwd=None, **kwargs):
-        return mhlver.StepResult(exit_code=exit_code, output=output)
+    The in-process counterpart of the old stub_run_step: ASC-MHL verify now goes
+    through mhl_suite.ascmhl.verify.verify_package, so dispatch/wiring tests pin
+    its structured result instead of a subprocess StepResult.
+    """
+    report = mhlver.ascmhl_verify.AscVerifyReport(entries=entries or [], code=code)
+    monkeypatch.setattr(mhlver.ascmhl_verify, "verify_package", lambda *a, **k: report)
 
-    monkeypatch.setattr(mhlver, "_run_step", _stub)
+
+def stub_integrity_check(monkeypatch, code, message=""):
+    """Replace ascmhl.verify.integrity_check (the size-only integrity gate)."""
+    monkeypatch.setattr(mhlver.ascmhl_verify, "integrity_check", lambda *a, **k: (code, message))
 
 
 def call_verify(manifest):
     """Invoke _ascmhl_verify with sane defaults and return its exit code."""
-
-    rc, _mr = mhlver._ascmhl_verify(
-        target=manifest,
-        cmd_path="/fake/ascmhl-debug",
-        cwd=None,
-        verbose=False,
-    )
+    rc, _mr = mhlver._ascmhl_verify(target=manifest, verbose=False)
     return rc
 
 
@@ -858,7 +858,7 @@ class TestAscMhlSizeOnly:
     """The ASC-MHL size-only checker (verify_ascmhl_sizes) and its mhlver wiring
     (_ascmhl_verify_sizeonly, _verify_ascmhl size_only=True). The helper-level tests
     call verify_ascmhl_sizes directly (no integrity gate); the wiring tests go through
-    _verify_ascmhl and stub the `ascmhl info` gate via _run_step."""
+    _verify_ascmhl and stub the in-process integrity gate (ascmhl.verify.integrity_check)."""
 
     def test_all_sizes_match_passes(self, tmp_path):
         """Every recorded size matches disk -> all ok."""
@@ -998,7 +998,7 @@ class TestAscMhlSizeOnly:
     def test_size_phase_runs_when_gate_passes(self, tmp_path, monkeypatch):
         """`ascmhl info` exit 0 -> size phase runs; OK entries are flagged size-only."""
         manifest = _build_ascmhl_package(tmp_path / "pkg", {"a.mov": 100})
-        stub_run_step(monkeypatch, 0)  # integrity gate (ascmhl info) passes
+        stub_integrity_check(monkeypatch, 0)  # integrity gate passes
         rc, mr = mhlver._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
         assert rc == 0
         assert mr is not None
@@ -1010,7 +1010,7 @@ class TestAscMhlSizeOnly:
         pkg = tmp_path / "pkg"
         manifest = _build_ascmhl_package(pkg, {"a.mov": 100})
         (pkg / "a.mov").write_bytes(b"x" * 50)
-        stub_run_step(monkeypatch, 0)  # gate passes
+        stub_integrity_check(monkeypatch, 0)  # gate passes
         rc, mr = mhlver._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
         assert rc == 10
         assert mr is not None
@@ -1021,7 +1021,7 @@ class TestAscMhlSizeOnly:
     def test_integrity_gate_failure_skips_size_checks(self, tmp_path, monkeypatch, gate_code):
         """A non-zero `ascmhl info` (tamper/missing chain or manifest) fails before sizes."""
         manifest = _build_ascmhl_package(tmp_path / "pkg", {"a.mov": 100})
-        stub_run_step(monkeypatch, gate_code, "Modified ASC MHL manifest in history")
+        stub_integrity_check(monkeypatch, gate_code, "Modified ASC MHL manifest in history")
         monkeypatch.setattr(
             mhlver,
             "verify_ascmhl_sizes",
@@ -1038,7 +1038,7 @@ class TestAscMhlSizeOnly:
         ascdir.mkdir(parents=True)
         (ascdir / "0001.mhl").write_text("<hashlist><not closed")
         _write_chain(ascdir, ["0001.mhl"])
-        stub_run_step(monkeypatch, 0)  # gate passes; size phase hits the malformed manifest
+        stub_integrity_check(monkeypatch, 0)  # gate passes; size phase hits the malformed manifest
         rc, mr = mhlver._verify_ascmhl(ascdir / "0001.mhl", verbose=False, schema=False, size_only=True)
         assert rc == 20
         assert mr is not None
@@ -1051,108 +1051,70 @@ class TestAscMhlSizeOnly:
 
 
 class TestAscMhlDispatch:
-    """ASC-MHL exit-code translation, schema dispatch, schema=False routing,
-    output visibility, and command-not-found (127).
+    """ASC-MHL exit-code translation, schema dispatch, and schema=False routing,
+    all verified in-process via mhl_suite.ascmhl.verify.
     """
 
     @pytest.mark.parametrize(
-        ("exit_code", "output"),
-        [
-            (0, ""),  # clean
-            (10, "ERROR: 1 missing file(s):"),  # CompletenessCheckFailedException
-            (11, "ERROR: hash mismatch"),  # VerificationFailedException
-            (12, ""),  # VerificationDirectoriesFailedException
-            (30, ""),  # NoMHLHistoryException
-            (31, ""),  # ModifiedMHLManifestFileException
-            (99, "weirdness"),  # unknown code: returned unchanged, never mapped to 0
-        ],
+        "exit_code",
+        [0, 10, 11, 12, 30, 31, 99],  # documented failures plus an unknown code
     )
-    def test_verify_exit_code_propagates(self, ascmhl_setup, monkeypatch, exit_code, output):
-        """Every exit code from ascmhl-debug verify is returned unchanged —
-        documented failures and unknown codes alike."""
-        stub_run_step(monkeypatch, exit_code, output)
+    def test_verify_exit_code_propagates(self, ascmhl_setup, monkeypatch, exit_code):
+        """verify_package's code is returned unchanged — documented failures and
+        unknown codes alike (an unknown code must never be mapped to 0)."""
+        entries = (
+            []
+            if exit_code == 0
+            else [FileOutcome(path="f.mxf", status="mismatch", line="ERROR: hash mismatch for f.mxf")]
+        )
+        stub_verify_package(monkeypatch, exit_code, entries)
         assert call_verify(ascmhl_setup) == exit_code
 
     def test_schema_check_clean_returns_zero(self, ascmhl_setup, monkeypatch):
         """Both schema checks pass -> exit 0."""
-        stub_run_step(monkeypatch, 0)
-        rc = mhlver._ascmhl_schema_check(
-            target=ascmhl_setup,
-            cmd_path="/fake/ascmhl-debug",
-            cwd=None,
-            verbose=False,
-        )
+        monkeypatch.setattr(mhlver.ascmhl_verify, "schema_check", lambda *a, **k: (0, []))
+        rc = mhlver._ascmhl_schema_check(target=ascmhl_setup, verbose=False)
         assert rc == 0
 
     def test_schema_check_manifest_failure_takes_precedence(self, ascmhl_setup, monkeypatch):
         """If the manifest fails schema check, that code wins over the chain's."""
-        call_count = {"n": 0}
+        calls = {"n": 0}
 
-        def _stub(cmd, cwd=None, **kwargs):
-            call_count["n"] += 1
-            return mhlver.StepResult(
-                exit_code=11 if call_count["n"] == 1 else 0,
-                output="manifest failed" if call_count["n"] == 1 else "",
-            )
+        def _stub(file_path, *, directory_file=False):
+            calls["n"] += 1
+            # first call is the manifest, second is the chain
+            return (11, ["manifest failed"]) if calls["n"] == 1 else (0, [])
 
-        monkeypatch.setattr(mhlver, "_run_step", _stub)
-
-        rc = mhlver._ascmhl_schema_check(
-            target=ascmhl_setup,
-            cmd_path="/fake/ascmhl-debug",
-            cwd=None,
-            verbose=False,
-        )
+        monkeypatch.setattr(mhlver.ascmhl_verify, "schema_check", _stub)
+        rc = mhlver._ascmhl_schema_check(target=ascmhl_setup, verbose=False)
         assert rc == 11
 
     def test_dispatch_table_covers_all_known_codes(self):
-        """The ASC-MHL verify dispatch table must cover every code that
-        ascmhl/errors.py defines, so we never fall through to the
-        'unexpected exit' branch for a documented failure."""
-        documented_codes = {0, 10, 11, 12, 20, 21, 30, 31, 32, 33, 127}
+        """The ASC-MHL verify dispatch table must cover every verify exit code
+        ascmhl/errors.py defines, so we never fall through to the 'unexpected
+        exit' branch for a documented failure. (127 was the subprocess
+        command-not-found code and no longer applies now that verify is in-process.)"""
+        documented_codes = {0, 10, 11, 12, 20, 21, 30, 31, 32, 33}
         missing = documented_codes - set(mhlver._ASCMHL_VERIFY_RESULTS.keys())
         assert missing == set(), f"Dispatch table missing codes: {missing}"
 
-    def test_ascmhl_backend_output_shown_by_default(self, ascmhl_setup, monkeypatch, capsys):
-        """ascmhl's per-file output is shown on terminal by default."""
-        stub_run_step(monkeypatch, 30, "ERROR: no MHL history found at /pkg")
-
-        # capsys from pytest automatically captures output cleanly.
-        mhlver._ascmhl_verify(
-            target=ascmhl_setup,
-            cmd_path="/fake/ascmhl-debug",
-            cwd=None,
-            verbose=False,
-        )
-
-        captured = capsys.readouterr()
-        assert "ERROR: no MHL history found" in captured.err
-
-    def test_ascmhl_backend_output_also_shown_with_verbose(self, ascmhl_setup, capsys, monkeypatch):
-        """With --verbose, ascmhl's output is also shown on terminal."""
-        stub_run_step(monkeypatch, 30, "ERROR: no MHL history found at /pkg")
-
-        mhlver._ascmhl_verify(
-            target=ascmhl_setup,
-            cmd_path="/fake/ascmhl-debug",
-            cwd=None,
-            verbose=True,
-        )
-
-        captured = capsys.readouterr()
-        assert "ERROR: no MHL history found" in captured.err
+    def test_ascmhl_failure_detail_shown_on_terminal(self, ascmhl_setup, monkeypatch, capsys):
+        """A failure's per-file detail (rendered from the structured report) is
+        shown on the terminal so the operator sees what went wrong."""
+        entries = [FileOutcome(path="b.mxf", status="mismatch", line="ERROR: hash mismatch for b.mxf")]
+        stub_verify_package(monkeypatch, 11, entries)
+        mhlver._ascmhl_verify(target=ascmhl_setup, verbose=False)
+        assert "hash mismatch for b.mxf" in capsys.readouterr().err
 
     def test_schema_false_dispatches_to_ascmhl_verify(self, ascmhl_setup, monkeypatch):
         """schema=False routes to _ascmhl_verify; _ascmhl_schema_check is never called."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
-
         called = {}
 
-        def _stub_verify(target, cmd_path, cwd, verbose, **kw):
+        def _stub_verify(target, verbose, **kw):
             called["verify"] = True
             return 0, None
 
-        def _stub_schema(target, cmd_path, cwd, verbose, **kw):
+        def _stub_schema(target, verbose, **kw):
             called["schema"] = True
             return 0
 
@@ -1167,23 +1129,15 @@ class TestAscMhlDispatch:
 
     def test_schema_false_return_value_is_propagated(self, ascmhl_setup, monkeypatch):
         """The exit code from _ascmhl_verify is returned unchanged."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
         monkeypatch.setattr(mhlver, "_ascmhl_verify", lambda *a, **kw: (11, None))
         rc, _mr = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False)
         assert rc == 11
 
-    def test_command_not_found_returns_127(self, ascmhl_setup, monkeypatch):
-        """When ascmhl-debug is not found, _verify_ascmhl returns 127."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: None)
-        rc, _mr = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False)
-        assert rc == 127
-
     def test_schema_true_dispatches_to_ascmhl_schema_check(self, ascmhl_setup, monkeypatch):
         """With schema=True, _verify_ascmhl calls _ascmhl_schema_check."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: "/fake/ascmhl-debug")
         called = {}
 
-        def _stub_schema_check(target, cmd_path, cwd, verbose, **kw):
+        def _stub_schema_check(target, verbose, **kw):
             called["yes"] = True
             return 0
 
@@ -1292,7 +1246,7 @@ class TestClassicMhlDispatch:
 
 
 class TestLogHelpers:
-    """Unit tests for _log, _emit_step_output, and _verbose_announce."""
+    """Unit tests for _log and _emit_step_output."""
 
     def test_log_routes_through_console(self, capsys):
         """When a console object is passed, _log uses console.print, not print()."""
@@ -1338,32 +1292,6 @@ class TestLogHelpers:
         assert captured.out == ""
         assert captured.err == ""
 
-    def test_verbose_announce_with_cwd_includes_cwd(self, capsys):
-        """_verbose_announce includes (cwd=...) when cwd is not None."""
-        cwd = Path("/some/dir")
-        mhlver._verbose_announce(["/bin/cmd", "arg"], cwd=cwd, verbose=True)
-        captured = capsys.readouterr()
-        assert f"cwd={cwd}" in captured.err
-
-    def test_verbose_announce_without_cwd_omits_cwd(self, capsys):
-        """_verbose_announce omits cwd when it is None."""
-        mhlver._verbose_announce(["/bin/cmd"], cwd=None, verbose=True)
-        captured = capsys.readouterr()
-        assert "cwd" not in captured.err
-
-    def test_verbose_announce_via_console(self):
-        """_verbose_announce routes through console when provided."""
-        console = FakeConsole()
-        mhlver._verbose_announce(["/bin/cmd"], cwd=None, verbose=True, console=console)
-        assert "running:" in console.getvalue()
-
-    def test_verbose_announce_noop_when_not_verbose(self, capsys):
-        """_verbose_announce produces no output when verbose=False."""
-        mhlver._verbose_announce(["/bin/cmd"], cwd=None, verbose=False)
-        captured = capsys.readouterr()
-        assert captured.out == ""
-        assert captured.err == ""
-
 
 # ---------------------------------------------------------------------------
 # TestReportViaTable
@@ -1401,41 +1329,6 @@ class TestReportViaTable:
         )
         captured = capsys.readouterr()
         assert "bad.mhl" in captured.err
-
-
-# ---------------------------------------------------------------------------
-# TestGetCommandPath
-# ---------------------------------------------------------------------------
-
-
-class TestGetCommandPath:
-    """Tests for get_command_path venv-first lookup."""
-
-    def test_falls_back_to_which_when_venv_candidate_missing(self, monkeypatch, tmp_path):
-        """When the venv bin candidate doesn't exist, shutil.which is tried."""
-        monkeypatch.setattr(mhlver.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
-        # Point sys.prefix at tmp_path so the venv candidate definitely won't exist.
-        monkeypatch.setattr(mhlver.sys, "prefix", str(tmp_path))
-        result = mhlver.get_command_path("simple-mhl")
-        assert result == "/usr/bin/simple-mhl"
-
-    def test_returns_none_when_not_found_anywhere(self, monkeypatch, tmp_path):
-        """Returns None when neither the venv candidate nor PATH has the command."""
-        monkeypatch.setattr(mhlver.shutil, "which", lambda cmd: None)
-        monkeypatch.setattr(mhlver.sys, "prefix", str(tmp_path))
-        assert mhlver.get_command_path("nonexistent-tool") is None
-
-    def test_prefers_venv_candidate_when_present(self, monkeypatch, tmp_path):
-        """Venv bin candidate is returned without calling shutil.which."""
-
-        venv_bin = tmp_path / ("Scripts" if sys.platform == "win32" else "bin")
-        venv_bin.mkdir()
-        candidate = venv_bin / "simple-mhl"
-        candidate.write_text("#!/bin/sh")
-        monkeypatch.setattr(mhlver.sys, "prefix", str(tmp_path))
-        # which would return a different path — we must NOT see it.
-        monkeypatch.setattr(mhlver.shutil, "which", lambda cmd: "/wrong/path")
-        assert mhlver.get_command_path("simple-mhl") == str(candidate)
 
 
 # ---------------------------------------------------------------------------
@@ -1713,117 +1606,6 @@ class TestRun:
 
 
 # ---------------------------------------------------------------------------
-# TestRunStep
-# ---------------------------------------------------------------------------
-
-
-class TestRunStep:
-    """Tests for _run_step — subprocess execution with progress-bar polling."""
-
-    def test_on_poll_is_set_during_subprocess(self):
-        """on_poll.set() must be called at least once while the subprocess runs.
-
-        _run_step polls every ~100 ms while the process is alive; even a
-        subprocess that exits almost immediately will trigger at least one
-        poll tick on most systems. We use a no-op shell command so the test
-        stays fast and cross-platform.
-        """
-        event = threading.Event()
-        result = mhlver._run_step(
-            cmd=["python3", "-c", "import time; time.sleep(0.15)"],
-            cwd=None,
-            on_poll=event,
-        )
-        assert result.exit_code == 0
-        assert event.is_set()
-
-    def test_on_poll_none_does_not_raise(self):
-        """Passing on_poll=None must not raise — it is the no-progress-bar path."""
-        result = mhlver._run_step(
-            cmd=["python3", "-c", "pass"],
-            cwd=None,
-            on_poll=None,
-        )
-        assert result.exit_code == 0
-
-    def test_large_stderr_output_does_not_deadlock(self):
-        """_run_step must not deadlock when the child writes > 64 KB to stderr.
-
-        The kernel pipe buffer is 64 KB on macOS/Linux. The old implementation
-        called proc.wait() in a loop before proc.communicate(), so the child
-        would block on its first write() that exceeded the buffer cap and the
-        parent would spin forever waiting for it to exit — a classic deadlock.
-
-        The fix calls proc.communicate() immediately (which drains both pipes
-        via internal reader threads) and drives on_poll ticks from a separate
-        ticker thread. This test encodes that contract: if the deadlock ever
-        regresses, the test will hang and pytest-timeout will report a failure
-        rather than letting the suite stall silently, which mirrors exactly
-        how `mhlver --report --verbose` stalled before the fix.
-        """
-        # Write 128 KB to stderr — well past the 64 KB pipe-buffer ceiling.
-        large_stderr_script = "import sys; sys.stderr.write('x' * 128 * 1024); sys.stderr.flush()"
-        result = mhlver._run_step(
-            cmd=["python3", "-c", large_stderr_script],
-            cwd=None,
-            on_poll=None,
-        )
-        # The subprocess exits cleanly; we just need it to finish at all.
-        assert result.exit_code == 0
-        # communicate() merges stdout+stderr into result.output, so the 'x'
-        # flood must appear there and must be at least 128 KB in total.
-        assert len(result.output) >= 128 * 1024
-
-    def test_on_poll_ticker_fires_multiple_times(self):
-        """The _ticker thread inside _run_step must call on_poll.set() on every
-        iteration of its loop, not just once.
-
-        This directly exercises the branch at lines 211-213:
-
-            def _ticker() -> None:
-                while not stop_ticking.is_set():
-                    if on_poll is not None:   # <- line 211
-                        on_poll.set()         # <- line 212 (the branch under test)
-                    stop_ticking.wait(timeout=0.1)
-
-        We replace the threading.Event with a counting shim so we can observe
-        how many times set() is called. The subprocess sleeps for 0.4 s;
-        with a 100 ms ticker interval that is at least 3 ticks. We assert >= 2
-        to give one tick of headroom for scheduling jitter on slow CI hosts.
-        """
-
-        class _CountingEvent:
-            """Drop-in threading.Event replacement that counts set() calls."""
-
-            def __init__(self):
-                self._real = threading.Event()
-                self.set_count = 0
-
-            def set(self):
-                self.set_count += 1
-                self._real.set()
-
-            def is_set(self):
-                return self._real.is_set()
-
-            def wait(self, timeout=None):
-                return self._real.wait(timeout=timeout)
-
-        counter = _CountingEvent()
-        result = mhlver._run_step(
-            cmd=["python3", "-c", "import time; time.sleep(0.4)"],
-            cwd=None,
-            on_poll=counter,
-        )
-        assert result.exit_code == 0
-        assert counter.set_count >= 2, (
-            f"Expected _ticker to fire on_poll.set() at least twice in 0.4 s "
-            f"(100 ms interval), but it fired {counter.set_count} time(s). "
-            "The 'if on_poll is not None: on_poll.set()' branch may not be looping."
-        )
-
-
-# ---------------------------------------------------------------------------
 # TestRunWithProgress
 # ---------------------------------------------------------------------------
 
@@ -2054,78 +1836,6 @@ class TestMain:
         rc, out, _ = mhlver_cli(["--version"])
         assert rc == 0
         assert out.strip() != ""
-
-
-# ---------------------------------------------------------------------------
-# TestRunStepRobustness
-# ---------------------------------------------------------------------------
-
-
-class TestRunStepRobustness:
-    """_run_step must survive non-UTF-8 bytes in a backend's output (e.g. a
-    legacy Latin-1 on-disk filename echoed by ascmhl-debug) rather than crashing
-    the whole verify on a UnicodeDecodeError."""
-
-    def test_invalid_utf8_output_does_not_crash(self):
-        """A child emitting an invalid UTF-8 byte is decoded leniently."""
-        # os.write bypasses stdout's text encoding so we emit the raw 0xff byte.
-        cmd = [sys.executable, "-c", r"import os; os.write(1, b'ok \xff bad\n')"]
-        result = mhlver._run_step(cmd)
-        assert result.exit_code == 0
-        assert "ok" in result.output
-        assert "bad" in result.output
-        assert "�" in result.output  # the 0xff became a replacement char
-
-
-# ---------------------------------------------------------------------------
-# TestParseAscMhlOutput
-# ---------------------------------------------------------------------------
-
-
-class TestParseAscMhlOutput:
-    """Direct unit tests for the ascmhl-debug output parser."""
-
-    def test_ok_line(self):
-        results = mhlver._parse_ascmhl_output("verification (xxh64) of file a/b.mxf: OK")
-        assert results == [mhlver.FileResult(path="a/b.mxf", status="ok")]
-
-    def test_mismatch_reorders_old_new_into_stored_calc(self):
-        """ascmhl reports old=stored, new=calculated; the parser normalises that."""
-        line = "ERROR: hash mismatch        for f.mxf old xxh64: AAA, new xxh64: BBB"
-        results = mhlver._parse_ascmhl_output(line)
-        assert results == [
-            mhlver.FileResult(
-                path="f.mxf",
-                status="mismatch",
-                detail="hash mismatch: calc xxh64: BBB | stored xxh64: AAA",
-            )
-        ]
-
-    def test_new_file(self):
-        results = mhlver._parse_ascmhl_output("found new file extra.mxf")
-        assert results == [mhlver.FileResult(path="extra.mxf", status="new")]
-
-    def test_missing_block_collects_indented_entries(self):
-        output = "ERROR: 2 missing file(s):\n    one.mxf\n    two.mxf"
-        results = mhlver._parse_ascmhl_output(output)
-        assert results == [
-            mhlver.FileResult(path="one.mxf", status="missing"),
-            mhlver.FileResult(path="two.mxf", status="missing"),
-        ]
-
-    def test_non_indented_line_ends_missing_block(self):
-        """A subsequent non-indented OK line terminates the missing block and is
-        parsed normally."""
-        output = "ERROR: 1 missing file(s):\n    gone.mxf\nverification (xxh64) of file ok.mxf: OK"
-        results = mhlver._parse_ascmhl_output(output)
-        assert results == [
-            mhlver.FileResult(path="gone.mxf", status="missing"),
-            mhlver.FileResult(path="ok.mxf", status="ok"),
-        ]
-
-    def test_informational_lines_are_skipped(self):
-        output = "check folder at path: /x\nignoring filepath /y\nError: something"
-        assert mhlver._parse_ascmhl_output(output) == []
 
 
 # ---------------------------------------------------------------------------
@@ -2509,52 +2219,26 @@ class TestSchemaShapedAscMhlFuzz:
 
 
 class TestSinglePassVerify:
-    """Locks the ASC-MHL double-run fix: a default (non-verbose) verify spawns
-    the ascmhl backend a single time. The old code ran it twice — once -v for the
-    report, once plain for the terminal — re-hashing the whole package, so a
-    regression here silently doubles verify time. (Classic MHL is in-process now,
-    so it inherently hashes once; see TestClassicMhlDispatch.)"""
+    """Locks the single-pass property: a default (non-verbose) ASC-MHL verify
+    hashes the package exactly once. verify_package is the sole hashing pass now
+    (the old code shelled out to ascmhl-debug twice — once -v for the report, once
+    plain for the terminal — re-hashing everything), so a regression that
+    reintroduced a second pass would call verify_package more than once. (Classic
+    MHL is in-process too; see TestClassicMhlDispatch.)"""
 
-    def test_ascmhl_verify_runs_backend_once(self, monkeypatch, tmp_path):
-        calls: list[list[str]] = []
-        monkeypatch.setattr(
-            mhlver,
-            "_run_step",
-            lambda cmd, cwd=None, **kw: calls.append(cmd) or mhlver.StepResult(exit_code=0, output=""),
-        )
+    def test_ascmhl_verify_invokes_engine_once(self, monkeypatch, tmp_path):
+        calls = {"n": 0}
+
+        def _spy(root_path, *, on_progress=None):
+            calls["n"] += 1
+            return mhlver.ascmhl_verify.AscVerifyReport(entries=[], code=0)
+
+        monkeypatch.setattr(mhlver.ascmhl_verify, "verify_package", _spy)
         pkg = tmp_path / "ascmhl"
         pkg.mkdir()
         target = pkg / "0001.mhl"
         target.write_text("<x/>")
 
-        mhlver._ascmhl_verify(target, "/fake/ascmhl-debug", tmp_path, verbose=False)
+        mhlver._ascmhl_verify(target, verbose=False)
 
-        assert len(calls) == 1, f"expected 1 backend spawn, got {len(calls)}"
-        assert "-v" in calls[0]
-
-
-# ---------------------------------------------------------------------------
-# TestStripVerbose — deriving non-verbose backend output from the -v run
-# ---------------------------------------------------------------------------
-
-
-class TestStripVerbose:
-    """The strip helpers reduce a backend's -v output to its non-verbose form,
-    which is what lets a single -v run feed both the report and the terminal."""
-
-    def test_strip_ascmhl_keeps_errors_and_missing_block(self):
-        verbose = (
-            "check folder at path: /x\n"
-            "verification (xxh64) of file a.bin: OK\n"
-            "ERROR: hash mismatch        for b.bin old xxh64: 1, new xxh64: 2\n"
-            "found new file d.bin\n"
-            "ERROR: 1 missing file(s):\n"
-            "  c.bin\n"
-        )
-        out = mhlver._strip_ascmhl_verbose(verbose)
-        assert "check folder" not in out  # verbose-only header dropped
-        assert "of file a.bin: OK" not in out  # verbose-only per-file OK dropped
-        assert "hash mismatch" in out
-        assert "found new file d.bin" in out
-        assert "ERROR: 1 missing file(s):" in out
-        assert "  c.bin" in out  # INDENTED missing entry preserved (present in both modes)
+        assert calls["n"] == 1, f"expected 1 hashing pass, got {calls['n']}"

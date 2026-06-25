@@ -8,7 +8,7 @@
 # delegating to the right backend:
 #
 #     Classic MHL (v1)  -> verified in-process via mhl_suite.classicmhl (ClassicMHLBackend)
-#     ASC-MHL  (v2)    -> shells out to `ascmhl-debug verify` (AscMHLBackend)
+#     ASC-MHL  (v2)     -> verified in-process via mhl_suite.ascmhl (AscMHLBackend)
 #
 # It detects ASC-MHL packages by the conventional `ascmhl/` folder containing
 # the manifest. Each backend's exit code is translated into a human-readable
@@ -16,8 +16,8 @@
 #
 # With -S/--size-only the files are size-checked only (no hashing): for classic
 # manifests the in-process engine size-checks, while for ASC-MHL  — first gates
-# on manifest integrity via `ascmhl info` (which verifies the chain and each
-# manifest's hash without hashing media), then compares sizes in-process via
+# on manifest integrity in-process (loading the history verifies the chain and
+# each manifest's hash without hashing media), then compares sizes in-process via
 # ascmhl.sizecheck (since ascmhl does not check sizes).
 #
 # Exit code policy: the first non-zero backend exit code becomes mhlver's
@@ -27,13 +27,8 @@
 
 import argparse
 import importlib.metadata
-import re
-import shutil
-import subprocess
 import sys
-import threading
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, TextIO
@@ -45,6 +40,7 @@ from rich.progress import BarColumn, Progress, TextColumn
 from rich.text import Text
 
 from mhl_suite._internal.unicodepaths import normalization_variant_on_disk
+from mhl_suite.ascmhl import verify as ascmhl_verify
 from mhl_suite.ascmhl.sizecheck import verify_ascmhl_sizes
 from mhl_suite.classicmhl.verify import render_verify_lines, schema_report, verify_manifest
 from mhl_suite.shared.report import (
@@ -96,7 +92,7 @@ class _ConsoleLike(Protocol):
     only method ever used is .print(). Typing against this minimal Protocol
     rather than the concrete rich Console keeps the annotation honest about what
     is required and lets the test doubles (e.g. FakeConsole) satisfy it without
-    an `Any` escape hatch or a cast (mirrors _PollEvent). markup/highlight are
+    an `Any` escape hatch or a cast. markup/highlight are
     declared keyword-only so their call sites stay type-checked; msg is
     positional-only so a single-positional double like FakeConsole conforms.
     """
@@ -146,210 +142,27 @@ def log_error(
     _log(msg, colour=RED, stream=sys.stderr, console=console)
 
 
-# -----------------------------------------------------------------------------
-# Command resolution
-# -----------------------------------------------------------------------------
-
-
-def get_command_path(cmd_name: str) -> str | None:
-    """
-    Find a command in the active venv first, falling back to the system PATH.
-
-    When mhlver is installed via `pip install` into a venv, the helper
-    binaries (simple-mhl, ascmhl-debug) live in the same venv's bin/.
-    We check there first so that a venv-installed mhlver doesn't accidentally
-    invoke a globally-installed simple-mhl that might be a different version.
-    """
-    venv_bin = Path(sys.prefix) / ("Scripts" if sys.platform == "win32" else "bin")
-    candidate = venv_bin / cmd_name
-    if candidate.exists():
-        return str(candidate)
-    return shutil.which(cmd_name)
-
-
-# -----------------------------------------------------------------------------
-# Subprocess helper
-# -----------------------------------------------------------------------------
-
-
-@dataclass
-class StepResult:
-    """Outcome of a single subprocess invocation."""
-
-    exit_code: int
-    output: str  # stdout + stderr combined and stripped
-
-
 # Report data model (FileResult / ManifestResult) and the report renderer live
 # in mhl_suite.shared.report; the names this module uses are imported up top.
 
 
-# --- Output parsers -----------------------------------------------------------
+# --- ASC-MHL output rendering -------------------------------------------------
 #
-# Classic MHL is verified in-process now (mhl_suite.classicmhl.verify), which returns
-# structured FileOutcomes directly — there is no classic text to parse. ASC-MHL
-# is still verified out-of-process via the ascmhl CLI, so its stdout is parsed
-# into FileResult entries below. The parser is intentionally defensive:
-# unrecognised lines are silently skipped so an ascmhl output change degrades
-# gracefully rather than raising.
-
-# ascmhl-debug verify -v line patterns:
-#   verification (xxh64) of file <path>: OK
-#   ERROR: hash mismatch        for <path> old xxh64: <hex>, new xxh64: <hex>
-#   found new file <path>
-#   ERROR: <N> missing file(s):          <- block header
-#     <path>                             <- one or more indented paths follow
-#   check folder at path: <path>         <- informational, skip
-#   ignoring filepath <path>             <- informational, skip
-#   Error: <message>                     <- manifest-level summary, skip
-
-_ASCMHL_OK = re.compile(r"^verification \(.+?\) of file (.+): OK$")
-_ASCMHL_MISMATCH = re.compile(r"^ERROR: hash mismatch\s+for (.+?) old (\S+): (\S+), new (\S+): (\S+)$")
-_ASCMHL_NEW = re.compile(r"^found new file (.+)$")
-_ASCMHL_MISSING_HEADER = re.compile(r"^ERROR: \d+ missing file\(s\):$")
-_ASCMHL_MISSING_ENTRY = re.compile(r"^\s+(\S.+)$")  # indented path under missing header
+# Both dialects are verified in-process now: classic via mhl_suite.classicmhl.verify
+# and ASC-MHL via mhl_suite.ascmhl.verify, each returning structured outcomes — so
+# there is no backend stdout to parse. _render_ascmhl_lines reproduces the
+# per-file terminal text from an AscVerifyReport (the ASC-MHL counterpart to
+# classicmhl.render_verify_lines): failure lines always, OK lines only when
+# verbose, matching the old `ascmhl-debug verify [-v]` output mhlver used to relay.
 
 
-def _parse_ascmhl_output(output: str) -> list[FileResult]:
-    """Parse ascmhl-debug verify -v output into FileResult entries."""
-    results: list[FileResult] = []
-    in_missing_block = False
-
-    for line in output.splitlines():
-        # Missing block: header sets the flag; indented paths are consumed.
-        if _ASCMHL_MISSING_HEADER.match(line.strip()):
-            in_missing_block = True
-            continue
-        if in_missing_block:
-            if m := _ASCMHL_MISSING_ENTRY.match(line):
-                results.append(FileResult(path=m.group(1).strip(), status="missing"))
-                continue
-            # Any non-indented line ends the block.
-            in_missing_block = False
-
-        stripped = line.strip()
-        if m := _ASCMHL_OK.match(stripped):
-            results.append(FileResult(path=m.group(1), status="ok"))
-        elif m := _ASCMHL_MISMATCH.match(stripped):
-            # groups: path, old_algo, old_hex, new_algo, new_hex
-            # ascmhl reports: old = stored (from manifest history), new = calculated
-            algo = m.group(2)  # old and new algo should be the same
-            detail = f"hash mismatch: calc {algo}: {m.group(5)} | stored {algo}: {m.group(3)}"
-            results.append(FileResult(path=m.group(1), status="mismatch", detail=detail))
-        elif m := _ASCMHL_NEW.match(stripped):
-            results.append(FileResult(path=m.group(1), status="new"))
-        # Informational lines (check folder, ignoring filepath, Error: …) are skipped.
-
-    return results
-
-
-_ASCMHL_CHECK_FOLDER = re.compile(r"^check folder at path: ")
-
-
-def _strip_ascmhl_verbose(output: str) -> str:
-    """Reduce `ascmhl-debug verify -v` output to what it prints WITHOUT -v.
-
-    Lets a single -v run drive both the report parser and the terminal, instead
-    of running ascmhl-debug a second time (a full re-hash of the package) just
-    to get the quieter output.
-    """
-    kept = [
-        line
-        for line in output.splitlines()
-        if not _ASCMHL_CHECK_FOLDER.match(line.strip()) and not _ASCMHL_OK.match(line.strip())
-    ]
-    return "\n".join(kept).strip()
-
-
-class _PollEvent(Protocol):
-    """Structural type for the on_poll argument accepted by _run_step.
-
-    Only set() is called by the ticker thread, so any object that provides
-    it satisfies the contract — threading.Event, a counting shim in tests,
-    or any other compatible type.  Using a Protocol rather than the concrete
-    threading.Event keeps the annotation honest and lets test doubles pass
-    the type-checker without a cast.
-    """
-
-    def set(self) -> None: ...
-
-
-def _run_step(
-    cmd: list[str],
-    cwd: Path | None = None,
-    on_poll: "_PollEvent | None" = None,
-) -> StepResult:
-    """
-    Run `cmd` and return its exit code plus combined stdout+stderr.
-
-    We capture both streams together because either could carry diagnostic
-    information from the backend; presenting them merged matches what an
-    operator would see if they ran the command interactively.
-
-    `cwd` is set when calling ascmhl-debug so it can find its bundled XSD
-    files via relative paths. For simple-mhl we pass cwd=None since it
-    locates its XSD via importlib.resources.
-
-    `on_poll` is any object satisfying _PollEvent (typically a threading.Event)
-    that is set() each time the ticker thread fires (every ~100 ms) while the
-    subprocess is running. The progress bar uses this to animate.
-
-    IMPORTANT — why we do NOT poll+wait before calling communicate():
-    Popen with stdout=PIPE and stderr=PIPE gives the child two kernel pipe
-    buffers (default 64 KB each on macOS/Linux). If the child writes more
-    than that before the parent reads, the child blocks on its next write()
-    and can never exit — while the parent's poll loop spins forever waiting
-    for the child to exit. Classic deadlock.
-
-    communicate() avoids this by draining both pipes concurrently with
-    internal reader threads. We therefore call it immediately and drive
-    on_poll ticks from a separate lightweight timer thread so the progress
-    bar continues animating without touching the pipe-draining path.
-    """
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        # Backends echo on-disk filenames that may not be valid UTF-8 (legacy
-        # Latin-1 names, cross-encoding mojibake). Decode leniently so a stray
-        # byte yields a replacement char instead of crashing the whole verify.
-        encoding="utf-8",
-        errors="replace",
-    )
-
-    # Suspend the ticker thread using Event.wait(timeout). Rely on this instead
-    # of time.sleep() to guarantee immediate responsiveness, allowing the main
-    # thread to terminate the loop without waiting for the next polling interval
-    # to expire.
-    stop_ticking = threading.Event()
-
-    def _ticker() -> None:
-        while not stop_ticking.is_set():
-            if on_poll is not None:
-                on_poll.set()
-            stop_ticking.wait(timeout=0.1)
-
-    ticker_thread: threading.Thread | None = None
-    if on_poll is not None:
-        ticker_thread = threading.Thread(target=_ticker, daemon=True)
-        ticker_thread.start()
-
-    try:
-        stdout, stderr = proc.communicate()
-    except BaseException:
-        # Interrupt (e.g. Ctrl-C mid-hash): don't orphan the backend — kill
-        # and reap it before propagating, so no stray hashing process lingers.
-        proc.kill()
-        proc.wait()
-        raise
-    finally:
-        stop_ticking.set()
-        if ticker_thread is not None:
-            ticker_thread.join()
-
-    combined = ((stdout or "") + (stderr or "")).strip()
-    return StepResult(exit_code=proc.returncode, output=combined)
+def _render_ascmhl_lines(report: "ascmhl_verify.AscVerifyReport", verbose: bool) -> list[str]:
+    """Render an AscVerifyReport to the per-file lines shown on the terminal."""
+    out: list[str] = []
+    if verbose:
+        out.extend(e.line for e in report.entries if e.status == "ok")
+    out.extend(e.line for e in report.entries if e.status in ("missing", "mismatch", "new"))
+    return out
 
 
 def _emit_step_output(
@@ -431,15 +244,14 @@ _CLASSICMHL_SCHEMA_RESULTS: dict[int, tuple[str, str]] = {
     ),
 }
 
-# --- ascmhl-debug (ASC-MHL 2.0) verify exit codes ---------------------------
-# These come from ascmhl/errors.py in the upstream Pomfort package. Each
-# corresponds to a click.ClickException subclass.
+# --- ASC-MHL (2.0) verify exit codes ----------------------------------------
+# These come from the vendored ascmhl/errors.py (each a click.ClickException
+# subclass carrying an exit_code), surfaced in-process by mhl_suite.ascmhl.verify.
 #
 # As with the classic MHL table, mhlver gives a single short status line per
-# manifest. ascmhl-debug emits its own `logger.error(...)` lines describing
-# what went wrong (which file mismatched, which manifest is missing, etc.);
-# those lines are passed through to the terminal so the operator sees the
-# detail. The exit code preserves the precise failure category for tooling.
+# manifest; the per-file detail (which file mismatched, which manifest is
+# missing) comes from the structured AscVerifyReport, rendered by
+# _render_ascmhl_lines. The exit code preserves the precise failure category.
 _ASCMHL_VERIFY_RESULTS: dict[int, tuple[str, str]] = {
     0: ("✅ ASC-MHL verified: {target}", "success"),
     10: ("❌ ASC-MHL verification failed: {target}", "error"),
@@ -454,10 +266,6 @@ _ASCMHL_VERIFY_RESULTS: dict[int, tuple[str, str]] = {
     31: ("❌ ASC-MHL verification failed: {target}", "error"),
     32: ("❌ ASC-MHL verification failed: {target}", "error"),
     33: ("❌ ASC-MHL verification failed: {target}", "error"),
-    127: (
-        "🚨 System error: 'ascmhl-debug' command not found. Ensure it is in your PATH.",
-        "warning",
-    ),
 }
 
 # ASC-MHL xsd-schema-check uses VerificationFailedException (code 11) for
@@ -468,10 +276,6 @@ _ASCMHL_SCHEMA_RESULTS: dict[int, tuple[str, str]] = {
     11: (
         "⚠️ ASC-MHL schema non-compliant: {target} does not match the ASC-MHL schema.",
         "error",
-    ),
-    127: (
-        "🚨 System error: 'ascmhl-debug' command not found. Ensure it is in your PATH.",
-        "warning",
     ),
 }
 
@@ -529,47 +333,20 @@ def _report_via_table(
     )
 
 
-def _verbose_announce(
-    cmd: list[str],
-    cwd: Path | None,
-    verbose: bool,
-    console: "_ConsoleLike | None" = None,
-) -> None:
-    """
-    When --verbose, print the exact command (and cwd) that's about to run.
-
-    Operators trying to reproduce a failure manually need the actual
-    invocation, not a paraphrase. Showing this BEFORE the run also lets
-    them see how far we got if the backend crashes mid-execution.
-    """
-    if not verbose:
-        return
-    rendered = " ".join(cmd)
-    line = f"  ↪ running: {rendered}"
-    if cwd is not None:
-        line += f"  (cwd={cwd})"
-    if console is not None:
-        console.print(line)
-    else:
-        print(line, file=sys.stderr)
-
-
 # -----------------------------------------------------------------------------
 # Verify backends — the port
 # -----------------------------------------------------------------------------
-# Both backends return the same (exit_code, ManifestResult | None), so the
-# orchestrator stays uniform whether verification runs in-process (classic) or
-# out-of-process (ASC-MHL). The subprocess-vs-library difference is sealed inside
-# each adapter. This is the seam ASC-MHL absorption will swap next version: only
-# AscMHLBackend's body changes; verify_item and the report model do not.
+# Both backends verify in-process and return the same (exit_code, ManifestResult
+# | None), so the orchestrator stays uniform. ClassicMHLBackend drives
+# mhl_suite.classicmhl.verify; AscMHLBackend drives mhl_suite.ascmhl.verify. Both
+# advance the progress bar through the same on_bytes hook as each file is hashed.
 
 
 class VerifyBackend(Protocol):
     """A manifest-verification backend.
 
-    The two progress hooks are mechanism-specific: `on_bytes` advances a bar from
-    the in-process hasher, `poll_event` animates it while a subprocess runs. A
-    backend uses whichever applies and ignores the other.
+    `on_bytes` advances a progress bar from the in-process hasher as each file
+    finishes hashing; a backend calls it when verifying (not in schema mode).
     """
 
     def verify(
@@ -581,13 +358,12 @@ class VerifyBackend(Protocol):
         size_only: bool = False,
         console: "_ConsoleLike | None" = None,
         progress_active: bool = False,
-        poll_event: "threading.Event | None" = None,
         on_bytes: "Callable[[int], None] | None" = None,
     ) -> "tuple[int, ManifestResult | None]": ...
 
 
 class ClassicMHLBackend:
-    """Verifies classic MHL in-process via the core engine — no subprocess."""
+    """Verifies classic MHL in-process via the core engine."""
 
     def verify(
         self,
@@ -598,11 +374,8 @@ class ClassicMHLBackend:
         size_only: bool = False,
         console: "_ConsoleLike | None" = None,
         progress_active: bool = False,
-        poll_event: "threading.Event | None" = None,
         on_bytes: "Callable[[int], None] | None" = None,
     ) -> "tuple[int, ManifestResult | None]":
-        # poll_event is unused: there is no subprocess to animate around. The bar
-        # advances from on_bytes and the Live display self-refreshes on its timer.
         return _verify_classicmhl(
             target,
             verbose,
@@ -615,7 +388,7 @@ class ClassicMHLBackend:
 
 
 class AscMHLBackend:
-    """Verifies ASC-MHL out-of-process via the ascmhl CLI."""
+    """Verifies ASC-MHL in-process via the vendored engine (mhl_suite.ascmhl)."""
 
     def verify(
         self,
@@ -626,11 +399,8 @@ class AscMHLBackend:
         size_only: bool = False,
         console: "_ConsoleLike | None" = None,
         progress_active: bool = False,
-        poll_event: "threading.Event | None" = None,
         on_bytes: "Callable[[int], None] | None" = None,
     ) -> "tuple[int, ManifestResult | None]":
-        # on_bytes is unused: the subprocess can't report per-file byte progress,
-        # so the bar advances per manifest and poll_event animates it meanwhile.
         return _verify_ascmhl(
             target,
             verbose,
@@ -638,7 +408,7 @@ class AscMHLBackend:
             size_only=size_only,
             console=console,
             progress_active=progress_active,
-            poll_event=poll_event,
+            on_bytes=on_bytes,
         )
 
 
@@ -654,23 +424,22 @@ def verify_item(
     size_only: bool = False,
     console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
-    poll_event: "threading.Event | None" = None,
     on_bytes: "Callable[[int], None] | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
     """
     Verify a single MHL manifest by selecting the right backend.
 
     Detection rule: if any path component is exactly 'ascmhl' the manifest
-    belongs to an ASC-MHL package and is verified out-of-process via the ascmhl
-    CLI (AscMHLBackend); otherwise it is classic MHL, verified in-process through
-    the core engine (ClassicMHLBackend). Both satisfy the VerifyBackend port, so
-    the orchestrator only ever sees `(exit_code, ManifestResult | None)`.
+    belongs to an ASC-MHL package and is verified through the vendored ASC-MHL
+    engine (AscMHLBackend); otherwise it is classic MHL, verified through the
+    classic engine (ClassicMHLBackend). Both verify in-process and satisfy the
+    VerifyBackend port, so the orchestrator only ever sees
+    `(exit_code, ManifestResult | None)`.
 
     `size_only` requests a fast size-only check. `progress_active` suppresses
     per-manifest success lines when a rich progress bar is already showing
-    progress (errors and warnings are always shown). `on_bytes`, used only by the
-    in-process classic backend, advances a progress bar as each file is hashed;
-    `poll_event` animates the bar while the ASC-MHL subprocess runs.
+    progress (errors and warnings are always shown). `on_bytes` advances a
+    progress bar as each file is hashed (both backends).
 
     Returns (exit_code, ManifestResult | None). ManifestResult is None when
     schema-check mode is active (no per-file detail is available then).
@@ -683,7 +452,6 @@ def verify_item(
         size_only=size_only,
         console=console,
         progress_active=progress_active,
-        poll_event=poll_event,
         on_bytes=on_bytes,
     )
 
@@ -796,179 +564,104 @@ def _verify_ascmhl(
     size_only: bool = False,
     console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
-    poll_event: "threading.Event | None" = None,
+    on_bytes: "Callable[[int], None] | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
-    """Run ascmhl-debug against an ASC-MHL manifest and translate the result."""
-    # Size-only is handled in-process (ascmhl does not check sizes).
+    """Verify an ASC-MHL package in-process via the vendored engine, by mode."""
+    # Size-only: an integrity gate plus a byte-free size compare (ascmhl does
+    # not check sizes), all in-process.
     if size_only and not schema:
-        return _ascmhl_verify_sizeonly(
-            target, verbose, console=console, progress_active=progress_active, poll_event=poll_event
-        )
-
-    cmd_path = get_command_path("ascmhl-debug")
-    if not cmd_path:
-        msg, sev = _ASCMHL_VERIFY_RESULTS[127]
-        _log_by_severity(sev, msg, console=console)
-        mr = ManifestResult(
-            manifest_path=target,
-            manifest_status="error",
-            manifest_error=msg,
-        )
-        return 127, mr
-
-    # ascmhl-debug expects to find its bundled XSDs via paths relative to
-    # its working directory. Setting cwd to the directory containing this
-    # script lets it locate them when the suite is installed alongside.
-    # Path(__file__).resolve().parent is always valid — if it didn't exist,
-    # Python would have failed to import this module.
-    cwd = Path(__file__).resolve().parent
-
+        return _ascmhl_verify_sizeonly(target, verbose, console=console, progress_active=progress_active)
     if schema:
-        code = _ascmhl_schema_check(
-            target,
-            cmd_path,
-            cwd,
-            verbose,
-            console=console,
-            progress_active=progress_active,
-            poll_event=poll_event,
-        )
+        code = _ascmhl_schema_check(target, verbose, console=console, progress_active=progress_active)
         return code, None
-    return _ascmhl_verify(
-        target,
-        cmd_path,
-        cwd,
-        verbose,
-        console=console,
-        progress_active=progress_active,
-        poll_event=poll_event,
-    )
+    return _ascmhl_verify(target, verbose, console=console, progress_active=progress_active, on_bytes=on_bytes)
 
 
 def _ascmhl_schema_check(
     target: Path,
-    cmd_path: str,
-    cwd: Path | None,
     verbose: bool,
     console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
-    poll_event: "threading.Event | None" = None,
 ) -> int:
     """
-    Schema-check both halves of an ASC-MHL package: the manifest itself
-    and the sibling ascmhl_chain.xml directory file.
+    Schema-check both halves of an ASC-MHL package in-process: the manifest
+    itself against ASCMHL.xsd and the sibling ascmhl_chain.xml against the
+    directory schema.
 
-    Both checks always run; the worst exit code (preferring the manifest's)
-    is returned so the caller has a single signal.
-
-    Backend output is always shown — XSD validation errors from ascmhl
-    typically include line numbers and structural detail that an operator
-    needs to fix the manifest. Suppressing them would force the operator
-    to re-run with -v, which defeats the purpose.
+    Both checks always run; the worst exit code (preferring the manifest's) is
+    returned so the caller has a single signal. Validation errors are always
+    shown — they carry the line numbers and structural detail an operator needs
+    to fix the file.
     """
     # Step 1: the .mhl manifest against the manifest schema.
-    mhl_cmd = [cmd_path, "xsd-schema-check", str(target)]
-    _verbose_announce(mhl_cmd, cwd, verbose, console=console)
-    mhl_step = _run_step(mhl_cmd, cwd=cwd, on_poll=poll_event)
+    mhl_code, mhl_lines = ascmhl_verify.schema_check(target)
     _report_via_table(
         _ASCMHL_SCHEMA_RESULTS,
-        mhl_step.exit_code,
+        mhl_code,
         str(target),
-        mhl_step.output,
+        "\n".join(mhl_lines),
         show_backend_output=True,
         show_status_on_terminal=not progress_active,
         console=console,
     )
 
-    # Step 2: ascmhl_chain.xml against the directory schema
+    # Step 2: ascmhl_chain.xml against the directory schema.
     chain_file = target.parent / "ascmhl_chain.xml"
-    chain_cmd = [cmd_path, "xsd-schema-check", "--directory_file", str(chain_file)]
-    _verbose_announce(chain_cmd, cwd, verbose, console=console)
-    chain_step = _run_step(chain_cmd, cwd=cwd, on_poll=poll_event)
+    chain_code, chain_lines = ascmhl_verify.schema_check(chain_file, directory_file=True)
     _report_via_table(
         _ASCMHL_SCHEMA_RESULTS,
-        chain_step.exit_code,
+        chain_code,
         str(chain_file),
-        chain_step.output,
+        "\n".join(chain_lines),
         show_backend_output=True,
         show_status_on_terminal=not progress_active,
         console=console,
     )
 
     # Manifest failure takes priority; otherwise the chain's code wins.
-    return mhl_step.exit_code if mhl_step.exit_code != 0 else chain_step.exit_code
+    return mhl_code if mhl_code != 0 else chain_code
 
 
 def _ascmhl_verify(
     target: Path,
-    cmd_path: str,
-    cwd: Path | None,
     verbose: bool,
     console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
-    poll_event: "threading.Event | None" = None,
+    on_bytes: "Callable[[int], None] | None" = None,
 ) -> "tuple[int, ManifestResult]":
     """
-    Run ascmhl-debug verify against the package directory.
+    Verify an ASC-MHL package in-process via mhl_suite.ascmhl.verify.
 
-    ASC-MHL convention: the manifest at <root>/ascmhl/manifest.mhl
-    describes the contents of <root>. ascmhl-debug verify takes <root>
-    as its argument, so we hand it the parent of the parent of the
-    manifest path.
-
-    The --verbose flag has two effects here:
-      1. Adds -v to the ascmhl-debug invocation, which makes ascmhl emit
-         per-file "verification of X: OK" lines via its own logger.
-      2. Prints the exact command being run before invocation, useful
-         when reproducing a failure manually.
-
-    Backend output is ALWAYS shown on the terminal: ascmhl's logger.error
-    lines are the per-file explanation that complements mhlver's short
-    summary, much like simple-mhl's ERROR: prefixed lines do for classic MHL.
-
-    For report collection we always pass -v to ascmhl-debug so we can
-    parse the per-file OK lines, running a second quiet invocation for
-    the user-facing terminal output when the user didn't request --verbose.
+    ASC-MHL convention: the manifest at <root>/ascmhl/<gen>.mhl describes the
+    contents of <root>, so we verify the parent of the ascmhl/ folder
+    (target.parent.parent). verify_package returns structured per-file outcomes
+    and reports byte progress through on_bytes as each file is hashed — the same
+    progress mechanism as the classic backend. _render_ascmhl_lines reproduces
+    the per-file terminal text (failure lines always, OK lines when verbose).
     """
     package_dir = target.parent.parent
+    report = ascmhl_verify.verify_package(package_dir, on_progress=on_bytes)
 
-    # Run ascmhl-debug ONCE, always with -v. Its -v output is a strict superset
-    # of the plain output (see _strip_ascmhl_verbose), so it feeds both the
-    # report parser (`step_verbose`) and the terminal (`step_terminal`).
-    # Previously we ran ascmhl-debug a second time without -v just to reproduce
-    # the quieter terminal text — re-hashing the entire package and doubling
-    # verify time on the default, non-verbose path. We derive that text instead.
-    cmd_verbose = [cmd_path, "verify", "-v", str(package_dir)]
-
-    _verbose_announce(cmd_verbose if verbose else [cmd_path, "verify", str(package_dir)], cwd, verbose, console=console)
-
-    step_verbose = _run_step(cmd_verbose, cwd=cwd, on_poll=poll_event)
-    if verbose:
-        step_terminal = step_verbose
-    else:
-        step_terminal = StepResult(
-            exit_code=step_verbose.exit_code,
-            output=_strip_ascmhl_verbose(step_verbose.output),
-        )
-
+    output = "\n".join(_render_ascmhl_lines(report, verbose))
     _report_via_table(
         _ASCMHL_VERIFY_RESULTS,
-        step_terminal.exit_code,
+        report.code,
         str(package_dir),
-        step_terminal.output,
+        output,
         show_backend_output=True,
         show_status_on_terminal=not progress_active,
         console=console,
     )
 
-    file_results = _parse_ascmhl_output(step_verbose.output)
-    mstatus = "ok" if step_terminal.exit_code == 0 else "failed"
+    # FileOutcome and FileResult share the same fields — a direct, parse-free map.
+    file_results = [FileResult(path=e.path, status=e.status, detail=e.detail) for e in report.entries]
+    mstatus = "ok" if report.code == 0 else "failed"
     mr = ManifestResult(
         manifest_path=target,
         manifest_status=mstatus,
         file_results=file_results,
     )
-    return step_terminal.exit_code, mr
+    return report.code, mr
 
 
 def _ascmhl_verify_sizeonly(
@@ -976,37 +669,34 @@ def _ascmhl_verify_sizeonly(
     verbose: bool,
     console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
-    poll_event: "threading.Event | None" = None,
 ) -> "tuple[int, ManifestResult]":
     """
     Size-only verify an ASC-MHL package, gating on manifest integrity first.
 
     Two phases:
 
-      1. Integrity gate — `ascmhl info` loads the history, which verifies the chain
-         file and every generation manifest's own hash without hashing any media.
-         This catches a tampered or missing manifest/chain before we trust their
-         contents.
+      1. Integrity gate — ascmhl_verify.integrity_check loads the history
+         in-process, which verifies the chain file and every generation
+         manifest's own hash without hashing any media. This catches a tampered
+         or missing manifest/chain before we trust their contents.
       2. Size phase — ascmhl does not check file sizes, so we use our own
          'ascmhl/sizecheck.py': verify_ascmhl_sizes parses the manifests and compares
          each recorded <path size> against the file on disk, reading no file bytes.
     """
     package_dir = target.parent.parent
 
-    # --- Phase 1: manifest-integrity gate ---
-    info_cmd = ["ascmhl", "info", str(package_dir)]
-    _verbose_announce(info_cmd, cwd=None, verbose=verbose, console=console)
-    info_step = _run_step(info_cmd, on_poll=poll_event)
-    if info_step.exit_code != 0:
+    # --- Phase 1: manifest-integrity gate (in-process) ---
+    gate_code, gate_msg = ascmhl_verify.integrity_check(package_dir)
+    if gate_code != 0:
         template, _sev = _ASCMHL_VERIFY_RESULTS.get(
-            info_step.exit_code,
+            gate_code,
             ("🚨 ASC-MHL manifest integrity check failed: {target}", "error"),
         )
         _report_via_table(
             _ASCMHL_VERIFY_RESULTS,
-            info_step.exit_code,
+            gate_code,
             str(package_dir),
-            info_step.output,
+            gate_msg,
             show_backend_output=True,
             show_status_on_terminal=not progress_active,
             console=console,
@@ -1016,7 +706,7 @@ def _ascmhl_verify_sizeonly(
             manifest_status="error",
             manifest_error=template.format(target=package_dir),
         )
-        return info_step.exit_code, mr
+        return gate_code, mr
 
     # --- Phase 2: size checks (manifests proven intact above) ---
     try:
@@ -1367,49 +1057,25 @@ def _verify_dir_with_progress(
     total_n = len(mhl_files)
     total_bytes = sum(weights.values())
     bar_task = progress.add_task(" ", total=total_bytes, done=0, total_n=total_n)
-    # poll_event is set() every ~100 ms while a subprocess runs,
-    # causing the Live display to refresh and animate the bar.
-    # stop_event is a separate signal used only to tell the refresh
-    # thread to exit — keeping it distinct from poll_event avoids a
-    # race where the thread clears the stop signal after it is set:
-    #
-    #   main: poll_event.set()        <- shutdown signal
-    #   thread: poll_event.wait() returns
-    #   thread: poll_event.clear()    <- signal gone, loop continues
-    #   main: refresh_thread.join()   <- blocks forever
-    #
-    # With a dedicated stop_event that is never cleared, the thread
-    # sees it reliably on the next loop iteration.
-    poll_event = threading.Event()
-    stop_event = threading.Event()
-
-    def _refresh_on_poll() -> None:
-        """Background thread: refresh Live display on each poll tick."""
-        while not stop_event.is_set():
-            live.refresh()
-            poll_event.wait(timeout=0.1)
-            poll_event.clear()
-
+    # Both backends now verify in-process and report byte progress via on_bytes,
+    # so the rich Live display (auto-refreshing on its own timer, see _build_live)
+    # animates the bar without any manual poll/refresh thread.
     with live:
         con = stdout_console
-        refresh_thread = threading.Thread(target=_refresh_on_poll, daemon=True)
-        refresh_thread.start()
         for i, f in enumerate(mhl_files):
             label.plain = ""
             label.append("🔎 Verifying… ", style="bold")
             label.append(f.name, style="cyan")
-            # Classic (in-process) verify reports bytes per hashed file via
-            # on_bytes, so the bar advances live within a manifest instead of
-            # jumping once at the end. We track what it advanced and top up the
-            # remainder afterwards so the manifest still contributes exactly its
-            # weight — and so the ASC-MHL subprocess path (which never calls
-            # on_bytes) still advances by the full weight as before.
+            # Both backends report bytes per hashed file via on_bytes, so the bar
+            # advances live within a manifest instead of jumping once at the end.
+            # We track what was advanced and top up the remainder afterwards so the
+            # manifest still contributes exactly its weight (covering size-only and
+            # directory/<null> entries that read no media bytes).
             advanced_box: list[int] = [0]
 
             def _advance(n: int, box: list[int] = advanced_box) -> None:
                 progress.advance(bar_task, n)
                 box[0] += n
-                poll_event.set()
 
             code, mr = verify_item(
                 f,
@@ -1417,22 +1083,14 @@ def _verify_dir_with_progress(
                 schema,
                 size_only,
                 console=con,
-                poll_event=poll_event,
                 on_bytes=_advance,
             )
             if mr is not None:
                 manifest_results.append(mr)
-            # Top up to the manifest's full weight: zero extra for the ASC-MHL
-            # subprocess path (advanced_box stays 0), the unhashed remainder for
-            # classic. Always called so the bar still ticks for a zero-weight
-            # manifest (empty or all-<null>).
             progress.advance(bar_task, max(0, weights[f] - advanced_box[0]))
             progress.update(bar_task, done=i + 1)
             if exit_status == 0:
                 exit_status = code
-        # Signal refresh thread to stop and wait for it to exit.
-        stop_event.set()
-        refresh_thread.join()
         label.plain = ""
         label.append("🔎 Verifying… ", style="bold")
         label.append("done", style="green")
