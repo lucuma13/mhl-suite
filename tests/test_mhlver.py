@@ -13,8 +13,9 @@ import pytest
 from hypothesis import HealthCheck, assume, given, settings, strategies
 from lxml import etree
 
-from mhl_suite import mhlver, verifyall
+from mhl_suite import verifyall
 from mhl_suite.ascmhl import sizecheck as ascmhl_sizecheck
+from mhl_suite.cli import mhlver
 from mhl_suite.shared.results import FileOutcome, VerifyReport
 
 # ---------------------------------------------------------------------------

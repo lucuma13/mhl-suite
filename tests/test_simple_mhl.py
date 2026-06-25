@@ -22,10 +22,10 @@ if TYPE_CHECKING:
 import xxhash
 from lxml import etree
 
-from mhl_suite import simple_mhl
 from mhl_suite._internal import hostinfo, ignorelist, unicodepaths
 from mhl_suite.classicmhl import seal as core_seal
 from mhl_suite.classicmhl import verify as core_verify
+from mhl_suite.cli import simple_mhl
 from mhl_suite.shared import hashing as core_hashing
 
 

@@ -50,8 +50,8 @@ dependencies = [
   "xxhash>=3.7.1",
 ]
 urls.Homepage = "https://github.com/lucuma13/mhl-suite"
-scripts.mhlver = "mhl_suite.mhlver:main"
-scripts.simple-mhl = "mhl_suite.simple_mhl:main"
+scripts.mhlver = "mhl_suite.cli.mhlver:main"
+scripts.simple-mhl = "mhl_suite.cli.simple_mhl:main"
 
 [dependency-groups]
 dev = [
