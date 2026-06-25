@@ -42,8 +42,10 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-  "ascmhl>=1.2",
+  "click>=8.1.7",
   "lxml>=6.1.1",
+  "pathspec>=0.8",
+  "python-dateutil>=2.8.2",
   "rich>=15",
   "xxhash>=3.7.1",
 ]
@@ -73,6 +75,13 @@ managed = true
 
 [tool.ruff]
 line-length = 120
+# Vendored upstream ASC-MHL engine (synced ~verbatim from github.com/ascmhl/mhl
+# v1.2; see src/mhl_suite/ascmhl/vendor/LICENSE and VENDOR.md). The whole vendor/
+# dir is excluded from lint/format so the suite's strict rules don't force-rewrite
+# third-party code and break re-syncing; new upstream files are covered automatically.
+# Our own ASC-MHL code (ascmhl/verify.py, ascmhl/sizecheck.py) sits outside vendor/
+# and IS linted.
+extend-exclude = [ "src/mhl_suite/ascmhl/vendor" ]
 lint.select = [
   "A",    # flake8-builtins
   "ANN",  # flake8-annotations
@@ -119,6 +128,12 @@ lint.mccabe.max-complexity = 15  # Cyclomatic-complexity ceiling
 [tool.typos]
 default.extend-ignore-re = [ '\b[0-9a-fA-F]{8,}\b' ]  # Hash digests
 default.extend-words.Nd = "Nd"  # "Number, decimal digit" Unicode category in Hypothesis strategy
+
+[tool.ty]
+# Don't type-check the vendored upstream ASC-MHL engine (see [tool.ruff]
+# extend-exclude for the rationale). Our own ascmhl/verify.py & ascmhl/sizecheck.py
+# sit outside vendor/ and stay checked.
+src.exclude = [ "src/mhl_suite/ascmhl/vendor" ]
 
 [tool.pytest]
 ini_options.addopts = "--strict-markers --cov=src --cov-branch --cov-report=term-missing --cov-report=xml"
