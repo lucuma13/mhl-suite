@@ -102,7 +102,7 @@ def stub_verify_package(monkeypatch, code, entries=None):
     through mhl_suite.ascmhl.verify.verify_package, so dispatch/wiring tests pin
     its structured result instead of a subprocess StepResult.
     """
-    report = verifyall.ascmhl_verify.AscVerifyReport(entries=entries or [], code=code)
+    report = verifyall.VerifyReport(entries=entries or [], code=code)
     monkeypatch.setattr(verifyall.ascmhl_verify, "verify_package", lambda *a, **k: report)
 
 
@@ -2233,7 +2233,7 @@ class TestSinglePassVerify:
 
         def _spy(root_path, *, on_progress=None):
             calls["n"] += 1
-            return verifyall.ascmhl_verify.AscVerifyReport(entries=[], code=0)
+            return verifyall.VerifyReport(entries=[], code=0)
 
         monkeypatch.setattr(verifyall.ascmhl_verify, "verify_package", _spy)
         pkg = tmp_path / "ascmhl"

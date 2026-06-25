@@ -191,7 +191,7 @@ def _emit_step_output(
 #
 # As with the classic MHL table, mhlver gives a single short status line per
 # manifest; the per-file detail (which file mismatched, which manifest is
-# missing) comes from the structured AscVerifyReport, rendered by
+# missing) comes from the structured VerifyReport, rendered by
 # _render_ascmhl_lines. The exit code preserves the precise failure category.
 def _log_by_severity(
     severity: str,

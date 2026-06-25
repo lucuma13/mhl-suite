@@ -12,6 +12,24 @@
 # =============================================================================
 
 from dataclasses import dataclass, field
+from enum import Enum
+
+
+class VerifyStatus(Enum):
+    """Dialect-neutral verification outcome for a manifest.
+
+    Both dialects report a numeric exit `code` (with different per-dialect
+    meanings — see mhl_suite.verifyall's dispatch tables), so this enum gives
+    library callers one vocabulary to branch on instead of magic numbers. It is
+    derived from a report's entries; `code` stays the source of truth for the CLI
+    and for tooling that wants the precise per-dialect category.
+    """
+
+    OK = "ok"
+    MISSING = "missing"  # referenced file(s) absent from disk
+    MISMATCH = "mismatch"  # hash or size differs (or a per-file verify error)
+    NEW_FILES = "new"  # files on disk not recorded in the manifest/history
+    MALFORMED = "malformed"  # the manifest itself could not be parsed
 
 
 @dataclass
@@ -64,3 +82,28 @@ class VerifyReport:
     code: int = 0
     malformed: bool = False
     notices: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """True when the manifest verified cleanly (exit code 0)."""
+        return self.code == 0
+
+    @property
+    def status(self) -> VerifyStatus:
+        """The dialect-neutral outcome, derived from the entries.
+
+        When several conditions co-occur, the most severe present wins, in the
+        order malformed → mismatch/error → missing → new → ok. (`code` still
+        carries the exact per-dialect category, e.g. classic 70 = missing AND
+        mismatch.)
+        """
+        if self.malformed:
+            return VerifyStatus.MALFORMED
+        kinds = {e.status for e in self.entries}
+        if "mismatch" in kinds or "error" in kinds:
+            return VerifyStatus.MISMATCH
+        if "missing" in kinds:
+            return VerifyStatus.MISSING
+        if "new" in kinds:
+            return VerifyStatus.NEW_FILES
+        return VerifyStatus.OK

@@ -28,6 +28,7 @@ from mhl_suite.ascmhl import verify as ascmhl_verify
 from mhl_suite.ascmhl.sizecheck import verify_ascmhl_sizes
 from mhl_suite.classicmhl.verify import render_verify_lines, schema_report, verify_manifest
 from mhl_suite.shared.report import FileResult, ManifestResult
+from mhl_suite.shared.results import VerifyReport, VerifyStatus  # noqa: F401 — VerifyStatus used by mhlver mapping
 
 # -----------------------------------------------------------------------------
 # Per-manifest status rendering data
@@ -68,13 +69,13 @@ def _emit(
 # Both dialects are verified in-process now: classic via mhl_suite.classicmhl.verify
 # and ASC-MHL via mhl_suite.ascmhl.verify, each returning structured outcomes — so
 # there is no backend stdout to parse. _render_ascmhl_lines reproduces the
-# per-file terminal text from an AscVerifyReport (the ASC-MHL counterpart to
+# per-file terminal text from a VerifyReport (the ASC-MHL counterpart to
 # classicmhl.render_verify_lines): failure lines always, OK lines only when
 # verbose, matching the old `ascmhl-debug verify [-v]` output mhlver used to relay.
 
 
-def _render_ascmhl_lines(report: "ascmhl_verify.AscVerifyReport", verbose: bool) -> list[str]:
-    """Render an AscVerifyReport to the per-file lines shown on the terminal."""
+def _render_ascmhl_lines(report: VerifyReport, verbose: bool) -> list[str]:
+    """Render a VerifyReport to the per-file lines shown on the terminal."""
     out: list[str] = []
     if verbose:
         out.extend(e.line for e in report.entries if e.status == "ok")
@@ -135,7 +136,7 @@ _CLASSICMHL_SCHEMA_RESULTS: dict[int, tuple[str, str]] = {
 #
 # As with the classic MHL table, mhlver gives a single short status line per
 # manifest; the per-file detail (which file mismatched, which manifest is
-# missing) comes from the structured AscVerifyReport, rendered by
+# missing) comes from the structured VerifyReport, rendered by
 # _render_ascmhl_lines. The exit code preserves the precise failure category.
 _ASCMHL_VERIFY_RESULTS: dict[int, tuple[str, str]] = {
     0: ("✅ ASC-MHL verified: {target}", "success"),

@@ -15,39 +15,27 @@
 # giving the suite a clean library boundary.
 # =============================================================================
 
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import click
 from lxml import etree
 
 from mhl_suite.ascmhl.vendor import commands, errors, logger
-from mhl_suite.shared.results import FileOutcome
+from mhl_suite.shared.results import FileOutcome, VerifyReport
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-
-@dataclass
-class AscVerifyReport:
-    """Structured outcome of verifying one ASC-MHL package.
-
-    `code` is the upstream ASC-MHL exit code (see ascmhl/errors.py): 0 clean,
-    10 missing files, 11 hash mismatch, 12 directory-hash mismatch, 20 single
-    file not found, 21 new files, 30/31/32/33 history/chain/manifest problems.
-    mhlver's `_ASCMHL_VERIFY_RESULTS` already maps these to status lines.
-
-    `entries` are the per-file outcomes in traversal order. `notices` mirror
-    classicmhl's manifest-level notes (unused today, kept for symmetry).
-    """
-
-    entries: list[FileOutcome] = field(default_factory=list)
-    code: int = 0
-    notices: list[str] = field(default_factory=list)
+# NOTE: the vendored verify engine checks only the *first* `original` hash entry
+# per file (find_original_hash_entry_for_path), so a file recorded with several
+# formats (the XSD allows one of each: c4/md5/sha1/xxh128/xxh3/xxh64) is verified
+# on just one — there is no ASC equivalent of classic's `-a all` yet. A future
+# multi-hash mode should arrive as verify_package(..., algorithm=...) mirroring
+# classicmhl.verify_manifest's shape (None / list of tags / "all").
 
 
-def verify_package(root_path: "str | Path", *, on_progress: "Callable[[int], None] | None" = None) -> AscVerifyReport:
+def verify_package(root_path: "str | Path", *, on_progress: "Callable[[int], None] | None" = None) -> VerifyReport:
     """Verify the ASC-MHL package rooted at `root_path` in-process.
 
     `root_path` is the directory the manifest describes (the parent of the
@@ -55,9 +43,13 @@ def verify_package(root_path: "str | Path", *, on_progress: "Callable[[int], Non
     size as it finishes hashing, so a caller can drive a progress bar — the
     ASC-MHL counterpart to classicmhl.verify_manifest(on_progress=...).
 
-    Returns an AscVerifyReport. Failure is signalled by `code`, never by an
-    exception or process exit. The vendored engine's logger output is suppressed
-    so the caller owns all terminal rendering.
+    Returns a shared.results.VerifyReport (same type as classic verify). `code`
+    is the upstream ASC-MHL exit code (see vendor/errors.py): 0 clean, 10 missing
+    files, 11 hash mismatch, 12 directory-hash mismatch, 21 new files,
+    30/31/32/33 history/chain/manifest problems. Failure is signalled by `code`,
+    never by an exception or process exit; `report.status`/`report.ok` give the
+    dialect-neutral view. The vendored engine's logger output is suppressed so the
+    caller owns all terminal rendering.
     """
     entries: list[FileOutcome] = []
     prev_quiet = logger.quiet
@@ -72,7 +64,7 @@ def verify_package(root_path: "str | Path", *, on_progress: "Callable[[int], Non
         code = getattr(exc, "exit_code", 1)
     finally:
         logger.quiet = prev_quiet
-    return AscVerifyReport(entries=entries, code=code)
+    return VerifyReport(entries=entries, code=code)
 
 
 def schema_check(file_path: "str | Path", *, directory_file: bool = False) -> "tuple[int, list[str]]":
