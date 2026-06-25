@@ -13,7 +13,7 @@ import pytest
 from hypothesis import HealthCheck, assume, given, settings, strategies
 from lxml import etree
 
-from mhl_suite import mhlver
+from mhl_suite import mhlver, verifyall
 from mhl_suite.ascmhl import sizecheck as ascmhl_sizecheck
 from mhl_suite.shared.results import FileOutcome, VerifyReport
 
@@ -101,18 +101,18 @@ def stub_verify_package(monkeypatch, code, entries=None):
     through mhl_suite.ascmhl.verify.verify_package, so dispatch/wiring tests pin
     its structured result instead of a subprocess StepResult.
     """
-    report = mhlver.ascmhl_verify.AscVerifyReport(entries=entries or [], code=code)
-    monkeypatch.setattr(mhlver.ascmhl_verify, "verify_package", lambda *a, **k: report)
+    report = verifyall.ascmhl_verify.AscVerifyReport(entries=entries or [], code=code)
+    monkeypatch.setattr(verifyall.ascmhl_verify, "verify_package", lambda *a, **k: report)
 
 
 def stub_integrity_check(monkeypatch, code, message=""):
     """Replace ascmhl.verify.integrity_check (the size-only integrity gate)."""
-    monkeypatch.setattr(mhlver.ascmhl_verify, "integrity_check", lambda *a, **k: (code, message))
+    monkeypatch.setattr(verifyall.ascmhl_verify, "integrity_check", lambda *a, **k: (code, message))
 
 
 def call_verify(manifest):
     """Invoke _ascmhl_verify with sane defaults and return its exit code."""
-    rc, _mr = mhlver._ascmhl_verify(target=manifest, verbose=False)
+    rc, _mr = verifyall._ascmhl_verify(target=manifest, verbose=False)
     return rc
 
 
@@ -240,7 +240,7 @@ class TestMhlver:
         (tmp_path / "sub").mkdir()
         (tmp_path / "sub" / "c.MhL").write_text("")
 
-        found = sorted(p.name for p in mhlver.find_mhl_files(tmp_path))
+        found = sorted(p.name for p in verifyall.find_mhl_files(tmp_path))
         assert found == ["a.mhl", "b.MHL", "c.MhL"]
 
     def test_select_mhl_files_dedups_ascmhl(self, tmp_path):
@@ -269,7 +269,7 @@ class TestMhlver:
         (hidden_dir / "valid.mhl").write_text("")
         (tmp_path / "._resource.mhl").write_text("")
 
-        found = list(mhlver.find_mhl_files(tmp_path))
+        found = list(verifyall.find_mhl_files(tmp_path))
         names = {p.name for p in found}
 
         assert "valid.mhl" in names, "File inside ._hidden dir should be included"
@@ -295,7 +295,7 @@ class TestMhlver:
         if not created:
             pytest.skip("OS refused to create any reserved-name files (expected on Windows)")
 
-        found_names = {p.name for p in mhlver.find_mhl_files(tmp_path)}
+        found_names = {p.name for p in verifyall.find_mhl_files(tmp_path)}
         for f in created:
             assert f.name in found_names, f"{f.name} exists on disk but was not yielded by find_mhl_files"
 
@@ -318,7 +318,7 @@ class TestMhlver:
         if not created:
             pytest.skip("OS refused to create any reserved-name files (expected on Windows)")
 
-        found_names = {p.name for p in mhlver.find_mhl_files(tmp_path)}
+        found_names = {p.name for p in verifyall.find_mhl_files(tmp_path)}
         for f in created:
             assert f.name in found_names, f"{f.name} was unexpectedly filtered out by find_mhl_files"
 
@@ -545,7 +545,7 @@ class TestAscMhlTotalBytes:
                 },
             ],
         )
-        assert mhlver._ascmhl_total_bytes(ascdir / "0001.mhl") == 223591 + 329746
+        assert verifyall._ascmhl_total_bytes(ascdir / "0001.mhl") == 223591 + 329746
 
     def test_verification_pass_does_not_double_count(self, tmp_path, write_mhl):
         """A second generation that re-verifies the same files must not add to the total."""
@@ -568,7 +568,7 @@ class TestAscMhlTotalBytes:
         write_mhl(ascdir, "0001.mhl", entries)
         write_mhl(ascdir, "0002.mhl", [{**e, "action": "verified"} for e in entries])
         # Must equal single-generation total, not double it.
-        assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 223591 + 329746
+        assert verifyall._ascmhl_total_bytes(ascdir / "0002.mhl") == 223591 + 329746
 
     def test_new_files_in_later_generation_are_included(self, tmp_path, write_mhl):
         """Files introduced in a later generation are counted exactly once."""
@@ -604,7 +604,7 @@ class TestAscMhlTotalBytes:
                 },
             ],
         )
-        assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000000 + 2000000
+        assert verifyall._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000000 + 2000000
 
     def test_directory_hashes_without_size_are_skipped(self, tmp_path, write_mhl):
         """<directoryhash><path> elements carry no size attribute and must be silently ignored.
@@ -634,7 +634,7 @@ class TestAscMhlTotalBytes:
   </hashes>
 </hashlist>""")
         # Only the <hash><path> contributes; <directoryhash><path> has no size.
-        assert mhlver._ascmhl_total_bytes(mhl) == 1073741824
+        assert verifyall._ascmhl_total_bytes(mhl) == 1073741824
 
     def test_ascmhl_from_shotputpro_two_generation_transfer(self, tmp_path, write_mhl):
         """Six files transferred in generation 1, all re-verified in generation 2.
@@ -663,7 +663,7 @@ class TestAscMhlTotalBytes:
             "0002.mhl",
             [{"path": p, "size": s, "action": "verified", "digest": d} for p, s, d in files],
         )
-        assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 1_811_635
+        assert verifyall._ascmhl_total_bytes(ascdir / "0002.mhl") == 1_811_635
 
     @pytest.mark.parametrize(
         "fixture_name",
@@ -679,7 +679,7 @@ class TestAscMhlTotalBytes:
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
         mhl = load_fixture_mhl(ascdir, fixture_name)
-        assert mhlver._ascmhl_total_bytes(mhl) == _ALIGNED_FIXTURE_TOTAL_BYTES
+        assert verifyall._ascmhl_total_bytes(mhl) == _ALIGNED_FIXTURE_TOTAL_BYTES
 
     def test_corrupt_generation_file_is_skipped_others_still_counted(self, tmp_path, write_mhl):
         """A corrupt .mhl in the ascmhl dir must be silently skipped; valid
@@ -704,7 +704,7 @@ class TestAscMhlTotalBytes:
             ],
         )
         (ascdir / "0002.mhl").write_text("<not valid xml")
-        assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000000
+        assert verifyall._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000000
 
     def test_generations_parsed_in_filename_order(self, tmp_path, write_mhl):
         """Earlier generation's size wins when the same path appears in multiple files."""
@@ -735,7 +735,7 @@ class TestAscMhlTotalBytes:
                 },
             ],
         )
-        assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 100
+        assert verifyall._ascmhl_total_bytes(ascdir / "0002.mhl") == 100
 
     def test_superscript_only_entry_contributes_zero_sibling_generation_unaffected(self, tmp_path):
         """A generation containing only a superscript size contributes 0 bytes,
@@ -764,7 +764,7 @@ class TestAscMhlTotalBytes:
             "</hashlist>\n",
             encoding="utf-8",
         )
-        assert mhlver._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000
+        assert verifyall._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000
 
     def test_all_common_superscript_digits_are_rejected_by_guard(self, tmp_path):
         """The three common Unicode superscript digits — ¹ ² ³ — are all
@@ -802,7 +802,7 @@ class TestAscMhlTotalBytes:
             "</hashlist>\n",
             encoding="utf-8",
         )
-        assert mhlver._ascmhl_total_bytes(mhl) == 100
+        assert verifyall._ascmhl_total_bytes(mhl) == 100
 
 
 # ---------------------------------------------------------------------------
@@ -999,7 +999,7 @@ class TestAscMhlSizeOnly:
         """`ascmhl info` exit 0 -> size phase runs; OK entries are flagged size-only."""
         manifest = _build_ascmhl_package(tmp_path / "pkg", {"a.mov": 100})
         stub_integrity_check(monkeypatch, 0)  # integrity gate passes
-        rc, mr = mhlver._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
+        rc, mr = verifyall._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
         assert rc == 0
         assert mr is not None
         assert mr.manifest_status == "ok"
@@ -1011,7 +1011,7 @@ class TestAscMhlSizeOnly:
         manifest = _build_ascmhl_package(pkg, {"a.mov": 100})
         (pkg / "a.mov").write_bytes(b"x" * 50)
         stub_integrity_check(monkeypatch, 0)  # gate passes
-        rc, mr = mhlver._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
+        rc, mr = verifyall._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
         assert rc == 10
         assert mr is not None
         assert mr.manifest_status == "failed"
@@ -1023,11 +1023,11 @@ class TestAscMhlSizeOnly:
         manifest = _build_ascmhl_package(tmp_path / "pkg", {"a.mov": 100})
         stub_integrity_check(monkeypatch, gate_code, "Modified ASC MHL manifest in history")
         monkeypatch.setattr(
-            mhlver,
+            verifyall,
             "verify_ascmhl_sizes",
             lambda *a, **k: (_ for _ in ()).throw(AssertionError("size phase must be skipped")),
         )
-        rc, mr = mhlver._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
+        rc, mr = verifyall._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
         assert rc == gate_code
         assert mr is not None
         assert mr.manifest_status == "error"
@@ -1039,7 +1039,7 @@ class TestAscMhlSizeOnly:
         (ascdir / "0001.mhl").write_text("<hashlist><not closed")
         _write_chain(ascdir, ["0001.mhl"])
         stub_integrity_check(monkeypatch, 0)  # gate passes; size phase hits the malformed manifest
-        rc, mr = mhlver._verify_ascmhl(ascdir / "0001.mhl", verbose=False, schema=False, size_only=True)
+        rc, mr = verifyall._verify_ascmhl(ascdir / "0001.mhl", verbose=False, schema=False, size_only=True)
         assert rc == 20
         assert mr is not None
         assert mr.manifest_status == "error"
@@ -1072,8 +1072,8 @@ class TestAscMhlDispatch:
 
     def test_schema_check_clean_returns_zero(self, ascmhl_setup, monkeypatch):
         """Both schema checks pass -> exit 0."""
-        monkeypatch.setattr(mhlver.ascmhl_verify, "schema_check", lambda *a, **k: (0, []))
-        rc = mhlver._ascmhl_schema_check(target=ascmhl_setup, verbose=False)
+        monkeypatch.setattr(verifyall.ascmhl_verify, "schema_check", lambda *a, **k: (0, []))
+        rc = verifyall._ascmhl_schema_check(target=ascmhl_setup, verbose=False)
         assert rc == 0
 
     def test_schema_check_manifest_failure_takes_precedence(self, ascmhl_setup, monkeypatch):
@@ -1085,8 +1085,8 @@ class TestAscMhlDispatch:
             # first call is the manifest, second is the chain
             return (11, ["manifest failed"]) if calls["n"] == 1 else (0, [])
 
-        monkeypatch.setattr(mhlver.ascmhl_verify, "schema_check", _stub)
-        rc = mhlver._ascmhl_schema_check(target=ascmhl_setup, verbose=False)
+        monkeypatch.setattr(verifyall.ascmhl_verify, "schema_check", _stub)
+        rc = verifyall._ascmhl_schema_check(target=ascmhl_setup, verbose=False)
         assert rc == 11
 
     def test_dispatch_table_covers_all_known_codes(self):
@@ -1095,7 +1095,7 @@ class TestAscMhlDispatch:
         exit' branch for a documented failure. (127 was the subprocess
         command-not-found code and no longer applies now that verify is in-process.)"""
         documented_codes = {0, 10, 11, 12, 20, 21, 30, 31, 32, 33}
-        missing = documented_codes - set(mhlver._ASCMHL_VERIFY_RESULTS.keys())
+        missing = documented_codes - set(verifyall._ASCMHL_VERIFY_RESULTS.keys())
         assert missing == set(), f"Dispatch table missing codes: {missing}"
 
     def test_ascmhl_failure_detail_shown_on_terminal(self, ascmhl_setup, monkeypatch, capsys):
@@ -1103,7 +1103,8 @@ class TestAscMhlDispatch:
         shown on the terminal so the operator sees what went wrong."""
         entries = [FileOutcome(path="b.mxf", status="mismatch", line="ERROR: hash mismatch for b.mxf")]
         stub_verify_package(monkeypatch, 11, entries)
-        mhlver._ascmhl_verify(target=ascmhl_setup, verbose=False)
+        # The orchestrator is print-free; the CLI sink (_render_status) does the printing.
+        verifyall._ascmhl_verify(target=ascmhl_setup, verbose=False, emit=mhlver._render_status)
         assert "hash mismatch for b.mxf" in capsys.readouterr().err
 
     def test_schema_false_dispatches_to_ascmhl_verify(self, ascmhl_setup, monkeypatch):
@@ -1118,10 +1119,10 @@ class TestAscMhlDispatch:
             called["schema"] = True
             return 0
 
-        monkeypatch.setattr(mhlver, "_ascmhl_verify", _stub_verify)
-        monkeypatch.setattr(mhlver, "_ascmhl_schema_check", _stub_schema)
+        monkeypatch.setattr(verifyall, "_ascmhl_verify", _stub_verify)
+        monkeypatch.setattr(verifyall, "_ascmhl_schema_check", _stub_schema)
 
-        rc, _mr = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False)
+        rc, _mr = verifyall._verify_ascmhl(ascmhl_setup, verbose=False, schema=False)
 
         assert called.get("verify") is True, "_ascmhl_verify was not called"
         assert "schema" not in called, "_ascmhl_schema_check must not be called"
@@ -1129,8 +1130,8 @@ class TestAscMhlDispatch:
 
     def test_schema_false_return_value_is_propagated(self, ascmhl_setup, monkeypatch):
         """The exit code from _ascmhl_verify is returned unchanged."""
-        monkeypatch.setattr(mhlver, "_ascmhl_verify", lambda *a, **kw: (11, None))
-        rc, _mr = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=False)
+        monkeypatch.setattr(verifyall, "_ascmhl_verify", lambda *a, **kw: (11, None))
+        rc, _mr = verifyall._verify_ascmhl(ascmhl_setup, verbose=False, schema=False)
         assert rc == 11
 
     def test_schema_true_dispatches_to_ascmhl_schema_check(self, ascmhl_setup, monkeypatch):
@@ -1141,8 +1142,8 @@ class TestAscMhlDispatch:
             called["yes"] = True
             return 0
 
-        monkeypatch.setattr(mhlver, "_ascmhl_schema_check", _stub_schema_check)
-        rc, _mr = mhlver._verify_ascmhl(ascmhl_setup, verbose=False, schema=True)
+        monkeypatch.setattr(verifyall, "_ascmhl_schema_check", _stub_schema_check)
+        rc, _mr = verifyall._verify_ascmhl(ascmhl_setup, verbose=False, schema=True)
         assert called.get("yes") is True
         assert rc == 0
 
@@ -1168,7 +1169,7 @@ class TestClassicMhlDispatch:
 
     @staticmethod
     def _stub_verify(monkeypatch, report):
-        monkeypatch.setattr(mhlver, "verify_manifest", lambda *a, **kw: report)
+        monkeypatch.setattr(verifyall, "verify_manifest", lambda *a, **kw: report)
 
     @pytest.mark.parametrize("exit_code", [0, 20, 30, 40, 70])
     def test_verify_classicmhl_exit_code_propagates(self, classic_mhl, monkeypatch, exit_code):
@@ -1183,7 +1184,7 @@ class TestClassicMhlDispatch:
             )
             report = VerifyReport(entries=entries, code=exit_code)
         self._stub_verify(monkeypatch, report)
-        rc, _mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
+        rc, _mr = verifyall._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
         assert rc == exit_code
 
     def test_manifest_status_is_failed_when_entries_present(self, classic_mhl, monkeypatch):
@@ -1193,7 +1194,7 @@ class TestClassicMhlDispatch:
             code=40,
         )
         self._stub_verify(monkeypatch, report)
-        rc, mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
+        rc, mr = verifyall._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
         assert rc == 40
         assert mr is not None
         assert mr.manifest_status == "failed"
@@ -1201,7 +1202,7 @@ class TestClassicMhlDispatch:
     def test_manifest_status_is_error_on_malformed(self, classic_mhl, monkeypatch):
         """Malformed XML (no per-file outcomes) yields manifest_status 'error'."""
         self._stub_verify(monkeypatch, VerifyReport(code=20, malformed=True))
-        rc, mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
+        rc, mr = verifyall._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
         assert rc == 20
         assert mr is not None
         assert mr.manifest_status == "error"
@@ -1217,8 +1218,8 @@ class TestClassicMhlDispatch:
                 code=0,
             )
 
-        monkeypatch.setattr(mhlver, "verify_manifest", _stub)
-        rc, mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False, size_only=True)
+        monkeypatch.setattr(verifyall, "verify_manifest", _stub)
+        rc, mr = verifyall._verify_classicmhl(target=classic_mhl, verbose=False, schema=False, size_only=True)
         assert rc == 0
         assert seen["size_only"] is True
         assert mr is not None
@@ -1227,14 +1228,14 @@ class TestClassicMhlDispatch:
     def test_verify_classicmhl_dispatch_table_covers_engine_codes(self):
         """_CLASSICMHL_RESULTS must cover every exit code the classic engine emits."""
         engine_codes = {0, 20, 30, 40, 70}
-        missing = engine_codes - set(mhlver._CLASSICMHL_RESULTS.keys())
+        missing = engine_codes - set(verifyall._CLASSICMHL_RESULTS.keys())
         assert missing == set(), f"Dispatch table missing codes: {missing}"
 
     def test_schema_uses_classicmhl_schema_results_table(self, classic_mhl, monkeypatch, capsys):
         """Schema mode runs schema_report and maps the code via
         _CLASSICMHL_SCHEMA_RESULTS — exit 60 has a specific 'schema' message."""
-        monkeypatch.setattr(mhlver, "schema_report", lambda mhl_file: (60, ["Error: could not locate XSD"]))
-        rc, _mr = mhlver._verify_classicmhl(classic_mhl, verbose=False, schema=True)
+        monkeypatch.setattr(verifyall, "schema_report", lambda mhl_file: (60, ["Error: could not locate XSD"]))
+        rc, _mr = verifyall._verify_classicmhl(classic_mhl, verbose=False, schema=True, emit=mhlver._render_status)
         assert rc == 60
         captured = capsys.readouterr()
         assert "schema" in (captured.out + captured.err).lower()
@@ -1305,7 +1306,7 @@ class TestReportViaTable:
         """When show_status_on_terminal=False and exit=0, the success line is
         suppressed entirely (the silent-progress-bar path)."""
         mhlver._report_via_table(
-            mhlver._CLASSICMHL_RESULTS,
+            verifyall._CLASSICMHL_RESULTS,
             0,
             "manifest.mhl",
             "",
@@ -1320,7 +1321,7 @@ class TestReportViaTable:
         """Errors must always appear on the terminal regardless of
         show_status_on_terminal, because operators need immediate visibility."""
         mhlver._report_via_table(
-            mhlver._CLASSICMHL_RESULTS,
+            verifyall._CLASSICMHL_RESULTS,
             40,
             "bad.mhl",
             "",
@@ -1347,7 +1348,7 @@ class TestVerifyItem:
             called["ascmhl"] = True
             return 0
 
-        monkeypatch.setattr(mhlver, "_verify_ascmhl", _stub)
+        monkeypatch.setattr(verifyall, "_verify_ascmhl", _stub)
         ascmhl_dir = tmp_path / "pkg" / "ascmhl"
         ascmhl_dir.mkdir(parents=True)
         manifest = ascmhl_dir / "0001.mhl"
@@ -1363,7 +1364,7 @@ class TestVerifyItem:
             called["classicmhl"] = True
             return 0
 
-        monkeypatch.setattr(mhlver, "_verify_classicmhl", _stub)
+        monkeypatch.setattr(verifyall, "_verify_classicmhl", _stub)
         mhl = tmp_path / "manifest.mhl"
         mhl.write_text("")
         mhlver.verify_item(mhl, verbose=False, schema=False)
@@ -1388,17 +1389,17 @@ class TestMhlTotalBytes:
             "<hash><file>b.bin</file><size>200</size><xxhash64be>bb</xxhash64be></hash>"
             "</hashlist>"
         )
-        assert mhlver._mhl_total_bytes(mhl) == 300
+        assert verifyall._mhl_total_bytes(mhl) == 300
 
     def test_returns_zero_on_parse_failure(self, tmp_path):
         """Returns 0 when the file cannot be parsed."""
         mhl = tmp_path / "broken.mhl"
         mhl.write_text("<not valid xml")
-        assert mhlver._mhl_total_bytes(mhl) == 0
+        assert verifyall._mhl_total_bytes(mhl) == 0
 
     def test_returns_zero_for_missing_file(self, tmp_path):
         """Returns 0 when the file doesn't exist."""
-        assert mhlver._mhl_total_bytes(tmp_path / "ghost.mhl") == 0
+        assert verifyall._mhl_total_bytes(tmp_path / "ghost.mhl") == 0
 
     def test_skips_non_digit_size_elements(self, tmp_path):
         """Non-numeric <size> values are ignored rather than raising."""
@@ -1410,7 +1411,7 @@ class TestMhlTotalBytes:
             "<hash><file>b.bin</file><size>50</size><xxhash64be>bb</xxhash64be></hash>"
             "</hashlist>"
         )
-        assert mhlver._mhl_total_bytes(mhl) == 50
+        assert verifyall._mhl_total_bytes(mhl) == 50
 
     def test_null_entry_excluded(self, tmp_path):
         """A <null> (size-only) entry reads zero bytes at verify time, so its
@@ -1423,7 +1424,7 @@ class TestMhlTotalBytes:
             "<hash><file>b.bin</file><size>200</size><null></null></hash>"
             "</hashlist>"
         )
-        assert mhlver._mhl_total_bytes(mhl) == 100
+        assert verifyall._mhl_total_bytes(mhl) == 100
 
     def test_existence_only_entry_is_zero(self, tmp_path):
         """A <null> entry with no <size> (existence-only) contributes nothing."""
@@ -1431,7 +1432,7 @@ class TestMhlTotalBytes:
         mhl.write_text(
             '<?xml version="1.0"?>\n<hashlist version="1.1"><hash><file>a.bin</file><null></null></hash></hashlist>'
         )
-        assert mhlver._mhl_total_bytes(mhl) == 0
+        assert verifyall._mhl_total_bytes(mhl) == 0
 
     @pytest.mark.parametrize(
         "fixture_name",
@@ -1446,7 +1447,7 @@ class TestMhlTotalBytes:
         """Real-world classic MHL exports from each vendor sum to the same
         aligned total."""
         mhl = load_fixture_mhl(tmp_path, fixture_name)
-        assert mhlver._mhl_total_bytes(mhl) == _ALIGNED_FIXTURE_TOTAL_BYTES
+        assert verifyall._mhl_total_bytes(mhl) == _ALIGNED_FIXTURE_TOTAL_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -2191,7 +2192,7 @@ class TestSchemaShapedAscMhlFuzz:
             ascdir.mkdir()
             mhl = ascdir / "0001.mhl"
             mhl.write_bytes(xml)
-            total = mhlver._ascmhl_total_bytes(mhl)
+            total = verifyall._ascmhl_total_bytes(mhl)
             assert isinstance(total, int)
             assert total >= 0
 
@@ -2208,7 +2209,7 @@ class TestSchemaShapedAscMhlFuzz:
         with tempfile.TemporaryDirectory() as tmp:
             mhl = Path(tmp) / "classic.mhl"
             mhl.write_bytes(xml)
-            total = mhlver._mhl_total_bytes(mhl)
+            total = verifyall._mhl_total_bytes(mhl)
             assert isinstance(total, int)
             assert total >= 0
 
@@ -2231,14 +2232,14 @@ class TestSinglePassVerify:
 
         def _spy(root_path, *, on_progress=None):
             calls["n"] += 1
-            return mhlver.ascmhl_verify.AscVerifyReport(entries=[], code=0)
+            return verifyall.ascmhl_verify.AscVerifyReport(entries=[], code=0)
 
-        monkeypatch.setattr(mhlver.ascmhl_verify, "verify_package", _spy)
+        monkeypatch.setattr(verifyall.ascmhl_verify, "verify_package", _spy)
         pkg = tmp_path / "ascmhl"
         pkg.mkdir()
         target = pkg / "0001.mhl"
         target.write_text("<x/>")
 
-        mhlver._ascmhl_verify(target, verbose=False)
+        verifyall._ascmhl_verify(target, verbose=False)
 
         assert calls["n"] == 1, f"expected 1 hashing pass, got {calls['n']}"
