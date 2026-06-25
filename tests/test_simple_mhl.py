@@ -24,6 +24,9 @@ from lxml import etree
 
 from mhl_suite import simple_mhl
 from mhl_suite._internal import hostinfo, ignorelist, unicodepaths
+from mhl_suite.classicmhl import seal as core_seal
+from mhl_suite.classicmhl import verify as core_verify
+from mhl_suite.shared import hashing as core_hashing
 
 
 def make_tree(root: Path, spec: dict):
@@ -275,7 +278,7 @@ class TestSeal:
         def _boom(*_a, **_k):
             raise AssertionError("null seal must not hash files")
 
-        monkeypatch.setattr(simple_mhl, "get_hashes", _boom)
+        monkeypatch.setattr(core_hashing, "get_hashes", _boom)
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "null"])
         assert rc == 0
 
@@ -500,7 +503,7 @@ class TestSealMultiFormat:
                 opens.append(str(path))
             return real_open(path, *args, **kwargs)
 
-        monkeypatch.setattr(simple_mhl, "open", counting_open, raising=False)
+        monkeypatch.setattr(core_hashing, "open", counting_open, raising=False)
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5,sha1,xxhash"])
         assert rc == 0
         assert opens == [str(target)], f"expected one read pass, got {len(opens)}"
@@ -1434,7 +1437,7 @@ class TestSealAtomicCollision:
         class _Info:
             ts = "2025-06-01_120000"
 
-        with patch("mhl_suite.simple_mhl.datetime") as mock_dt:
+        with patch("mhl_suite.classicmhl.seal.datetime") as mock_dt:
             mock_dt.now.return_value = fixed
             mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
             yield _Info()
@@ -1501,7 +1504,7 @@ class TestValidateSchemaXsdNotFound:
         def _raise():
             raise FileNotFoundError("Could not locate MediaHashList_v1_1.xsd (tried /fake/path)")
 
-        monkeypatch.setattr(simple_mhl, "get_xsd_path", _raise)
+        monkeypatch.setattr(core_verify, "get_xsd_path", _raise)
 
         rc, _, err = mhl_cli(["xsd-schema-check", str(mhl_file)])
         assert rc == 60
@@ -1533,7 +1536,12 @@ class TestGetXsdPathFallbackPaths:
 
     def test_falls_back_to_local_xsd_when_importlib_raises(self, tmp_path):
         """When importlib.resources.files raises ImportError, the local xsd/
-        sibling is found and its path is returned."""
+        sibling is found and its path is returned.
+
+        get_xsd_path lives in mhl_suite/classicmhl/verify.py, so the checkout fallback
+        resolves xsd/ one level up from the module (parent.parent). We patch
+        core_verify.__file__ to a 2-levels-deep path so tmp_path/xsd is the target.
+        """
 
         xsd_dir = tmp_path / "xsd"
         xsd_dir.mkdir()
@@ -1542,13 +1550,13 @@ class TestGetXsdPathFallbackPaths:
 
         with (
             patch.object(
-                simple_mhl.importlib.resources,
+                core_verify.importlib.resources,
                 "files",
                 side_effect=ImportError("no package"),
             ),
-            patch.object(simple_mhl, "__file__", str(tmp_path / "simple_mhl.py")),
+            patch.object(core_verify, "__file__", str(tmp_path / "classicmhl" / "verify.py")),
         ):
-            result = simple_mhl.get_xsd_path()
+            result = core_verify.get_xsd_path()
 
         assert result == str(xsd_file)
 
@@ -1567,10 +1575,10 @@ class TestGetXsdPathFallbackPaths:
         fake_pkg.joinpath.return_value = fake_resource
 
         with (
-            patch.object(simple_mhl.importlib.resources, "files", return_value=fake_pkg),
-            patch.object(simple_mhl, "__file__", str(tmp_path / "simple_mhl.py")),
+            patch.object(core_verify.importlib.resources, "files", return_value=fake_pkg),
+            patch.object(core_verify, "__file__", str(tmp_path / "classicmhl" / "verify.py")),
         ):
-            result = simple_mhl.get_xsd_path()
+            result = core_verify.get_xsd_path()
 
         assert result == str(xsd_file)
 
@@ -1580,14 +1588,14 @@ class TestGetXsdPathFallbackPaths:
 
         with (
             patch.object(
-                simple_mhl.importlib.resources,
+                core_verify.importlib.resources,
                 "files",
                 side_effect=ImportError("no package"),
             ),
-            patch.object(simple_mhl, "__file__", str(tmp_path / "simple_mhl.py")),
+            patch.object(core_verify, "__file__", str(tmp_path / "classicmhl" / "verify.py")),
             pytest.raises(FileNotFoundError, match=r"MediaHashList_v1_1\.xsd"),
         ):
-            simple_mhl.get_xsd_path()
+            core_verify.get_xsd_path()
 
     def test_verify_file_not_found_exits_1(self, mhl_cli, tmp_path):
         """verify on a nonexistent .mhl file must exit 1."""
@@ -2186,7 +2194,7 @@ class TestTOCTOURaceCondition:
             target.unlink(missing_ok=True)
             return real_get_hashes(filepath, factories)
 
-        monkeypatch.setattr(simple_mhl, "get_hashes", _get_hashes_after_delete)
+        monkeypatch.setattr(core_hashing, "get_hashes", _get_hashes_after_delete)
 
         # No <size> element — size pre-check block is not entered.
         root = etree.Element("hashlist", version="1.1")
@@ -2690,7 +2698,7 @@ class TestSizePreCheck:
             get_hashes_calls.append(filepath)
             return real_get_hashes(filepath, factories)
 
-        monkeypatch.setattr(simple_mhl, "get_hashes", spy_get_hashes)
+        monkeypatch.setattr(core_hashing, "get_hashes", spy_get_hashes)
 
         mhl = make_mhl_with_size(tmp_path, "clip.bin", b"hello", size_override="9999")
 
@@ -2744,7 +2752,7 @@ class TestSizePreCheck:
         def always_correct_hash(filepath, factories):
             return [correct_digest for _ in factories]
 
-        monkeypatch.setattr(simple_mhl, "get_hashes", always_correct_hash)
+        monkeypatch.setattr(core_hashing, "get_hashes", always_correct_hash)
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
 
@@ -2832,7 +2840,7 @@ class TestUnicodeNormalization:
                 nfd_str = unicodedata.normalize("NFD", str(p))
                 yield Path(nfd_str), stat_result
 
-        monkeypatch.setattr(simple_mhl, "_iter_files_for_seal", nfd_iter)
+        monkeypatch.setattr(core_seal, "_iter_files_for_seal", nfd_iter)
 
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
@@ -3308,7 +3316,7 @@ class TestFriendlyHostname:
     def test_creatorinfo_uses_friendly_hostname(self, monkeypatch):
         """The manifest's creatorinfo <hostname> is sourced from the shared
         helper, not the bare network hostname."""
-        monkeypatch.setattr(simple_mhl, "friendly_hostname", lambda: "Luis's MacBook Pro")
+        monkeypatch.setattr(core_seal, "friendly_hostname", lambda: "Luis's MacBook Pro")
         doc = etree.Element("hashlist", version="1.1")
         info = simple_mhl._build_creatorinfo(doc, "simple-mhl test", "2026-01-01T00:00:00Z")
         assert info.findtext("hostname") == "Luis's MacBook Pro"
@@ -3341,23 +3349,23 @@ class TestAdaptiveHashing:
         return paths, sizes, ref
 
     def _force(self, monkeypatch, *, read_bw, hash_bw, cpu=8, min_bytes=0, recheck=8 * 1024**3):
-        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", min_bytes)
-        monkeypatch.setattr(simple_mhl, "_AUTO_RECHECK_BYTES", recheck)
-        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda algo: hash_bw)
+        monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", min_bytes)
+        monkeypatch.setattr(core_hashing, "_AUTO_RECHECK_BYTES", recheck)
+        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw", lambda algo: hash_bw)
         # seal calibrates all formats combined via _calibrate_hash_bw_multi.
-        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw_multi", lambda factories: hash_bw)
-        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda paths: read_bw)
+        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw_multi", lambda factories: hash_bw)
+        monkeypatch.setattr(core_hashing, "_probe_read_bw", lambda paths: read_bw)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: cpu)
 
     def _spy_batch(self, monkeypatch):
         calls: list[int] = []
-        real = simple_mhl._hash_batch
+        real = core_hashing._hash_batch
 
         def spy(jobs, workers):
             calls.append(workers)
             return real(jobs, workers)
 
-        monkeypatch.setattr(simple_mhl, "_hash_batch", spy)
+        monkeypatch.setattr(core_hashing, "_hash_batch", spy)
         return calls
 
     # --- output invariance: the manifest must be identical on every path -----
@@ -3409,17 +3417,17 @@ class TestAdaptiveHashing:
 
     def test_small_job_skips_probe(self, tmp_path, monkeypatch):
         paths, sizes, ref = self._make_files(tmp_path, 5)
-        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 10 * 1024**3)  # larger than the job
+        monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", 10 * 1024**3)  # larger than the job
         probed: list[int] = []
-        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 1.0)
+        monkeypatch.setattr(core_hashing, "_probe_read_bw", lambda p: probed.append(1) or 1.0)
         assert [d for d, _hashdate in simple_mhl._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
         assert probed == [], "a sub-threshold job must not probe the disk"
 
     def test_single_file_skips_probe(self, tmp_path, monkeypatch):
         paths, sizes, ref = self._make_files(tmp_path, 1)
-        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
+        monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", 0)
         probed: list[int] = []
-        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 9e9)
+        monkeypatch.setattr(core_hashing, "_probe_read_bw", lambda p: probed.append(1) or 9e9)
         assert [d for d, _hashdate in simple_mhl._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
         assert probed == [], "nothing to parallelise across a single file"
 
@@ -3434,15 +3442,15 @@ class TestAdaptiveHashing:
         """_hash_batch runs each job callable and returns results in input order;
         jobs resolve get_hash via the module global so monkeypatches intercept."""
         paths, _, _ = self._make_files(tmp_path, 6)
-        monkeypatch.setattr(simple_mhl, "get_hash", lambda p, a: "STUB")
-        jobs: list[Callable[[], str]] = [(lambda p=p: simple_mhl.get_hash(p, "md5")) for p in paths]
-        assert simple_mhl._hash_batch(jobs, 3) == ["STUB"] * 6
+        monkeypatch.setattr(core_hashing, "get_hash", lambda p, a: "STUB")
+        jobs: list[Callable[[], str]] = [(lambda p=p: core_hashing.get_hash(p, "md5")) for p in paths]
+        assert core_hashing._hash_batch(jobs, 3) == ["STUB"] * 6
 
     def test_probe_read_bw_skips_unreadable(self, tmp_path, monkeypatch):
         good = tmp_path / "g.bin"
         good.write_bytes(b"x" * 4096)
-        monkeypatch.setattr(simple_mhl, "_AUTO_PROBE_BYTES", 1)
-        monkeypatch.setattr(simple_mhl, "_AUTO_PROBE_SECONDS", 0.0)
+        monkeypatch.setattr(core_hashing, "_AUTO_PROBE_BYTES", 1)
+        monkeypatch.setattr(core_hashing, "_AUTO_PROBE_SECONDS", 0.0)
         bw = simple_mhl._probe_read_bw([str(tmp_path / "missing.bin"), str(good)])
         assert bw > 0  # unreadable path skipped without error, good file measured
 
@@ -3474,11 +3482,11 @@ class TestSealConcurrency:
 
     @staticmethod
     def _force_parallel(monkeypatch):
-        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
+        monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
-        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda a: 1000.0)
-        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw_multi", lambda f: 1000.0)
-        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: 8000.0)  # read >> hash ⇒ parallel
+        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw", lambda a: 1000.0)
+        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw_multi", lambda f: 1000.0)
+        monkeypatch.setattr(core_hashing, "_probe_read_bw", lambda p: 8000.0)  # read >> hash ⇒ parallel
 
     def test_auto_parallel_produces_correct_digests(self, mhl_cli, tmp_path, monkeypatch):
         make_tree(tmp_path, {"a.bin": b"hello", "sub/b.bin": b"world"})
@@ -3492,12 +3500,12 @@ class TestSealConcurrency:
     def test_default_uses_auto_probe(self, tmp_path, monkeypatch):
         """A plain seal routes through the adaptive probe (no operator input)."""
         make_tree(tmp_path, {"a.bin": b"x", "b.bin": b"y"})
-        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
+        monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
-        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda a: 1000.0)
-        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw_multi", lambda f: 1000.0)
+        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw", lambda a: 1000.0)
+        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw_multi", lambda f: 1000.0)
         probed: list[int] = []
-        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: probed.append(1) or 100.0)  # disk-bound
+        monkeypatch.setattr(core_hashing, "_probe_read_bw", lambda p: probed.append(1) or 100.0)  # disk-bound
         simple_mhl.seal(str(tmp_path), ["md5"], verbose=False)
         assert probed == [1], "the default must probe the disk to decide"
 
@@ -3530,11 +3538,11 @@ class TestVerifyConcurrency:
         return mhl, files
 
     def _force_parallel(self, monkeypatch):
-        monkeypatch.setattr(simple_mhl, "_AUTO_MIN_BYTES", 0)
+        monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
-        monkeypatch.setattr(simple_mhl, "_calibrate_hash_bw", lambda a: 1000.0)
-        monkeypatch.setattr(simple_mhl, "_probe_read_bw", lambda p: 8000.0)  # read >> hash ⇒ parallel
-        monkeypatch.setattr(simple_mhl, "_AUTO_RECHECK_BYTES", 4096)  # several windows over tiny files
+        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw", lambda a: 1000.0)
+        monkeypatch.setattr(core_hashing, "_probe_read_bw", lambda p: 8000.0)  # read >> hash ⇒ parallel
+        monkeypatch.setattr(core_hashing, "_AUTO_RECHECK_BYTES", 4096)  # several windows over tiny files
 
     def test_parallel_matches_sequential_clean(self, mhl_cli, tmp_path, monkeypatch):
         mhl, _ = self._build_manifest(tmp_path)
@@ -3558,3 +3566,83 @@ class TestVerifyConcurrency:
         assert rc_seq == 70  # both missing and mismatch
         assert rc_par == rc_seq
         assert out_par == out_seq  # same buckets, same order
+
+
+# ---------------------------------------------------------------------------
+# TestVerifyManifestOutcomes — the structured contract mhlver's report consumes
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyManifestOutcomes:
+    """verify_manifest emits structured FileOutcomes — status, detail, and the
+    weak-check flags — that mhlver maps straight onto its report (no text parse).
+    These pin that contract directly, replacing the old mhlver output-parser tests."""
+
+    @staticmethod
+    def _write(tmp_path, entries):
+        """entries: list of (file_text, {child_tag: text}); returns the .mhl path."""
+        root = etree.Element("hashlist", version="1.1")
+        for file_text, fields in entries:
+            h = etree.SubElement(root, "hash")
+            etree.SubElement(h, "file").text = file_text
+            for tag, text in fields.items():
+                etree.SubElement(h, tag).text = text
+        mhl = tmp_path / "m.mhl"
+        etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
+        return mhl
+
+    def test_hash_mismatch_detail_is_full_fidelity(self, tmp_path):
+        (tmp_path / "f.bin").write_bytes(b"actual content")  # 14 bytes
+        mhl = self._write(tmp_path, [("f.bin", {"size": "14", "md5": "0" * 32})])
+        report = core_verify.verify_manifest(str(mhl))
+        assert report.code == 40
+        (e,) = report.entries
+        assert e.status == "mismatch"
+        assert e.detail.startswith("hash mismatch: calc md5: ")
+        assert "stored md5: " + "0" * 32 in e.detail
+
+    def test_missing_file(self, tmp_path):
+        mhl = self._write(tmp_path, [("ghost.bin", {"size": "3", "md5": "0" * 32})])
+        report = core_verify.verify_manifest(str(mhl))
+        assert report.code == 30
+        (e,) = report.entries
+        assert e.status == "missing"
+
+    def test_blocked_traversal_is_error(self, tmp_path):
+        mhl = self._write(tmp_path, [("../escape.bin", {"size": "3", "md5": "0" * 32})])
+        (e,) = core_verify.verify_manifest(str(mhl)).entries
+        assert e.status == "error"
+        assert e.detail == "blocked traversal attempt"
+
+    def test_size_only_without_recorded_size_is_error(self, tmp_path):
+        (tmp_path / "f.bin").write_bytes(b"xx")
+        mhl = self._write(tmp_path, [("f.bin", {"md5": "0" * 32})])  # no <size>
+        (e,) = core_verify.verify_manifest(str(mhl), size_only=True).entries
+        assert e.status == "error"
+        assert e.detail == "no size recorded"
+
+    def test_requested_hash_not_stored_is_error(self, tmp_path):
+        (tmp_path / "f.bin").write_bytes(b"xx")
+        mhl = self._write(tmp_path, [("f.bin", {"size": "2", "md5": hashlib.md5(b"xx").hexdigest()})])
+        (e,) = core_verify.verify_manifest(str(mhl), algorithm=["sha1"]).entries
+        assert e.status == "error"
+        assert e.detail == "requested hash sha1 not stored"
+
+    def test_null_entries_set_size_only_and_existence_only(self, tmp_path):
+        (tmp_path / "s.bin").write_bytes(b"abcd")
+        (tmp_path / "e.bin").write_bytes(b"z")
+        mhl = self._write(tmp_path, [("s.bin", {"size": "4", "null": ""}), ("e.bin", {"null": ""})])
+        report = core_verify.verify_manifest(str(mhl))
+        assert report.code == 0
+        by_path = {e.path: e for e in report.entries}
+        assert by_path["s.bin"].size_only is True
+        assert by_path["e.bin"].existence_only is True
+        assert report.notices  # the "Verified with … checks" notice fired
+
+    def test_malformed_xml_sets_code_20(self, tmp_path):
+        mhl = tmp_path / "bad.mhl"
+        mhl.write_text("<hashlist><hash><file>x</file>")  # truncated
+        report = core_verify.verify_manifest(str(mhl))
+        assert report.code == 20
+        assert report.malformed is True
+        assert report.entries == []

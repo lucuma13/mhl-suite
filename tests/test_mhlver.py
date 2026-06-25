@@ -15,7 +15,8 @@ from hypothesis import HealthCheck, assume, given, settings, strategies
 from lxml import etree
 
 from mhl_suite import mhlver
-from mhl_suite._internal import ascmhl_sizecheck
+from mhl_suite.ascmhl import sizecheck as ascmhl_sizecheck
+from mhl_suite.shared.results import FileOutcome, VerifyReport
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -1198,127 +1199,87 @@ class TestAscMhlDispatch:
 
 
 class TestClassicMhlDispatch:
-    """MHL v1 exit-code translation, verbose/schema flags, dispatch table, and command-not-found.
-
-    Both get_command_path and _run_step are patched so no real subprocess
-    is spawned and tests are independent of the installed environment.
-    """
+    """Classic MHL is verified in-process via the core engine. These pin
+    exit-code propagation, manifest-status derivation, size-only flagging, and
+    schema-check dispatch — with verify_manifest / schema_report stubbed so the
+    tests don't depend on real hashing or the filesystem."""
 
     @pytest.fixture
-    def classic_mhl(self, tmp_path, monkeypatch):
-        """A dummy .mhl plus a stubbed simple-mhl on PATH so _verify_classicmhl
-        runs without spawning a real subprocess."""
+    def classic_mhl(self, tmp_path):
+        """A path for a classic manifest. The engine is stubbed per test, so the
+        file contents are irrelevant."""
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
-        # String (not Path) so verbose tests' _verbose_announce can " ".join(cmd).
-        monkeypatch.setattr(mhlver, "get_command_path", lambda _: "/fake/simple-mhl")
         return mhl
 
-    @pytest.mark.parametrize(
-        ("exit_code", "output"),
-        [
-            (0, ""),  # clean
-            (1, "Verification Error: not an MHL file"),  # bad argument
-            (20, "Malformed XML"),  # malformed XML
-            (30, ""),  # missing files
-            (40, ""),  # hash mismatch
-            (70, ""),  # missing + mismatch
-        ],
-    )
-    def test_verify_classicmhl_exit_code_propagates(self, classic_mhl, monkeypatch, exit_code, output):
-        """simple-mhl exit codes are returned unchanged by _verify_classicmhl."""
-        stub_run_step(monkeypatch, exit_code, output)
+    @staticmethod
+    def _stub_verify(monkeypatch, report):
+        monkeypatch.setattr(mhlver, "verify_manifest", lambda *a, **kw: report)
+
+    @pytest.mark.parametrize("exit_code", [0, 20, 30, 40, 70])
+    def test_verify_classicmhl_exit_code_propagates(self, classic_mhl, monkeypatch, exit_code):
+        """The engine's report code is returned unchanged by _verify_classicmhl."""
+        if exit_code == 20:
+            report = VerifyReport(code=20, malformed=True)
+        else:
+            entries = (
+                []
+                if exit_code == 0
+                else [FileOutcome(path="f.mxf", status="mismatch", line="[ERROR] hash mismatch: f.mxf")]
+            )
+            report = VerifyReport(entries=entries, code=exit_code)
+        self._stub_verify(monkeypatch, report)
         rc, _mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
         assert rc == exit_code
 
-    def test_manifest_status_is_failed_when_output_is_parseable(self, classic_mhl, monkeypatch):
-        """A non-zero exit WITH parseable [ERROR] lines yields manifest_status
-        'failed' (not 'error')."""
-        stub_run_step(monkeypatch, 40, "[ERROR] hash mismatch: f.mxf")
+    def test_manifest_status_is_failed_when_entries_present(self, classic_mhl, monkeypatch):
+        """A non-zero code WITH per-file outcomes yields manifest_status 'failed'."""
+        report = VerifyReport(
+            entries=[FileOutcome(path="f.mxf", status="mismatch", detail="hash mismatch")],
+            code=40,
+        )
+        self._stub_verify(monkeypatch, report)
         rc, mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
         assert rc == 40
         assert mr is not None
         assert mr.manifest_status == "failed"
 
-    def test_manifest_status_is_error_when_output_is_empty(self, classic_mhl, monkeypatch):
-        """A non-zero exit with NO parseable output yields manifest_status 'error'."""
-        stub_run_step(monkeypatch, 20, "")
+    def test_manifest_status_is_error_on_malformed(self, classic_mhl, monkeypatch):
+        """Malformed XML (no per-file outcomes) yields manifest_status 'error'."""
+        self._stub_verify(monkeypatch, VerifyReport(code=20, malformed=True))
         rc, mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
         assert rc == 20
         assert mr is not None
         assert mr.manifest_status == "error"
 
-    def test_size_only_adds_S_flag_and_flags_results(self, classic_mhl, monkeypatch):
-        """size_only adds -S to the simple-mhl verify command and marks OK results."""
-        seen: dict[str, list[str]] = {}
+    def test_size_only_is_passed_through_and_flagged(self, classic_mhl, monkeypatch):
+        """size_only reaches verify_manifest and OK results carry the size-only flag."""
+        seen: dict[str, bool] = {}
 
-        def _capture(cmd, cwd=None, **kw):
-            seen["cmd"] = cmd
-            return mhlver.StepResult(exit_code=0, output="[OK] clip.mxf  size: 4170")
+        def _stub(mhl_file, *, size_only=False, on_progress=None):
+            seen["size_only"] = size_only
+            return VerifyReport(
+                entries=[FileOutcome(path="clip.mxf", status="ok", size_only=True, line="[OK] clip.mxf  size: 4170")],
+                code=0,
+            )
 
-        monkeypatch.setattr(mhlver, "_run_step", _capture)
+        monkeypatch.setattr(mhlver, "verify_manifest", _stub)
         rc, mr = mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False, size_only=True)
         assert rc == 0
-        assert "-S" in seen["cmd"]
+        assert seen["size_only"] is True
         assert mr is not None
         assert mr.n_size_only == 1
 
-    def test_no_S_flag_without_size_only(self, classic_mhl, monkeypatch):
-        """Without size_only the -S flag is not passed to simple-mhl."""
-        seen: dict[str, list[str]] = {}
-
-        def _capture(cmd, cwd=None, **kw):
-            seen["cmd"] = cmd
-            return mhlver.StepResult(exit_code=0, output="")
-
-        monkeypatch.setattr(mhlver, "_run_step", _capture)
-        mhlver._verify_classicmhl(target=classic_mhl, verbose=False, schema=False)
-        assert "-S" not in seen["cmd"]
-
-    def test_verify_classicmhl_dispatch_table_covers_all_known_codes(self):
-        """_CLASSICMHL_RESULTS must cover every exit code simple-mhl can emit."""
-        documented_codes = {0, 1, 20, 30, 40, 70, 127}
-        missing = documented_codes - set(mhlver._CLASSICMHL_RESULTS.keys())
+    def test_verify_classicmhl_dispatch_table_covers_engine_codes(self):
+        """_CLASSICMHL_RESULTS must cover every exit code the classic engine emits."""
+        engine_codes = {0, 20, 30, 40, 70}
+        missing = engine_codes - set(mhlver._CLASSICMHL_RESULTS.keys())
         assert missing == set(), f"Dispatch table missing codes: {missing}"
 
-    def test_command_not_found_returns_127(self, tmp_path, monkeypatch):
-        """When simple-mhl is not found, _verify_classicmhl returns 127."""
-        monkeypatch.setattr(mhlver, "get_command_path", lambda cmd: None)
-        mhl = tmp_path / "dummy.mhl"
-        mhl.write_text("")
-        rc, _mr = mhlver._verify_classicmhl(mhl, verbose=False, schema=False)
-        assert rc == 127
-
-    def test_verbose_with_schema_does_not_add_v_flag(self, classic_mhl, monkeypatch):
-        """With verbose=True and schema=True, -v must NOT be appended
-        (xsd-schema-check has no per-file output)."""
-        captured_cmd = {}
-
-        def _stub(cmd, cwd=None, **kwargs):
-            captured_cmd["cmd"] = cmd
-            return mhlver.StepResult(exit_code=0, output="")
-
-        monkeypatch.setattr(mhlver, "_run_step", _stub)
-        mhlver._verify_classicmhl(classic_mhl, verbose=True, schema=True)
-        assert "-v" not in captured_cmd["cmd"]
-        assert "xsd-schema-check" in captured_cmd["cmd"]
-
-    def test_verbose_without_schema_adds_v_flag(self, classic_mhl, monkeypatch):
-        """With verbose=True and schema=False, -v IS appended."""
-        captured_cmd = {}
-
-        def _stub(cmd, cwd=None, **kwargs):
-            captured_cmd["cmd"] = cmd
-            return mhlver.StepResult(exit_code=0, output="")
-
-        monkeypatch.setattr(mhlver, "_run_step", _stub)
-        mhlver._verify_classicmhl(classic_mhl, verbose=True, schema=False)
-        assert "-v" in captured_cmd["cmd"]
-
     def test_schema_uses_classicmhl_schema_results_table(self, classic_mhl, monkeypatch, capsys):
-        """With schema=True, exit 60 is looked up in _CLASSICMHL_SCHEMA_RESULTS
-        (which has a specific message) not _CLASSICMHL_RESULTS (which doesn't)."""
-        monkeypatch.setattr(mhlver, "_run_step", lambda cmd, **kw: mhlver.StepResult(60, ""))
+        """Schema mode runs schema_report and maps the code via
+        _CLASSICMHL_SCHEMA_RESULTS — exit 60 has a specific 'schema' message."""
+        monkeypatch.setattr(mhlver, "schema_report", lambda mhl_file: (60, ["Error: could not locate XSD"]))
         rc, _mr = mhlver._verify_classicmhl(classic_mhl, verbose=False, schema=True)
         assert rc == 60
         captured = capsys.readouterr()
@@ -2117,92 +2078,6 @@ class TestRunStepRobustness:
 
 
 # ---------------------------------------------------------------------------
-# TestParseClassicMhlOutput
-# ---------------------------------------------------------------------------
-
-
-class TestParseClassicMhlOutput:
-    """Direct unit tests for the simple-mhl output parser. It is a pure
-    string→FileResult function, so we exercise every branch with crafted
-    backend output rather than spawning the real backend."""
-
-    def test_ok_line(self):
-        results = mhlver._parse_classicmhl_output("[OK] a/b.mxf")
-        assert results == [mhlver.FileResult(path="a/b.mxf", status="ok")]
-
-    def test_size_only_ok_line_sets_flag(self):
-        """A null (size-only) verbose OK line is flagged size_only; a hashed one isn't."""
-        out = "[OK] a.mxf  size: 5 (size-only check - no hash stored)\n[OK] b.mxf  xxhash64be: abc123"
-        results = mhlver._parse_classicmhl_output(out)
-        assert results == [
-            mhlver.FileResult(path="a.mxf  size: 5 (size-only check - no hash stored)", status="ok", size_only=True),
-            mhlver.FileResult(path="b.mxf  xxhash64be: abc123", status="ok", size_only=False),
-        ]
-
-    def test_existence_only_ok_line_sets_flag(self):
-        """A null entry with no recorded <size> verifies on existence alone; its OK
-        line is flagged existence_only (not size_only) — neither hash nor size checked."""
-        out = "[OK] a.mxf  (existence-only check — no hash or size stored)"
-        results = mhlver._parse_classicmhl_output(out)
-        assert results == [
-            mhlver.FileResult(
-                path="a.mxf  (existence-only check — no hash or size stored)",
-                status="ok",
-                size_only=False,
-                existence_only=True,
-            ),
-        ]
-
-    def test_missing_line(self):
-        results = mhlver._parse_classicmhl_output("[ERROR] missing file: gone.mxf")
-        assert results == [mhlver.FileResult(path="gone.mxf", status="missing")]
-
-    def test_mismatch_without_detail(self):
-        """A bare mismatch line (non-verbose) keeps the mismatch type as detail."""
-        results = mhlver._parse_classicmhl_output("[ERROR] hash mismatch: f.mxf")
-        assert results == [mhlver.FileResult(path="f.mxf", status="mismatch", detail="hash mismatch")]
-
-    def test_mismatch_with_verbose_detail_consumes_next_line(self):
-        """The indented parenthetical on the following line is attached and consumed."""
-        output = "[ERROR] hash mismatch: f.mxf\n        (calc xxhash64be: abc | stored xxhash64be: def)"
-        results = mhlver._parse_classicmhl_output(output)
-        assert results == [
-            mhlver.FileResult(
-                path="f.mxf",
-                status="mismatch",
-                detail="hash mismatch: calc xxhash64be: abc | stored xxhash64be: def",
-            )
-        ]
-
-    def test_size_mismatch_type_is_preserved(self):
-        results = mhlver._parse_classicmhl_output("[ERROR] size mismatch: f.mxf")
-        assert results == [mhlver.FileResult(path="f.mxf", status="mismatch", detail="size mismatch")]
-
-    def test_error_category_becomes_detail(self):
-        results = mhlver._parse_classicmhl_output("[ERROR] malformed size field: weird.mxf")
-        assert results == [mhlver.FileResult(path="weird.mxf", status="error", detail="malformed size field")]
-
-    def test_cannot_verify_carries_reason(self):
-        results = mhlver._parse_classicmhl_output("[ERROR] cannot verify x.mxf: unsupported algo")
-        assert results == [mhlver.FileResult(path="x.mxf", status="error", detail="unsupported algo")]
-
-    def test_no_size_recorded_drops_hint_suffix(self):
-        out = "[ERROR] no size recorded: clip.mxf (try 'simple-mhl verify' for full hash verification)"
-        results = mhlver._parse_classicmhl_output(out)
-        assert results == [mhlver.FileResult(path="clip.mxf", status="error", detail="no size recorded")]
-
-    def test_requested_hashes_not_stored(self):
-        results = mhlver._parse_classicmhl_output("[ERROR] requested hashes md5, sha1 not stored: clip.mxf")
-        assert results == [
-            mhlver.FileResult(path="clip.mxf", status="error", detail="requested hashes md5, sha1 not stored")
-        ]
-
-    def test_unrecognized_lines_are_ignored(self):
-        results = mhlver._parse_classicmhl_output("some banner\n\nVerifying...")
-        assert results == []
-
-
-# ---------------------------------------------------------------------------
 # TestParseAscMhlOutput
 # ---------------------------------------------------------------------------
 
@@ -2435,7 +2310,7 @@ class TestRenderReportDetails:
 
     def test_operator_falls_back_when_lookup_fails(self, monkeypatch):
         """Environments that can't resolve a username must not crash the report."""
-        monkeypatch.setattr(mhlver.getpass, "getuser", lambda: (_ for _ in ()).throw(OSError()))
+        monkeypatch.setattr("getpass.getuser", lambda: (_ for _ in ()).throw(OSError()))
         out = self._render([], exit_status=0)
         assert "User:       unknown" in out
 
@@ -2634,27 +2509,11 @@ class TestSchemaShapedAscMhlFuzz:
 
 
 class TestSinglePassVerify:
-    """Locks the double-run fix: a default (non-verbose) verify runs the backend
-    a single time. The old code ran it twice — once -v for the report, once
-    plain for the terminal — re-hashing every file, so a regression here silently
-    doubles verify time."""
-
-    def test_classicmhl_verify_runs_backend_once(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(mhlver, "get_command_path", lambda name: "/fake/simple-mhl")
-        calls: list[list[str]] = []
-
-        def counting(cmd, cwd=None, **kw):
-            calls.append(cmd)
-            return mhlver.StepResult(exit_code=0, output="[OK] a.bin\n")
-
-        monkeypatch.setattr(mhlver, "_run_step", counting)
-        target = tmp_path / "m.mhl"
-        target.write_text("<hashlist/>")
-
-        mhlver._verify_classicmhl(target, verbose=False, schema=False)
-
-        assert len(calls) == 1, f"expected 1 backend spawn, got {len(calls)}"
-        assert "-v" in calls[0], "the single run must be the -v run (feeds both report and terminal)"
+    """Locks the ASC-MHL double-run fix: a default (non-verbose) verify spawns
+    the ascmhl backend a single time. The old code ran it twice — once -v for the
+    report, once plain for the terminal — re-hashing the whole package, so a
+    regression here silently doubles verify time. (Classic MHL is in-process now,
+    so it inherently hashes once; see TestClassicMhlDispatch.)"""
 
     def test_ascmhl_verify_runs_backend_once(self, monkeypatch, tmp_path):
         calls: list[list[str]] = []
@@ -2682,19 +2541,6 @@ class TestSinglePassVerify:
 class TestStripVerbose:
     """The strip helpers reduce a backend's -v output to its non-verbose form,
     which is what lets a single -v run feed both the report and the terminal."""
-
-    def test_strip_classicmhl_drops_ok_and_indented_detail(self):
-        verbose = (
-            "[OK] a.bin\n"
-            "[ERROR] hash mismatch: b.bin\n"
-            "        (calc md5: 111 | stored md5: 222)\n"
-            "[ERROR] missing file: c.bin\n"
-        )
-        out = mhlver._strip_classicmhl_verbose(verbose)
-        assert "[OK]" not in out
-        assert "calc md5" not in out  # indented verbose-only detail dropped
-        assert "[ERROR] hash mismatch: b.bin" in out
-        assert "[ERROR] missing file: c.bin" in out
 
     def test_strip_ascmhl_keeps_errors_and_missing_block(self):
         verbose = (

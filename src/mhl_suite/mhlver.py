@@ -7,18 +7,18 @@
 # mhlver walks a path looking for MHL manifests and verifies each one by
 # delegating to the right backend:
 #
-#     Classic MHL (v1)  -> shells out to `simple-mhl verify`
-#     ASC-MHL  (v2)    -> shells out to `ascmhl-debug verify`
+#     Classic MHL (v1)  -> verified in-process via mhl_suite.classicmhl (ClassicMHLBackend)
+#     ASC-MHL  (v2)    -> shells out to `ascmhl-debug verify` (AscMHLBackend)
 #
 # It detects ASC-MHL packages by the conventional `ascmhl/` folder containing
 # the manifest. Each backend's exit code is translated into a human-readable
 # status line via dispatch tables (see _CLASSICMHL_RESULTS, _ASCMHL_VERIFY_RESULTS).
 #
 # With -S/--size-only the files are size-checked only (no hashing): for classic
-# manifests it passes -S to `simple-mhl verify`, while for ASC-MHL  — first gates
+# manifests the in-process engine size-checks, while for ASC-MHL  — first gates
 # on manifest integrity via `ascmhl info` (which verifies the chain and each
 # manifest's hash without hashing media), then compares sizes in-process via
-# _internal.ascmhl_sizecheck (since ascmhl does not check sizes).
+# ascmhl.sizecheck (since ascmhl does not check sizes).
 #
 # Exit code policy: the first non-zero backend exit code becomes mhlver's
 # exit code, so an automation script gets a meaningful signal even when many
@@ -26,16 +26,14 @@
 # =============================================================================
 
 import argparse
-import getpass
 import importlib.metadata
 import re
 import shutil
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, TextIO
@@ -46,9 +44,16 @@ from rich.live import Live
 from rich.progress import BarColumn, Progress, TextColumn
 from rich.text import Text
 
-from mhl_suite._internal.ascmhl_sizecheck import verify_ascmhl_sizes
-from mhl_suite._internal.hostinfo import friendly_hostname
 from mhl_suite._internal.unicodepaths import normalization_variant_on_disk
+from mhl_suite.ascmhl.sizecheck import verify_ascmhl_sizes
+from mhl_suite.classicmhl.verify import render_verify_lines, schema_report, verify_manifest
+from mhl_suite.shared.report import (
+    FileResult,
+    ManifestResult,
+    _format_file_result,  # noqa: F401 — re-exported for tests
+    _open_report,
+    _render_report,
+)
 
 # -----------------------------------------------------------------------------
 # Version
@@ -175,205 +180,18 @@ class StepResult:
     output: str  # stdout + stderr combined and stripped
 
 
-# -----------------------------------------------------------------------------
-# Report data model
-# -----------------------------------------------------------------------------
-# FileResult and ManifestResult are populated by parsing backend output when
-# --report is requested. They are kept entirely separate from the terminal
-# output path so that the existing streaming log behaviour is not affected.
-#
-# status values:
-#   "ok"        — file verified successfully
-#   "missing"   — file not found on disk
-#   "mismatch"  — hash (or size) does not match the manifest
-#   "new"       — file found on disk but not recorded in ASC-MHL history
-#   "error"     — any other per-file problem (traversal block, bad algo, etc.)
-#
-# manifest_status values:
-#   "ok"        — all files verified
-#   "failed"    — one or more per-file failures
-#   "error"     — manifest-level failure (malformed XML, backend not found, etc.)
-
-
-@dataclass
-class FileResult:
-    """Outcome for a single file entry within a manifest."""
-
-    path: str  # relative path as recorded in the manifest
-    status: str  # "ok" | "missing" | "mismatch" | "new" | "error"
-    detail: str = ""  # extra info: mismatch hashes, error reason, etc.
-    size_only: bool = False  # size-only check (<null> tag), no hash checked
-    existence_only: bool = False  # existence-only check <null> tag with no recorded <size>
-
-
-@dataclass
-class ManifestResult:
-    """Collected results for one manifest file."""
-
-    manifest_path: Path
-    manifest_status: str  # "ok" | "failed" | "error"
-    manifest_error: str = ""  # set when manifest_status == "error"
-    file_results: list[FileResult] = field(default_factory=list)
-
-    # Convenience counts — computed once after collection is complete.
-    @property
-    def n_ok(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "ok")
-
-    @property
-    def n_missing(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "missing")
-
-    @property
-    def n_mismatch(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "mismatch")
-
-    @property
-    def n_new(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "new")
-
-    @property
-    def n_error(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "error")
-
-    @property
-    def n_size_only(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "ok" and r.size_only)
-
-    @property
-    def n_existence_only(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "ok" and r.existence_only)
-
-    @property
-    def n_files(self) -> int:
-        return len(self.file_results)
+# Report data model (FileResult / ManifestResult) and the report renderer live
+# in mhl_suite.shared.report; the names this module uses are imported up top.
 
 
 # --- Output parsers -----------------------------------------------------------
 #
-# Each parser turns raw backend stdout+stderr into a list[FileResult].
-# Both parsers are intentionally defensive: unrecognised lines are silently
-# skipped so that future backend output changes degrade gracefully rather
-# than raising exceptions.
-
-# simple-mhl verify -v line patterns (bracket format):
-#   [OK] <path>
-#   [ERROR] missing file: <path>
-#   [ERROR] hash mismatch: <path>
-#   [ERROR] hash mismatch: <path>          <- followed by indented detail line (verbose)
-#           (calc <tag>: <hex> | stored <tag>: <hex>)
-#   [ERROR] size mismatch: <path>
-#           (calc size: <n> | stored size: <n>)  <- verbose only
-#   [ERROR] malformed size field: <path>
-#   [ERROR] no supported hash found: <path>
-#   [ERROR] blocked traversal attempt: <path>
-#   [ERROR] cannot verify <path>: <reason>
-
-# A null (size-only) OK line ends with this marker, e.g.
-#   [OK] clip.mxf  size: 4170 (size-only check - no hash stored)
-_CLASSICMHL_SIZE_ONLY_MARKER = "(size-only check - no hash stored)"
-
-# A null entry that records no <size> passes on existence alone — neither hash
-# nor size was checked. Its OK line ends with this marker, e.g.
-#   [OK] clip.mxf  (existence-only check — no hash or size stored)
-_CLASSICMHL_EXISTENCE_ONLY_MARKER = "(existence-only check — no hash or size stored)"
-
-_CLASSICMHL_OK = re.compile(r"^\[OK\] (.+)$")
-_CLASSICMHL_MISSING = re.compile(r"^\[ERROR\] missing file: (.+)$")
-_CLASSICMHL_MISMATCH = re.compile(r"^\[ERROR\] (hash mismatch|size mismatch): (.+)$")
-_CLASSICMHL_ERROR = re.compile(
-    r"^\[ERROR\] (?:malformed size field|no supported hash found|blocked traversal attempt): (.+)$"
-)
-_CLASSICMHL_CANNOT_VERIFY = re.compile(r"^\[ERROR\] cannot verify (.+?): (.+)$")
-# -S only: an entry that records no <size> when sizes were the whole check. The
-# path carries a trailing "(try …)" hint, which we drop.
-_CLASSICMHL_NO_SIZE = re.compile(r"^\[ERROR\] no size recorded: (.+?)(?: \(try .+\))?$")
-# -a only: the requested format(s) aren't recorded for this entry. group(1) is the
-# category label (incl. which tags), group(2) the path.
-_CLASSICMHL_NOT_STORED = re.compile(r"^\[ERROR\] (requested hashes? .+? not stored): (.+)$")
-_CLASSICMHL_DETAIL = re.compile(r"^\s+\((.+)\)$")  # indented detail line after a mismatch
-
-
-def _parse_classicmhl_output(output: str) -> list[FileResult]:
-    """Parse simple-mhl verify output into FileResult entries.
-
-    Simple-mhl emits structured [OK] / [ERROR] lines. Verbose mode appends a
-    second indented detail line for hash and size mismatches:
-
-        [ERROR] hash mismatch: path/to/file.mxf
-                (calc xxhash64be: abc… | stored xxhash64be: def…)
-
-    The parser collects these pairs: when a mismatch line is seen, the next
-    line is checked for a detail parenthetical and attached if found.
-    All other detail is passed through verbatim from the bracket prefix onward.
-    """
-    lines = output.splitlines()
-    results: list[FileResult] = []
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].strip()
-
-        if m := _CLASSICMHL_OK.match(stripped):
-            body = m.group(1)
-            results.append(
-                FileResult(
-                    path=body,
-                    status="ok",
-                    size_only=body.endswith(_CLASSICMHL_SIZE_ONLY_MARKER),
-                    existence_only=body.endswith(_CLASSICMHL_EXISTENCE_ONLY_MARKER),
-                )
-            )
-
-        elif m := _CLASSICMHL_MISSING.match(stripped):
-            results.append(FileResult(path=m.group(1), status="missing"))
-
-        elif m := _CLASSICMHL_MISMATCH.match(stripped):
-            mtype = m.group(1)  # "hash mismatch" | "size mismatch"
-            path = m.group(2)
-            # Peek at next line for optional verbose detail.
-            detail = mtype
-            if i + 1 < len(lines) and (d := _CLASSICMHL_DETAIL.match(lines[i + 1])):
-                detail = f"{mtype}: {d.group(1)}"
-                i += 1  # consume the detail line
-            results.append(FileResult(path=path, status="mismatch", detail=detail))
-
-        elif m := _CLASSICMHL_ERROR.match(stripped):
-            # Everything after "[ERROR] <category>: " is the path; the category
-            # itself is the useful detail label.
-            category = re.match(r"^\[ERROR\] (.+?): .+$", stripped)
-            detail = category.group(1) if category else stripped
-            results.append(FileResult(path=m.group(1), status="error", detail=detail))
-
-        elif m := _CLASSICMHL_CANNOT_VERIFY.match(stripped):
-            results.append(FileResult(path=m.group(1), status="error", detail=m.group(2)))
-
-        elif m := _CLASSICMHL_NO_SIZE.match(stripped):
-            results.append(FileResult(path=m.group(1), status="error", detail="no size recorded"))
-
-        elif m := _CLASSICMHL_NOT_STORED.match(stripped):
-            results.append(FileResult(path=m.group(2), status="error", detail=m.group(1)))
-
-        i += 1
-    return results
-
-
-def _strip_classicmhl_verbose(output: str) -> str:
-    """Reduce `simple-mhl verify -v` output to what it prints WITHOUT -v.
-
-    The -v output is a strict superset of the plain output: it adds an
-    ``[OK] <path>`` line per verified file and an indented ``(calc … | stored …)``
-    detail line under each mismatch. Dropping those two leaves exactly the
-    non-verbose error lines.
-    """
-    kept = [
-        line
-        for line in output.splitlines()
-        # [OK] lines and indented verbose-only detail continuations are the only
-        # things -v adds; every primary error line starts at column 0.
-        if not line.startswith("[OK] ") and not line[:1].isspace()
-    ]
-    return "\n".join(kept).strip()
-
+# Classic MHL is verified in-process now (mhl_suite.classicmhl.verify), which returns
+# structured FileOutcomes directly — there is no classic text to parse. ASC-MHL
+# is still verified out-of-process via the ascmhl CLI, so its stdout is parsed
+# into FileResult entries below. The parser is intentionally defensive:
+# unrecognised lines are silently skipped so an ascmhl output change degrades
+# gracefully rather than raising.
 
 # ascmhl-debug verify -v line patterns:
 #   verification (xxh64) of file <path>: OK
@@ -737,6 +555,94 @@ def _verbose_announce(
 
 
 # -----------------------------------------------------------------------------
+# Verify backends — the port
+# -----------------------------------------------------------------------------
+# Both backends return the same (exit_code, ManifestResult | None), so the
+# orchestrator stays uniform whether verification runs in-process (classic) or
+# out-of-process (ASC-MHL). The subprocess-vs-library difference is sealed inside
+# each adapter. This is the seam ASC-MHL absorption will swap next version: only
+# AscMHLBackend's body changes; verify_item and the report model do not.
+
+
+class VerifyBackend(Protocol):
+    """A manifest-verification backend.
+
+    The two progress hooks are mechanism-specific: `on_bytes` advances a bar from
+    the in-process hasher, `poll_event` animates it while a subprocess runs. A
+    backend uses whichever applies and ignores the other.
+    """
+
+    def verify(
+        self,
+        target: Path,
+        verbose: bool,
+        schema: bool,
+        *,
+        size_only: bool = False,
+        console: "_ConsoleLike | None" = None,
+        progress_active: bool = False,
+        poll_event: "threading.Event | None" = None,
+        on_bytes: "Callable[[int], None] | None" = None,
+    ) -> "tuple[int, ManifestResult | None]": ...
+
+
+class ClassicMHLBackend:
+    """Verifies classic MHL in-process via the core engine — no subprocess."""
+
+    def verify(
+        self,
+        target: Path,
+        verbose: bool,
+        schema: bool,
+        *,
+        size_only: bool = False,
+        console: "_ConsoleLike | None" = None,
+        progress_active: bool = False,
+        poll_event: "threading.Event | None" = None,
+        on_bytes: "Callable[[int], None] | None" = None,
+    ) -> "tuple[int, ManifestResult | None]":
+        # poll_event is unused: there is no subprocess to animate around. The bar
+        # advances from on_bytes and the Live display self-refreshes on its timer.
+        return _verify_classicmhl(
+            target,
+            verbose,
+            schema,
+            size_only=size_only,
+            console=console,
+            progress_active=progress_active,
+            on_bytes=on_bytes,
+        )
+
+
+class AscMHLBackend:
+    """Verifies ASC-MHL out-of-process via the ascmhl CLI."""
+
+    def verify(
+        self,
+        target: Path,
+        verbose: bool,
+        schema: bool,
+        *,
+        size_only: bool = False,
+        console: "_ConsoleLike | None" = None,
+        progress_active: bool = False,
+        poll_event: "threading.Event | None" = None,
+        on_bytes: "Callable[[int], None] | None" = None,
+    ) -> "tuple[int, ManifestResult | None]":
+        # on_bytes is unused: the subprocess can't report per-file byte progress,
+        # so the bar advances per manifest and poll_event animates it meanwhile.
+        return _verify_ascmhl(
+            target,
+            verbose,
+            schema,
+            size_only=size_only,
+            console=console,
+            progress_active=progress_active,
+            poll_event=poll_event,
+        )
+
+
+# -----------------------------------------------------------------------------
 # verify_item — main per-MHL dispatcher
 # -----------------------------------------------------------------------------
 
@@ -749,37 +655,28 @@ def verify_item(
     console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
     poll_event: "threading.Event | None" = None,
+    on_bytes: "Callable[[int], None] | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
     """
-    Verify a single MHL manifest, dispatching to the right backend.
+    Verify a single MHL manifest by selecting the right backend.
 
     Detection rule: if any path component is exactly 'ascmhl' the manifest
-    belongs to an ASC-MHL package; otherwise it's classic MHL. This matches
-    the convention used by ascmhl-debug, where manifests live at
-    `<root>/ascmhl/manifest.mhl`.
+    belongs to an ASC-MHL package and is verified out-of-process via the ascmhl
+    CLI (AscMHLBackend); otherwise it is classic MHL, verified in-process through
+    the core engine (ClassicMHLBackend). Both satisfy the VerifyBackend port, so
+    the orchestrator only ever sees `(exit_code, ManifestResult | None)`.
 
-    `size_only` requests a fast size-only check. For classic MHL it passes -S to
-    `simple-mhl verify`; for ASC-MHL it uses an in-process parser since ascmhl does
-    not check sizes.
-
-    `progress_active` suppresses per-manifest success lines on the terminal
-    when a rich progress bar is already communicating progress visually.
-    Errors and warnings are always shown.
+    `size_only` requests a fast size-only check. `progress_active` suppresses
+    per-manifest success lines when a rich progress bar is already showing
+    progress (errors and warnings are always shown). `on_bytes`, used only by the
+    in-process classic backend, advances a progress bar as each file is hashed;
+    `poll_event` animates the bar while the ASC-MHL subprocess runs.
 
     Returns (exit_code, ManifestResult | None). ManifestResult is None when
     schema-check mode is active (no per-file detail is available then).
     """
-    if "ascmhl" in target.parts:
-        return _verify_ascmhl(
-            target,
-            verbose,
-            schema,
-            size_only=size_only,
-            console=console,
-            progress_active=progress_active,
-            poll_event=poll_event,
-        )
-    return _verify_classicmhl(
+    backend: VerifyBackend = AscMHLBackend() if "ascmhl" in target.parts else ClassicMHLBackend()
+    return backend.verify(
         target,
         verbose,
         schema,
@@ -787,6 +684,7 @@ def verify_item(
         console=console,
         progress_active=progress_active,
         poll_event=poll_event,
+        on_bytes=on_bytes,
     )
 
 
@@ -800,87 +698,84 @@ def _verify_classicmhl(
     size_only: bool = False,
     console: "_ConsoleLike | None" = None,
     progress_active: bool = False,
-    poll_event: "threading.Event | None" = None,
+    on_bytes: "Callable[[int], None] | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
-    """Run simple-mhl against a classic MHL manifest and translate the result."""
-    cmd_path = get_command_path("simple-mhl")
-    if not cmd_path:
-        # 127 is the conventional 'command not found' exit code; keep the
-        # same so report-aggregation tooling can detect it consistently
-        # across both backends.
-        msg, sev = _CLASSICMHL_RESULTS[127]
-        _log_by_severity(sev, msg, console=console)
+    """Verify a classic MHL manifest in-process via the core engine.
+
+    Schema mode runs core.verify.schema_report; verify/size-only run
+    core.verify.verify_manifest, whose structured FileOutcomes map straight onto
+    FileResult — no subprocess, no text round-trip. render_verify_lines reproduces
+    the exact `simple-mhl verify` stdout so the terminal output is unchanged.
+
+    `on_bytes`, when given, advances the caller's progress bar as each file is
+    hashed (the in-process equivalent of the old subprocess animation tick).
+    """
+    if schema:
+        code, lines = schema_report(str(target))
+        _report_via_table(
+            _CLASSICMHL_SCHEMA_RESULTS,
+            code,
+            target.name,
+            "\n".join(lines),
+            show_backend_output=True,
+            show_status_on_terminal=not progress_active,
+            console=console,
+        )
+        return code, None
+
+    report = verify_manifest(str(target), size_only=size_only, on_progress=on_bytes)
+
+    if report.malformed:
+        # Malformed XML: the engine read nothing and produced no per-file detail.
+        template, _sev = _CLASSICMHL_RESULTS[20]
+        _report_via_table(
+            _CLASSICMHL_RESULTS,
+            20,
+            target.name,
+            "",
+            show_backend_output=True,
+            show_status_on_terminal=not progress_active,
+            console=console,
+        )
         mr = ManifestResult(
             manifest_path=target,
             manifest_status="error",
-            manifest_error=msg,
+            manifest_error=template.format(target=target.name),
         )
-        return 127, mr
+        return 20, mr
 
-    sub = "xsd-schema-check" if schema else "verify"
-    cmd = [cmd_path, sub, str(target)]
-    # -S asks simple-mhl to check sizes only (skip hashing); irrelevant to schema-check.
-    if size_only and not schema:
-        cmd.append("-S")
-
-    if schema:
-        # xsd-schema-check has no per-file -v output and nothing to parse for the
-        # report — a single plain run is all that's needed. (-S never reaches schema
-        # mode: it's CLI-exclusive with -s, and the -S flag is gated on `not schema`.)
-        _verbose_announce(cmd, cwd=None, verbose=verbose, console=console)
-        step = _run_step(cmd, on_poll=poll_event)
-        step_terminal = step
-    else:
-        # Run verify ONCE, always with -v. The -v output is a strict superset of
-        # the plain output (see _strip_classicmhl_verbose), so it feeds both the
-        # report parser (`step`) and the terminal (`step_terminal`). Previously we
-        # ran the backend a second time without -v purely to reproduce the quieter
-        # terminal text — re-hashing every file and doubling verify time on the
-        # default, non-verbose path. We now derive that text instead.
-        cmd_v = [*cmd, "-v"]
-        _verbose_announce(cmd_v if verbose else cmd, cwd=None, verbose=verbose, console=console)
-        step = _run_step(cmd_v, on_poll=poll_event)
-        if verbose:
-            step_terminal = step
-        else:
-            step_terminal = StepResult(
-                exit_code=step.exit_code,
-                output=_strip_classicmhl_verbose(step.output),
-            )
-
-    # simple-mhl is a tool we control. Its per-file output uses structured
-    # `ERROR: <category>: <path>` and `OK: <path>` prefixes that stand
-    # alone — they aren't restatements of mhlver's summary line. Always
-    # show on terminal.
-    table = _CLASSICMHL_SCHEMA_RESULTS if schema else _CLASSICMHL_RESULTS
+    # render_verify_lines reproduces the exact `simple-mhl verify` stdout at the
+    # requested verbosity (OK lines and the indented detail continuations are
+    # included only when verbose), matching the old subprocess terminal output.
+    output = "\n".join(render_verify_lines(report, verbose))
     _report_via_table(
-        table,
-        step_terminal.exit_code,
+        _CLASSICMHL_RESULTS,
+        report.code,
         target.name,
-        step_terminal.output,
+        output,
         show_backend_output=True,
         show_status_on_terminal=not progress_active,
         console=console,
     )
 
-    # Build ManifestResult from the -v output (not available for schema-check).
-    if schema:
-        return step.exit_code, None
-
-    file_results = _parse_classicmhl_output(step.output)
-    # Under -S every verified entry was checked by size alone, so flag each OK
-    # result accordingly.
-    if size_only:
-        for fr in file_results:
-            if fr.status == "ok":
-                fr.size_only = True
-    if step.exit_code == 0:
+    # FileOutcome and FileResult share the same fields — a direct, parse-free map.
+    file_results = [
+        FileResult(
+            path=e.path,
+            status=e.status,
+            detail=e.detail,
+            size_only=e.size_only,
+            existence_only=e.existence_only,
+        )
+        for e in report.entries
+    ]
+    if report.code == 0:
         mstatus = "ok"
     elif file_results:
         mstatus = "failed"
     else:
         mstatus = "error"
-    template, _ = table.get(step.exit_code, ("Unexpected exit {code}", "warning"))
+    template, _ = _CLASSICMHL_RESULTS.get(report.code, ("Unexpected exit {code}", "warning"))
     merror = "" if mstatus != "error" else template.format(target=target.name)
     mr = ManifestResult(
         manifest_path=target,
@@ -888,7 +783,7 @@ def _verify_classicmhl(
         manifest_error=merror,
         file_results=file_results,
     )
-    return step.exit_code, mr
+    return report.code, mr
 
 
 # --- ASC-MHL (v2) path --------------------------------------------------------
@@ -1093,7 +988,7 @@ def _ascmhl_verify_sizeonly(
          This catches a tampered or missing manifest/chain before we trust their
          contents.
       2. Size phase — ascmhl does not check file sizes, so we use our own
-         'ascmhl_sizecheck.py': verify_ascmhl_sizes parses the manifests and compares
+         'ascmhl/sizecheck.py': verify_ascmhl_sizes parses the manifests and compares
          each recorded <path size> against the file on disk, reading no file bytes.
     """
     package_dir = target.parent.parent
@@ -1365,246 +1260,6 @@ def _build_live() -> "tuple[Live, Progress, Text, Console]":
 
 
 # -----------------------------------------------------------------------------
-# Report file
-# -----------------------------------------------------------------------------
-
-
-@contextmanager
-def _open_report(src: Path) -> Iterator[tuple[TextIO, Path]]:
-    """
-    Open a timestamped report log next to `src` and yield (file, path).
-
-    Context-manager form ensures the file is always closed and we don't
-    have to thread try/finally through the main flow. The path is yielded
-    so we can echo it on completion ("report saved to: ...").
-
-    Unlike the old streaming approach, this file handle is only used by
-    _render_report() which writes the complete structured report at the
-    end of the verification run. Nothing is written here at open time.
-    """
-    report_dir = src if src.is_dir() else src.parent
-    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    report_path = report_dir / f"mhlver_report_{src.name}_{timestamp}.log"
-    with open(report_path, "w", encoding="utf-8") as fh:
-        yield fh, report_path
-
-
-_W = 119  # total report width (matches the === / --- separator length)
-_SEP_HEAVY = "=" * _W
-_SEP_LIGHT = "-" * _W
-
-
-def _summary_line(
-    *,
-    passed: bool,
-    n_files: int,
-    n_ok: int,
-    n_missing: int,
-    n_mismatch: int,
-    n_error: int,
-    n_new: int,
-    n_size_only: int = 0,
-    n_existence_only: int = 0,
-    warn_weak: bool = False,
-    n_manifests: int | None = None,
-) -> str:
-    """Build the ' | '-joined verdict line shared by the global summary and
-    each per-manifest sub-summary. Pass n_manifests=None to omit the manifest
-    count (per-manifest lines don't repeat it).
-
-    When the run passed but relied on weak (non-hash) checks — size-only or
-    existence-only <null> entries — the verdict names which kinds were used and,
-    when warn_weak is set, is downgraded to ⚠️ VERIFIED WITH WARNINGS. The two
-    kinds are labelled distinctly: an existence-only entry checked neither hash
-    nor size, so it must not read as a SIZE-ONLY check."""
-    n_weak = n_size_only + n_existence_only
-    if not passed:
-        verdict = "❌ FAILED"
-    elif n_weak:
-        head = "⚠️ VERIFIED WITH WARNINGS" if warn_weak else "✅ VERIFIED"
-        kinds = []
-        if n_size_only:
-            kinds.append("SIZE-ONLY")
-        if n_existence_only:
-            kinds.append("EXISTENCE-ONLY")
-        prefix = "SOME " if n_weak != n_ok else ""
-        verdict = f"{head} ({prefix}{' AND '.join(kinds)} CHECKS)"
-    else:
-        verdict = "✅ VERIFIED"
-    parts = [verdict]
-    if n_manifests is not None:
-        parts.append(f"{n_manifests} {'manifest' if n_manifests == 1 else 'manifests'}")
-    parts.append(f"{n_files} {'file' if n_files == 1 else 'files'}")
-    parts.append(f"{n_ok} verified")
-    if n_missing:
-        parts.append(f"{n_missing} missing")
-    if n_mismatch:
-        parts.append(f"{n_mismatch} hash mismatch")
-    if n_error:
-        parts.append(f"{n_error} error")
-    if n_new:
-        parts.append(f"{n_new} new (untracked)")
-    return " | ".join(parts)
-
-
-def _render_report(
-    fh: TextIO,
-    src: Path,
-    started_at: datetime,
-    finished_at: datetime,
-    manifest_results: list[ManifestResult],
-    exit_status: int,
-) -> None:
-    """
-    Write the structured verification report to fh.
-    """
-
-    def line(s: str = "") -> None:
-        fh.write(s + "\n")
-
-    # ── Header ────────────────────────────────────────────────────────────────
-    line(_SEP_HEAVY)
-    line("MHL Verification Report")
-    line(_SEP_HEAVY)
-    line()
-
-    host = friendly_hostname()
-    try:
-        operator = getpass.getuser()
-    except (OSError, KeyError, ImportError):
-        operator = "unknown"
-
-    fmt = "%Y-%m-%d %H:%M:%S %Z"
-    line(f"Source:     {src}")
-    line(f"Tool:       mhlver {__version__}")
-    line(f"User:       {operator}")
-    line(f"Host:       {host}")
-    line(f"Started:    {started_at.astimezone().strftime(fmt)}")
-    line(f"Finished:   {finished_at.astimezone().strftime(fmt)}")
-    line()
-
-    # Aggregate counts across all manifests.
-    n_manifests = len(manifest_results)
-    n_files = sum(mr.n_files for mr in manifest_results)
-    n_ok = sum(mr.n_ok for mr in manifest_results)
-    n_missing = sum(mr.n_missing for mr in manifest_results)
-    n_mismatch = sum(mr.n_mismatch for mr in manifest_results)
-    n_new = sum(mr.n_new for mr in manifest_results)
-    n_error = sum(mr.n_error for mr in manifest_results)
-    n_size_only = sum(mr.n_size_only for mr in manifest_results)
-    n_existence_only = sum(mr.n_existence_only for mr in manifest_results)
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    line("Summary")
-    line(_SEP_LIGHT)
-    line(
-        _summary_line(
-            passed=exit_status == 0,
-            n_manifests=n_manifests,
-            n_files=n_files,
-            n_ok=n_ok,
-            n_missing=n_missing,
-            n_mismatch=n_mismatch,
-            n_error=n_error,
-            n_new=n_new,
-            n_size_only=n_size_only,
-            n_existence_only=n_existence_only,
-            warn_weak=True,
-        )
-    )
-    line()
-
-    # ── Issues ────────────────────────────────────────────────────────────────
-    # Everything that isn't a clean OK, pulled to the top across all manifests
-    # Omitted entirely when there's nothing to show.
-    issue_lines: list[str] = []
-    for mr in manifest_results:
-        if mr.manifest_status == "error":
-            issue_lines.append(f"🚨 {mr.manifest_path}: {mr.manifest_error or 'manifest-level error'}")
-            continue
-        issue_lines.extend(_format_file_result(fr, indent="") for fr in mr.file_results if fr.status != "ok")
-
-    if issue_lines:
-        line("Issues")
-        line(_SEP_LIGHT)
-        for s in issue_lines:
-            line(s)
-        line()
-
-    # ── Manifests ───────────────────────────────────────────────────────────────
-    if manifest_results:
-        line("Manifest" if n_manifests == 1 else "Manifests")
-        line(_SEP_LIGHT)
-
-    for mr in manifest_results:
-        # Manifest header line — show the .mhl path (for classic MHL) or the
-        # asc-mhl directory (for ASC-MHL)
-        line(f"📄 {mr.manifest_path}")
-
-        if mr.manifest_status == "error":
-            line(f"    ✗ {mr.manifest_error or 'manifest-level error'}")
-            continue
-
-        # Per-manifest sub-summary — same fields as the global verdict minus the
-        # manifest count. New/untracked is a warning, not a verification failure,
-        # so it doesn't flip the manifest's PASSED/FAILED state.
-        line(
-            _summary_line(
-                passed=mr.n_missing == 0 and mr.n_mismatch == 0 and mr.n_error == 0,
-                n_files=mr.n_files,
-                n_ok=mr.n_ok,
-                n_missing=mr.n_missing,
-                n_mismatch=mr.n_mismatch,
-                n_error=mr.n_error,
-                n_new=mr.n_new,
-                n_size_only=mr.n_size_only,
-                n_existence_only=mr.n_existence_only,
-            )
-        )
-
-        for fr in mr.file_results:
-            line(_format_file_result(fr))
-        line()
-
-    line(_SEP_HEAVY)
-
-
-def _format_file_result(fr: "FileResult", indent: str = "    ") -> str:
-    """Return the report line(s) for a single FileResult (without trailing newline).
-
-    `indent` is the leading whitespace for the primary line; the Details section
-    indents under its manifest header (4 spaces) while the Issues section sits at
-    column 0. Continuation (detail) lines are indented `indent` + 3 spaces.
-
-    Mismatch entries with detail render across two lines, using the label
-    embedded in the detail string (e.g. "hash mismatch", "size mismatch"):
-
-        ❌ hash mismatch: path/to/file.mxf
-           (calc xxh64: abc123 | stored xxh64: def456)
-
-        ❌ size mismatch: path/to/file.mxf
-           (calc size: 122 | stored size: 4170)
-    """
-    cont = indent + "   "  # continuation/detail line indent
-    if fr.status == "ok":
-        return f"{indent}✓ {fr.path}"
-    if fr.status == "missing":
-        return f"{indent}❌ missing: {fr.path}"
-    if fr.status == "mismatch":
-        if ": " in fr.detail:
-            label, paren_content = fr.detail.split(": ", 1)
-            return f"{indent}❌ {label}: {fr.path}\n{cont}({paren_content})"
-        # Non-verbose failsafe: detail is just "hash mismatch" or "size mismatch".
-        return f"{indent}❌ {fr.detail}: {fr.path}"
-    if fr.status == "new":
-        return f"{indent}⚠️ new (untracked): {fr.path}"
-    # "error"
-    if fr.detail:
-        return f"{indent}🚨 error: {fr.path}\n{cont}({fr.detail})"
-    return f"{indent}🚨 error: {fr.path}"
-
-
-# -----------------------------------------------------------------------------
 # CLI entry point
 # -----------------------------------------------------------------------------
 
@@ -1743,6 +1398,19 @@ def _verify_dir_with_progress(
             label.plain = ""
             label.append("🔎 Verifying… ", style="bold")
             label.append(f.name, style="cyan")
+            # Classic (in-process) verify reports bytes per hashed file via
+            # on_bytes, so the bar advances live within a manifest instead of
+            # jumping once at the end. We track what it advanced and top up the
+            # remainder afterwards so the manifest still contributes exactly its
+            # weight — and so the ASC-MHL subprocess path (which never calls
+            # on_bytes) still advances by the full weight as before.
+            advanced_box: list[int] = [0]
+
+            def _advance(n: int, box: list[int] = advanced_box) -> None:
+                progress.advance(bar_task, n)
+                box[0] += n
+                poll_event.set()
+
             code, mr = verify_item(
                 f,
                 verbose,
@@ -1750,10 +1418,15 @@ def _verify_dir_with_progress(
                 size_only,
                 console=con,
                 poll_event=poll_event,
+                on_bytes=_advance,
             )
             if mr is not None:
                 manifest_results.append(mr)
-            progress.advance(bar_task, weights[f])
+            # Top up to the manifest's full weight: zero extra for the ASC-MHL
+            # subprocess path (advanced_box stays 0), the unhashed remainder for
+            # classic. Always called so the bar still ticks for a zero-weight
+            # manifest (empty or all-<null>).
+            progress.advance(bar_task, max(0, weights[f] - advanced_box[0]))
             progress.update(bar_task, done=i + 1)
             if exit_status == 0:
                 exit_status = code
