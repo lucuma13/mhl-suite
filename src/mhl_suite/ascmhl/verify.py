@@ -15,17 +15,18 @@
 # giving the suite a clean library boundary.
 # =============================================================================
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
 from lxml import etree
 
+from mhl_suite.ascmhl.sizecheck import verify_ascmhl_sizes
 from mhl_suite.ascmhl.vendor import commands, errors, logger
 from mhl_suite.shared.results import FileOutcome, VerifyReport
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
 # NOTE: the vendored verify engine checks only the *first* `original` hash entry
 # per file (find_original_hash_entry_for_path), so a file recorded with several
@@ -35,22 +36,32 @@ if TYPE_CHECKING:
 # classicmhl.verify_manifest's shape (None / list of tags / "all").
 
 
-def verify_package(root_path: "str | Path", *, on_progress: "Callable[[int], None] | None" = None) -> VerifyReport:
+def verify_package(
+    root_path: "str | Path",
+    *,
+    size_only: bool = False,
+    on_progress: "Callable[[int], None] | None" = None,
+) -> VerifyReport:
     """Verify the ASC-MHL package rooted at `root_path` in-process.
 
     `root_path` is the directory the manifest describes (the parent of the
-    `ascmhl/` folder). `on_progress`, if given, is called with each file's byte
-    size as it finishes hashing, so a caller can drive a progress bar — the
-    ASC-MHL counterpart to classicmhl.verify_manifest(on_progress=...).
+    `ascmhl/` folder). `size_only` checks recorded sizes against disk without
+    hashing media (see _verify_sizes); `on_progress`, given, is called with each
+    file's byte size as it finishes hashing, so a caller can drive a progress bar
+    — the ASC-MHL counterpart to classicmhl.verify_manifest(size_only=, on_progress=).
 
     Returns a shared.results.VerifyReport (same type as classic verify). `code`
     is the upstream ASC-MHL exit code (see vendor/errors.py): 0 clean, 10 missing
     files, 11 hash mismatch, 12 directory-hash mismatch, 21 new files,
-    30/31/32/33 history/chain/manifest problems. Failure is signalled by `code`,
-    never by an exception or process exit; `report.status`/`report.ok` give the
-    dialect-neutral view. The vendored engine's logger output is suppressed so the
-    caller owns all terminal rendering.
+    30/31/32/33 history/chain/manifest problems — plus 13 for a size mismatch on
+    the size-only path (a suite extension; ascmhl has no size check). Failure is
+    signalled by `code`, never by an exception or process exit;
+    `report.status`/`report.ok` give the dialect-neutral view. The vendored
+    engine's logger output is suppressed so the caller owns all terminal rendering.
     """
+    if size_only:
+        return _verify_sizes(root_path)
+
     entries: list[FileOutcome] = []
     prev_quiet = logger.quiet
     logger.quiet = True
@@ -64,6 +75,66 @@ def verify_package(root_path: "str | Path", *, on_progress: "Callable[[int], Non
         code = getattr(exc, "exit_code", 1)
     finally:
         logger.quiet = prev_quiet
+    return VerifyReport(entries=entries, code=code)
+
+
+def _verify_sizes(root_path: "str | Path") -> VerifyReport:
+    """Size-only verify: integrity gate, then compare recorded sizes to disk.
+
+    Two phases, reading no media bytes:
+      1. Integrity gate — integrity_check loads the history, validating the chain
+         and each generation manifest's own hash. ascmhl's own verify gets this
+         implicitly when it loads the history; the size path uses the raw size
+         parser (verify_ascmhl_sizes), which bypasses the loader, so we gate first.
+      2. Size phase — verify_ascmhl_sizes compares each recorded <path size>
+         against the file on disk.
+
+    Codes: 0 all match; 10 a referenced file is missing; 13 a size mismatch (or
+    any other non-missing size-check failure, e.g. no recorded size / blocked
+    traversal) — `13` is distinct from `11` so size failures don't masquerade as
+    hash failures. The gate's own exit code (30/31/32/33) passes through on failure.
+    """
+    gate_code, gate_msg = integrity_check(root_path)
+    if gate_code != 0:
+        return VerifyReport(code=gate_code, notices=[gate_msg])
+
+    # Gate passed, so the latest generation manifest exists; verify_ascmhl_sizes
+    # reads the chain/siblings off it to apply original-generation sizes.
+    manifest = max((Path(root_path) / "ascmhl").glob("*.mhl"))
+    try:
+        size_results = verify_ascmhl_sizes(manifest)
+    except (etree.XMLSyntaxError, OSError):
+        return VerifyReport(code=20, malformed=True, notices=[f"🚨 Malformed XML: {root_path} cannot be parsed."])
+
+    entries: list[FileOutcome] = []
+    for r in size_results:
+        if r.status == "ok":
+            # Path carries its size (matches simple-mhl's "<path>  size: <n>" form).
+            entries.append(
+                FileOutcome(
+                    path=f"{r.path}  {r.detail}", status="ok", size_only=True, line=f"[OK] {r.path}  {r.detail}"
+                )
+            )
+        elif r.status == "missing":
+            entries.append(FileOutcome(path=r.path, status="missing", line=f"[ERROR] missing file: {r.path}"))
+        elif ": " in r.detail:  # mismatch: "size mismatch: calc … | stored …" -> label + parenthetical
+            label, paren = r.detail.split(": ", 1)
+            entries.append(
+                FileOutcome(
+                    path=r.path,
+                    status="mismatch",
+                    detail=r.detail,
+                    line=f"[ERROR] {label}: {r.path}",
+                    detail_line=f"        ({paren})",
+                )
+            )
+        else:  # mismatch with a bare reason: "no size recorded", "blocked traversal attempt"
+            entries.append(
+                FileOutcome(path=r.path, status="mismatch", detail=r.detail, line=f"[ERROR] {r.detail}: {r.path}")
+            )
+
+    statuses = {e.status for e in entries}
+    code = 13 if "mismatch" in statuses else (10 if "missing" in statuses else 0)
     return VerifyReport(entries=entries, code=code)
 
 

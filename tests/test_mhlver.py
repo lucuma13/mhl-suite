@@ -1007,13 +1007,13 @@ class TestAscMhlSizeOnly:
         assert mr.n_size_only == 1
 
     def test_size_mismatch_through_wiring(self, tmp_path, monkeypatch):
-        """With the gate passing, a size mismatch yields exit 10 and a failed manifest."""
+        """With the gate passing, a size mismatch yields exit 13 and a failed manifest."""
         pkg = tmp_path / "pkg"
         manifest = _build_ascmhl_package(pkg, {"a.mov": 100})
         (pkg / "a.mov").write_bytes(b"x" * 50)
         stub_integrity_check(monkeypatch, 0)  # gate passes
         rc, mr = verifyall._verify_ascmhl(manifest, verbose=False, schema=False, size_only=True)
-        assert rc == 10
+        assert rc == 13
         assert mr is not None
         assert mr.manifest_status == "failed"
         assert mr.n_mismatch == 1
@@ -1024,7 +1024,7 @@ class TestAscMhlSizeOnly:
         manifest = _build_ascmhl_package(tmp_path / "pkg", {"a.mov": 100})
         stub_integrity_check(monkeypatch, gate_code, "Modified ASC MHL manifest in history")
         monkeypatch.setattr(
-            verifyall,
+            verifyall.ascmhl_verify,
             "verify_ascmhl_sizes",
             lambda *a, **k: (_ for _ in ()).throw(AssertionError("size phase must be skipped")),
         )
@@ -2231,7 +2231,7 @@ class TestSinglePassVerify:
     def test_ascmhl_verify_invokes_engine_once(self, monkeypatch, tmp_path):
         calls = {"n": 0}
 
-        def _spy(root_path, *, on_progress=None):
+        def _spy(root_path, *, size_only=False, on_progress=None):
             calls["n"] += 1
             return verifyall.VerifyReport(entries=[], code=0)
 

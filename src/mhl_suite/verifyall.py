@@ -25,7 +25,6 @@ from typing import Protocol
 from lxml import etree
 
 from mhl_suite.ascmhl import verify as ascmhl_verify
-from mhl_suite.ascmhl.sizecheck import verify_ascmhl_sizes
 from mhl_suite.classicmhl.verify import render_verify_lines, schema_report, verify_manifest
 from mhl_suite.shared.report import FileResult, ManifestResult
 from mhl_suite.shared.results import VerifyReport, VerifyStatus  # noqa: F401 — VerifyStatus used by mhlver mapping
@@ -75,11 +74,20 @@ def _emit(
 
 
 def _render_ascmhl_lines(report: VerifyReport, verbose: bool) -> list[str]:
-    """Render a VerifyReport to the per-file lines shown on the terminal."""
-    out: list[str] = []
+    """Render a VerifyReport to the per-file lines shown on the terminal.
+
+    Manifest-level notices first (e.g. a size-only integrity-gate message), then
+    OK lines (verbose only), then failures — each with its verbose-only detail
+    continuation if present (size-only mismatches carry one; hash failures don't).
+    """
+    out: list[str] = list(report.notices)
     if verbose:
         out.extend(e.line for e in report.entries if e.status == "ok")
-    out.extend(e.line for e in report.entries if e.status in ("missing", "mismatch", "new"))
+    for e in report.entries:
+        if e.status in ("missing", "mismatch", "new"):
+            out.append(e.line)
+            if verbose and e.detail_line:
+                out.append(e.detail_line)
     return out
 
 
@@ -143,6 +151,9 @@ _ASCMHL_VERIFY_RESULTS: dict[int, tuple[str, str]] = {
     10: ("❌ ASC-MHL verification failed: {target}", "error"),
     11: ("❌ ASC-MHL verification failed: {target}", "error"),
     12: ("❌ ASC-MHL verification failed: {target}", "error"),
+    # 13 is a suite extension (ascmhl has no size check): size-only size mismatch,
+    # kept distinct from 11 so size failures don't look like hash failures.
+    13: ("❌ ASC-MHL verification failed: {target}", "error"),
     20: ("❌ ASC-MHL verification failed: {target}", "error"),
     21: (
         "⚠️ ASC-MHL: new files found in {target} that are not recorded in history.",
@@ -366,14 +377,12 @@ def _verify_ascmhl(
     on_bytes: "Callable[[int], None] | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
     """Verify an ASC-MHL package in-process via the vendored engine, by mode."""
-    # Size-only: an integrity gate plus a byte-free size compare (ascmhl does
-    # not check sizes), all in-process.
-    if size_only and not schema:
-        return _ascmhl_verify_sizeonly(target, verbose, emit=emit)
     if schema:
         code = _ascmhl_schema_check(target, verbose, emit=emit)
         return code, None
-    return _ascmhl_verify(target, verbose, emit=emit, on_bytes=on_bytes)
+    # Both full and size-only verify go through _ascmhl_verify -> verify_package;
+    # size_only does the integrity gate + byte-free size compare inside the engine.
+    return _ascmhl_verify(target, verbose, size_only=size_only, emit=emit, on_bytes=on_bytes)
 
 
 def _ascmhl_schema_check(
@@ -407,6 +416,7 @@ def _ascmhl_schema_check(
 def _ascmhl_verify(
     target: Path,
     verbose: bool,
+    size_only: bool = False,
     emit: "Callable[[StatusLine], None] | None" = None,
     on_bytes: "Callable[[int], None] | None" = None,
 ) -> "tuple[int, ManifestResult]":
@@ -415,105 +425,44 @@ def _ascmhl_verify(
 
     ASC-MHL convention: the manifest at <root>/ascmhl/<gen>.mhl describes the
     contents of <root>, so we verify the parent of the ascmhl/ folder
-    (target.parent.parent). verify_package returns structured per-file outcomes
-    and reports byte progress through on_bytes as each file is hashed — the same
-    progress mechanism as the classic backend. _render_ascmhl_lines reproduces
-    the per-file terminal text (failure lines always, OK lines when verbose).
+    (target.parent.parent). verify_package returns a structured VerifyReport;
+    `size_only` runs the integrity gate + byte-free size compare (no hashing),
+    otherwise on_bytes drives per-file progress as each file is hashed.
+    _render_ascmhl_lines reproduces the per-file terminal text.
     """
     package_dir = target.parent.parent
-    report = ascmhl_verify.verify_package(package_dir, on_progress=on_bytes)
+    report = ascmhl_verify.verify_package(package_dir, size_only=size_only, on_progress=on_bytes)
 
     output = "\n".join(_render_ascmhl_lines(report, verbose))
     _emit(emit, _ASCMHL_VERIFY_RESULTS, report.code, str(package_dir), output)
 
     # FileOutcome and FileResult share the same fields — a direct, parse-free map.
-    file_results = [FileResult(path=e.path, status=e.status, detail=e.detail) for e in report.entries]
-    mstatus = "ok" if report.code == 0 else "failed"
+    file_results = [
+        FileResult(
+            path=e.path,
+            status=e.status,
+            detail=e.detail,
+            size_only=e.size_only,
+            existence_only=e.existence_only,
+        )
+        for e in report.entries
+    ]
+    if report.code == 0:
+        mstatus = "ok"
+    elif file_results:
+        mstatus = "failed"
+    else:
+        # No per-file entries: a manifest-level failure (integrity gate / malformed).
+        mstatus = "error"
+    template, _ = _ASCMHL_VERIFY_RESULTS.get(report.code, ("Unexpected exit {code}", "warning"))
+    merror = "" if mstatus != "error" else template.format(target=package_dir)
     mr = ManifestResult(
         manifest_path=target,
         manifest_status=mstatus,
+        manifest_error=merror,
         file_results=file_results,
     )
     return report.code, mr
-
-
-def _ascmhl_verify_sizeonly(
-    target: Path,
-    verbose: bool,
-    emit: "Callable[[StatusLine], None] | None" = None,
-) -> "tuple[int, ManifestResult]":
-    """
-    Size-only verify an ASC-MHL package, gating on manifest integrity first.
-
-    Two phases:
-
-      1. Integrity gate — ascmhl_verify.integrity_check loads the history
-         in-process, which verifies the chain file and every generation
-         manifest's own hash without hashing any media. This catches a tampered
-         or missing manifest/chain before we trust their contents.
-      2. Size phase — ascmhl does not check file sizes, so we use our own
-         'ascmhl/sizecheck.py': verify_ascmhl_sizes parses the manifests and compares
-         each recorded <path size> against the file on disk, reading no file bytes.
-    """
-    package_dir = target.parent.parent
-
-    # --- Phase 1: manifest-integrity gate (in-process) ---
-    gate_code, gate_msg = ascmhl_verify.integrity_check(package_dir)
-    if gate_code != 0:
-        template, _sev = _ASCMHL_VERIFY_RESULTS.get(
-            gate_code,
-            ("🚨 ASC-MHL manifest integrity check failed: {target}", "error"),
-        )
-        _emit(emit, _ASCMHL_VERIFY_RESULTS, gate_code, str(package_dir), gate_msg)
-        mr = ManifestResult(
-            manifest_path=target,
-            manifest_status="error",
-            manifest_error=template.format(target=package_dir),
-        )
-        return gate_code, mr
-
-    # --- Phase 2: size checks (manifests proven intact above) ---
-    try:
-        size_results = verify_ascmhl_sizes(target)
-    except (etree.XMLSyntaxError, OSError):
-        msg = f"🚨 Malformed XML: {package_dir} cannot be parsed."
-        # One-off error-severity status (red), matching the previous log_error call.
-        _emit(emit, {20: ("🚨 Malformed XML: {target} cannot be parsed.", "error")}, 20, str(package_dir), "")
-        mr = ManifestResult(manifest_path=target, manifest_status="error", manifest_error=msg)
-        return 20, mr
-
-    # Translate to FileResult, flagging every OK entry as size-only so the report
-    # summary reads "VERIFIED (SIZE-ONLY CHECKS)". The OK path carries its size in
-    # the displayed path, matching the output from simple-mhl: "<path>  size: <n>" form.
-    file_results: list[FileResult] = []
-    out_lines: list[str] = []
-    for r in size_results:
-        if r.status == "ok":
-            file_results.append(FileResult(path=f"{r.path}  {r.detail}", status="ok", size_only=True))
-            if verbose:
-                out_lines.append(f"[OK] {r.path}  {r.detail}")
-        elif r.status == "missing":
-            file_results.append(FileResult(path=r.path, status="missing"))
-            out_lines.append(f"[ERROR] missing file: {r.path}")
-        else:  # mismatch — detail is "size mismatch: …", "no size recorded", or "blocked …"
-            file_results.append(FileResult(path=r.path, status="mismatch", detail=r.detail))
-            if ": " in r.detail:
-                label, paren = r.detail.split(": ", 1)
-                out_lines.append(f"[ERROR] {label}: {r.path}")
-                if verbose:
-                    out_lines.append(f"        ({paren})")
-            else:
-                out_lines.append(f"[ERROR] {r.detail}: {r.path}")
-
-    code = 0 if all(fr.status == "ok" for fr in file_results) else 10
-    _emit(emit, _ASCMHL_VERIFY_RESULTS, code, str(package_dir), "\n".join(out_lines))
-
-    mr = ManifestResult(
-        manifest_path=target,
-        manifest_status="ok" if code == 0 else "failed",
-        file_results=file_results,
-    )
-    return code, mr
 
 
 # -----------------------------------------------------------------------------
