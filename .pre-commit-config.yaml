@@ -27,9 +27,6 @@ repos:
     hooks:
       - id: typos
         args: [--force-exclude] # Flag only: removed default --write-changes
-        # Skip the vendored upstream ASC-MHL engine; upstream typos aren't ours to
-        # fix. Our own ascmhl/ code sits outside vendor/ and stays spell-checked.
-        exclude: ^src/mhl_suite/ascmhl/vendor/
   # Pyproject formatter
   - repo: https://github.com/tox-dev/pyproject-fmt
     rev: v2.25.0
@@ -100,6 +97,6 @@ repos:
         args: ["--verbose"]
   # CI security auditing
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.25.2
+    rev: v1.26.1
     hooks:
       - id: zizmor
