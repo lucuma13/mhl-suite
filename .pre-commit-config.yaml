@@ -29,7 +29,7 @@ repos:
         args: [--force-exclude] # Flag only: removed default --write-changes
   # Pyproject formatter
   - repo: https://github.com/tox-dev/pyproject-fmt
-    rev: v2.24.1
+    rev: v2.25.0
     hooks:
       - id: pyproject-fmt
   # Pyproject validator
@@ -37,11 +37,13 @@ repos:
     rev: v0.25
     hooks:
       - id: validate-pyproject
-  # Keep uv.lock in sync with pyproject.toml
+  # keep uv.lock in sync with pyproject.toml & Dependency security auditing
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.11.21
+    rev: 0.11.24
     hooks:
       - id: uv-lock
+      - id: uv-audit
+        args: ["--preview-features", "audit-command"]
   # TOML formatter and linter (excluding pyproject.toml)
   - repo: local
     hooks:
@@ -59,7 +61,7 @@ repos:
         exclude: ^pyproject\.toml$
   # Python formatter and linter (linter with --fix before formatter)
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.17
+    rev: v0.15.20
     hooks:
       - id: ruff-check
         args: ["--fix"]
@@ -93,13 +95,8 @@ repos:
     hooks:
       - id: check-github-workflows
         args: ["--verbose"]
-  # Dependency security auditing
-  - repo: https://github.com/pypa/pip-audit
-    rev: v2.10.1
-    hooks:
-      - id: pip-audit
   # CI security auditing
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.25.2
+    rev: v1.26.1
     hooks:
       - id: zizmor
