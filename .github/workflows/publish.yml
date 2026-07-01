@@ -27,7 +27,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
     steps:
       - name: Checkout source code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - name: Extract metadata from pyproject.toml
@@ -61,7 +61,7 @@ jobs:
       url: https://pypi.org/p/${{ needs.read-metadata.outputs.package-name }}
     steps:
       - name: Checkout source code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - name: Verify release tag matches declared version
@@ -120,11 +120,13 @@ jobs:
           VERSION: ${{ needs.read-metadata.outputs.version }}
         shell: bash
         run: |
-          MAX_RETRIES=6
-          RETRY_INTERVAL=10
+          MAX_RETRIES=10
+          RETRY_INTERVAL=15
 
           for i in $(seq 1 $MAX_RETRIES); do
-            if uv pip install --system "$PACKAGE_NAME==$VERSION"; then
+            # --refresh-package bypasses uv's cached index listing so each retry
+            # re-fetches from PyPI and can see the freshly published version.
+            if uv pip install --system --refresh-package "$PACKAGE_NAME" "$PACKAGE_NAME==$VERSION"; then
               echo "Package installed successfully from PyPI."
               exit 0
             fi

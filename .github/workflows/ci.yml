@@ -22,7 +22,7 @@ jobs:
       python-versions: ${{ steps.set-matrix.outputs.versions }}
     steps:
       - name: Checkout source code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - name: Extract Python Versions
@@ -47,7 +47,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout source code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - name: Install uv
@@ -74,13 +74,16 @@ jobs:
       contents: read
     steps:
       - name: Checkout source code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: false
+      # Dependency vulnerability scan against the locked tree
+      - name: Audit dependencies
+        run: uv audit --frozen --preview-features audit-command
       # YAML correctness
       - name: Lint YAML (yamllint)
         uses: ibiqlik/action-yamllint@2576378a8e339169678f9939646ee3ee325e845c # v3.1.1
@@ -97,7 +100,7 @@ jobs:
         run: uvx validate-pyproject==0.25 pyproject.toml
       # CI workflow security audit
       - name: Audit CI workflows (zizmor)
-        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
+        uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
         with:
           advanced-security: false
   # JOB 3: Test matrix (stable Python versions on Linux/macOS/Windows)
@@ -114,7 +117,7 @@ jobs:
         python-version: ${{ fromJSON(needs.prepare-matrix.outputs.python-versions) }}
     steps:
       - name: Checkout source code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
       - name: Install uv
@@ -122,7 +125,7 @@ jobs:
         with:
           enable-cache: true
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install project and dev dependencies (locked)
