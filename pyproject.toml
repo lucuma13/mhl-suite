@@ -4,9 +4,30 @@ requires = [ "hatchling" ]
 
 [project]
 name = "mhl-suite"
-version = "1.3.1"
+version = "1.4.0"
 description = "Simple MHL verification and sealing tools"
 readme = "README.md"
+keywords = [
+  "asc-mhl",
+  "ascmhl",
+  "c4",
+  "checksum",
+  "classic-mhl",
+  "flat-mhl",
+  "legacy-mhl",
+  "md5",
+  "media-hash-list",
+  "mhl",
+  "mhl-suite",
+  "mhl-tool",
+  "mhlver",
+  "sha1",
+  "simple-mhl",
+  "xxhash",
+  "xxhash3",
+  "xxhash64",
+  "xxhash128",
+]
 license = { text = "MIT" }
 authors = [ { name = "Luis Gómez Gutiérrez" } ]
 requires-python = ">=3.11"
@@ -22,13 +43,14 @@ classifiers = [
 ]
 dependencies = [
   "ascmhl>=1.2",
+  "click>=8.1.8",
   "lxml>=6.1.1",
   "rich>=15",
-  "xxhash>=3.7",
+  "xxhash>=3.8",
 ]
 urls.Homepage = "https://github.com/lucuma13/mhl-suite"
-scripts.mhlver = "mhl_suite.mhlver:main"
-scripts.simple-mhl = "mhl_suite.simple_mhl:main"
+scripts.mhlver = "mhl_suite.cli.mhlver:main"
+scripts.simple-mhl = "mhl_suite.cli.simple_mhl:main"
 
 [dependency-groups]
 dev = [
@@ -44,7 +66,7 @@ dev = [
 
 [tool.hatch]
 build.targets.wheel.packages = [ "src/mhl_suite/" ]
-build.targets.sdist.include = [ "/src/mhl_suite/", "tests/" ]
+build.targets.sdist.include = [ "/src/mhl_suite/", "/tests/" ]
 build.targets.sdist.exclude = [ "/.github/" ]
 
 [tool.uv]
@@ -88,7 +110,7 @@ lint.ignore = [
 ]
 lint.per-file-ignores."tests/*.py" = [
   "ANN",     # annotations on tests add noise without value
-  "PLR2004", # exact values in assertions are the point of a test
+  "PLR2004", # exact values in assertions are the point
   "S101",    # asserts are the point of a test
   "S311",    # random is for fuzz-data generation, not cryptography
   "S324",    # md5 is a valid MHL algorithm the tests exercise, not a security boundary
@@ -101,3 +123,6 @@ default.extend-words.Nd = "Nd"  # "Number, decimal digit" Unicode category in Hy
 
 [tool.pytest]
 ini_options.addopts = "--strict-markers --cov=src --cov-branch --cov-report=term-missing --cov-report=xml"
+ini_options.filterwarnings = [
+  "ignore:GitWildMatchPattern.*:DeprecationWarning", # pathspec 'gitwildmatch' deprecation (ascmhl dependency)
+]
