@@ -9,8 +9,8 @@
 
 `mhl-suite` is a toolkit for sealing and verifying MHL files. It consists of two primary executables:
 
-* `mhlver`: one tool to verify them all. A wrapper that verifies MHL files recursively in a directory, with optional XSD schema validation and reporting. It delegates to `simple-mhl` for classic flat MHLs and to [ascmhl](https://github.com/ascmitc/mhl) for ASC-MHL.
-* `simple-mhl`: a modern sealing and verification tool, for classic flat MHL files. A successor of the discontinued [mhl-tool](https://github.com/pomfort/mhl-tool) and backwards compatible with its manifests - 2 to 5 times faster, full support for standard `xxhash64be` hashes, XSD schema validation features, cleaner output and structured exit codes.
+* `mhlver`: one tool to verify them all. Recursively verifies every MHL file under a path (both classic flat MHL and ASC-MHL), with a per-file progress bar, reports and optional XSD schema validation. The official [ASC-MHL](https://github.com/ascmitc/mhl) library runs in-process alongside the classic-MHL engine from `simple-mhl`. Both verify with the same auto-tuned parallel hashing (it compares the hash and storage performance and parallelises only when that's faster), giving ASC-MHL verification a speed-up over the reference implementation.
+* `simple-mhl`: a modern sealing and verification tool, for classic flat MHL files. A successor of the discontinued [mhl-tool](https://github.com/pomfort/mhl-tool) and backwards compatible with legacy manifests - 2 to 5 times faster (automatically parallelises when it pays off), full support for standard `xxhash64be` hashes, correct NFC/NFD handling independently of the filesystem, XSD schema validation features, cleaner output and structured exit codes.
 
 ### 🚀 Installation
 
@@ -42,15 +42,26 @@ Verify MHL files (both classic and ASC-MHL):
 
 ```bash
 mhlver path/to/file.mhl
-mhlver path/to/directory/
-mhlver                                     # verify current directory
+mhlver path/to/directory/                  # every manifest found
+mhlver                                     # current directory
+```
+
+Create a report after verification:
+```bash
+mhlver --report path/to/directory/
+```
+
+Quick size-only check:
+```bash
+mhlver --size-only path/to/directory/
 ```
 
 Seal a directory:
 
 ```bash
 simple-mhl seal path/to/directory/
-simple-mhl seal -a md5 path/to/directory/   # use MD5 algorithm
+simple-mhl seal -a md5 -a xxhash path/to/directory/        # use both MD5 and xxhash algorithms
+simple-mhl seal -o path/to/output/mhl path/to/directory/   # write the MHL into a parent directory
 ```
 
 Validate XML Schema Definition of a file:
