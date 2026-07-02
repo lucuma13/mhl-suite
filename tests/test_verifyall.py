@@ -1,0 +1,365 @@
+"""The cross-dialect orchestrator (mhl_suite.verifyall).
+
+This is where "both dialects verify in-process" actually happens: discover every
+manifest under a tree, dedup ASC-MHL generations, route each to the right backend,
+and render its per-file lines. The mhlver CLI owns aggregation and is tested
+separately; here we pin the orchestrator's own seams — discovery filtering,
+generation dedup, backend dispatch, render fidelity, and progress weighting.
+"""
+
+import tempfile
+import unicodedata
+from collections import Counter
+from pathlib import Path
+
+from hypothesis import HealthCheck, assume, given, settings, strategies
+
+from mhl_suite import verifyall
+from mhl_suite.verify_results import VerifyEntry, VerifyReport
+
+from .helpers import make_mhl_with_size, make_package, make_tree
+
+# Minimal ASC-MHL v2 manifest body — enough for is_ascmhl_v2()'s header check (namespace + version) to classify a file
+# as ASC-MHL during selection. Dedup groups generations by their `ascmhl/` package only when the header says v2.
+_V2_MHL = b'<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0"/>'
+
+# Hypothesis strategy for valid filename stems: Unicode letters, digits and
+# symbols (including emoji), plus "_-". We keep only NFC-normalised stems so two
+# "distinct" names can't collapse onto the same file on a normalisation-insensitive
+# filesystem (APFS/HFS+), and skip leading "._" (the resource-fork filter) and blanks.
+_filename_stem = strategies.text(
+    alphabet=strategies.characters(
+        whitelist_categories=("Ll", "Lu", "Nd", "So"),
+        whitelist_characters="_-",
+    ),
+    min_size=1,
+    max_size=20,
+).filter(lambda s: not s.startswith("._") and s.strip() and unicodedata.is_normalized("NFC", s))
+
+_generations_per_pkg = strategies.integers(min_value=1, max_value=4)
+
+
+def _fs_name_key(name: str) -> str:
+    """Key under which two stems become the *same* file on a case-insensitive,
+    normalisation-insensitive filesystem (macOS APFS/HFS+): case-folded and
+    NFC-normalised. Package-name lists are made unique by this key, not by plain
+    string equality, so generated names like "Ŭ"/"ŭ" can't map to one on-disk
+    directory and break the one-package-per-name assumption these tests rely on.
+    """
+    return unicodedata.normalize("NFC", name.casefold())
+
+
+class TestFindMhlFiles:
+    """find_mhl_files walks case-insensitively and skips macOS resource forks."""
+
+    def test_case_insensitive_recursive(self, tmp_path):
+        make_tree(tmp_path, {"a.mhl": b"", "sub/B.MHL": b"", "sub/deep/c.MhL": b""})
+        found = {p.name for p in verifyall.find_mhl_files(tmp_path)}
+        assert found == {"a.mhl", "B.MHL", "c.MhL"}
+
+    def test_skips_resource_forks(self, tmp_path):
+        make_tree(tmp_path, {"real.mhl": b"", "._real.mhl": b""})
+        found = [p.name for p in verifyall.find_mhl_files(tmp_path)]
+        assert found == ["real.mhl"]
+
+    def test_ignores_non_mhl(self, tmp_path):
+        make_tree(tmp_path, {"keep.mhl": b"", "notes.txt": b"", "data.xml": b""})
+        found = {p.name for p in verifyall.find_mhl_files(tmp_path)}
+        assert found == {"keep.mhl"}
+
+
+class TestSelectMhlFiles:
+    """_select_mhl_files keeps one manifest per ASC package and passes classic through."""
+
+    def test_ascmhl_package_dedups_to_latest_generation(self, tmp_path):
+        make_tree(
+            tmp_path,
+            {
+                "pkg/ascmhl/0001.mhl": _V2_MHL,
+                "pkg/ascmhl/0002.mhl": _V2_MHL,
+                "pkg/ascmhl/0003.mhl": _V2_MHL,
+            },
+        )
+        selected = verifyall._select_mhl_files(tmp_path)
+        assert [p.name for p in selected] == ["0003.mhl"]
+
+    def test_classic_files_pass_through(self, tmp_path):
+        make_tree(tmp_path, {"one.mhl": b"", "sub/two.mhl": b""})
+        selected = {p.name for p in verifyall._select_mhl_files(tmp_path)}
+        assert selected == {"one.mhl", "two.mhl"}
+
+    def test_mixed_tree_keeps_classic_and_latest_asc(self, tmp_path):
+        make_tree(
+            tmp_path,
+            {
+                "data.mhl": b"",
+                "pkg/ascmhl/0001.mhl": _V2_MHL,
+                "pkg/ascmhl/0002.mhl": _V2_MHL,
+                "._fork.mhl": b"",
+            },
+        )
+        selected = {p.name for p in verifyall._select_mhl_files(tmp_path)}
+        assert selected == {"data.mhl", "0002.mhl"}
+
+    def test_ascmhl_folder_directly_under_scan_root_yields_latest(self, tmp_path):
+        """An ascmhl/ immediately under the scan root (no package dir) still dedups
+        to exactly one manifest — the latest generation."""
+        make_tree(
+            tmp_path,
+            {
+                "ascmhl/0001.mhl": _V2_MHL,
+                "ascmhl/0002.mhl": _V2_MHL,
+                "ascmhl/0003.mhl": _V2_MHL,
+            },
+        )
+        selected = verifyall._select_mhl_files(tmp_path)
+        assert len(selected) == 1
+        assert selected[0].name == "0003.mhl"
+
+    def test_top_level_and_nested_ascmhl_dedup_independently(self, tmp_path):
+        """A top-level ascmhl/ and a nested package's ascmhl/ each contribute one
+        manifest — they must not share a dedup key despite both being 'ascmhl'."""
+        make_tree(
+            tmp_path,
+            {
+                "ascmhl/0001.mhl": _V2_MHL,
+                "pkg/ascmhl/0001.mhl": _V2_MHL,
+                "pkg/ascmhl/0002.mhl": _V2_MHL,
+            },
+        )
+        selected = {p.name for p in verifyall._select_mhl_files(tmp_path)}
+        assert selected == {"0001.mhl", "0002.mhl"}
+
+    def test_classic_v1_inside_ascmhl_folder_is_not_grouped_as_package(self, tmp_path):
+        """Dialect is decided by the header, not the folder name: a classic v1
+        manifest that happens to sit inside an `ascmhl/` folder passes through as its own classic manifest instead of
+        being folded into — and distorting — the real v2 package's generation dedup."""
+        make_tree(
+            tmp_path,
+            {
+                "pkg/ascmhl/0001.mhl": _V2_MHL,
+                "pkg/ascmhl/0002.mhl": _V2_MHL,
+                "pkg/ascmhl/legacy.mhl": b'<hashlist version="1.1"/>',
+            },
+        )
+        selected = {p.name for p in verifyall._select_mhl_files(tmp_path)}
+        # The v2 package dedups to its latest generation (0002); the v1 file stands on its own key.
+        assert selected == {"0002.mhl", "legacy.mhl"}
+
+
+class TestSelectMhlFilesInvariants:
+    """Property-based invariants over generated layouts, complementing the unit
+    cases above. @given tests manage their own TemporaryDirectory rather than the
+    function-scoped tmp_path, which is not reset between generated examples."""
+
+    @given(
+        pkg_names=strategies.lists(_filename_stem, min_size=1, max_size=5, unique_by=_fs_name_key),
+        gen_counts=strategies.lists(_generations_per_pkg, min_size=1, max_size=5),
+    )
+    @settings(max_examples=80, suppress_health_check=[HealthCheck.too_slow])
+    def test_each_ascmhl_package_selected_at_most_once(self, pkg_names, gen_counts):
+        """No matter how many generation files a package has, _select_mhl_files
+        must return at most one manifest per ascmhl/ directory."""
+        counts = (gen_counts + [1] * len(pkg_names))[: len(pkg_names)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_dirs = set()
+            for name, n_gens in zip(pkg_names, counts, strict=True):
+                ascdir = root / name / "ascmhl"
+                ascdir.mkdir(parents=True, exist_ok=True)
+                package_dirs.add(ascdir)
+                for i in range(1, n_gens + 1):
+                    (ascdir / f"{i:04d}.mhl").write_bytes(_V2_MHL)
+
+            selected = verifyall._select_mhl_files(root)
+
+            dir_counts = Counter(f.parent for f in selected if f.parent in package_dirs)
+            for ascdir, count in dir_counts.items():
+                assert count == 1, f"{ascdir} appears {count} times in selection; expected exactly 1"
+
+    @given(
+        pkg_names=strategies.lists(_filename_stem, min_size=1, max_size=4, unique_by=_fs_name_key),
+        gen_counts=strategies.lists(_generations_per_pkg, min_size=1, max_size=4),
+    )
+    @settings(max_examples=80, suppress_health_check=[HealthCheck.too_slow])
+    def test_latest_generation_is_always_selected(self, pkg_names, gen_counts):
+        """_select_mhl_files must pick the lexicographically largest filename
+        (i.e. the latest generation) for each ASC-MHL package."""
+        counts = (gen_counts + [1] * len(pkg_names))[: len(pkg_names)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            expected: dict[Path, Path] = {}
+            for name, n_gens in zip(pkg_names, counts, strict=True):
+                ascdir = root / name / "ascmhl"
+                ascdir.mkdir(parents=True, exist_ok=True)
+                for i in range(1, n_gens + 1):
+                    (ascdir / f"{i:04d}.mhl").write_bytes(_V2_MHL)
+                expected[ascdir] = ascdir / f"{n_gens:04d}.mhl"
+
+            selected = verifyall._select_mhl_files(root)
+            selected_set = set(selected)
+
+            for ascdir, latest in expected.items():
+                assert latest in selected_set, (
+                    f"Expected latest generation {latest.name} to be selected for package {ascdir.parent.name}"
+                )
+
+    @given(mhl_names=strategies.lists(_filename_stem, min_size=1, max_size=6, unique=True))
+    @settings(max_examples=60, suppress_health_check=[HealthCheck.too_slow])
+    def test_loose_mhl_files_are_never_deduplicated_against_each_other(self, mhl_names):
+        """Each distinct loose .mhl file (not inside an ascmhl/ folder) uses its own
+        path as its dedup key, so N distinct loose files must yield N results."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in mhl_names:
+                (root / f"{name}.mhl").write_text("")
+
+            # Distinct names can still collide on a case-insensitive filesystem (e.g. APFS),
+            # so compare against the files on disk.
+            on_disk = list(root.glob("*.mhl"))
+            selected = verifyall._select_mhl_files(root)
+            assert len(selected) == len(on_disk), (
+                f"Expected {len(on_disk)} loose files, got {len(selected)}: {[p.name for p in selected]}"
+            )
+
+    @given(
+        pkg_names=strategies.lists(_filename_stem, min_size=1, max_size=3, unique=True),
+        mhl_names=strategies.lists(_filename_stem, min_size=1, max_size=3, unique=True),
+        gen_counts=strategies.lists(_generations_per_pkg, min_size=1, max_size=3),
+    )
+    @settings(max_examples=60, suppress_health_check=[HealthCheck.too_slow])
+    def test_output_count_never_exceeds_input_count(self, pkg_names, mhl_names, gen_counts):
+        """Total selected files ≤ total .mhl files on disk: dedup can only reduce
+        the count, never invent or duplicate files."""
+        assume(not (set(pkg_names) & set(mhl_names)))
+        counts = (gen_counts + [1] * len(pkg_names))[: len(pkg_names)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            total_files = 0
+
+            for name, n_gens in zip(pkg_names, counts, strict=True):
+                ascdir = root / name / "ascmhl"
+                ascdir.mkdir(parents=True, exist_ok=True)
+                for i in range(1, n_gens + 1):
+                    (ascdir / f"{i:04d}.mhl").write_bytes(_V2_MHL)
+                    total_files += 1
+
+            for name in mhl_names:
+                (root / f"{name}.mhl").write_text("")
+                total_files += 1
+
+            selected = verifyall._select_mhl_files(root)
+            assert len(selected) <= total_files
+
+    @given(
+        n_pkgs=strategies.integers(min_value=0, max_value=3),
+        n_loose=strategies.integers(min_value=0, max_value=3),
+    )
+    @settings(max_examples=60, suppress_health_check=[HealthCheck.too_slow])
+    def test_output_is_always_sorted(self, n_pkgs, n_loose):
+        """_select_mhl_files must return paths in sorted order regardless of how
+        many packages or loose files are present."""
+        assume(n_pkgs + n_loose > 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            for i in range(n_pkgs):
+                ascdir = root / f"pkg{i}" / "ascmhl"
+                ascdir.mkdir(parents=True, exist_ok=True)
+                (ascdir / "0001.mhl").write_bytes(_V2_MHL)
+
+            for i in range(n_loose):
+                (root / f"loose{i}.mhl").write_text("")
+
+            selected = verifyall._select_mhl_files(root)
+            assert selected == sorted(selected)
+
+
+class TestVerifyItemDispatch:
+    """verify_item routes by the 'ascmhl' path component, both backends in-process."""
+
+    def test_classic_manifest_routes_to_classic_backend(self, tmp_path):
+        manifest = make_mhl_with_size(tmp_path, "clip.mov", b"hello world")
+        code, _mr = verifyall.verify_item(manifest, verbose=False, schema=False)
+        assert code == 0
+
+    def test_classic_mismatch_surfaces_nonzero(self, tmp_path):
+        manifest = make_mhl_with_size(tmp_path, "clip.mov", b"hello world")
+        (tmp_path / "clip.mov").write_bytes(b"tampered")
+        code, _mr = verifyall.verify_item(manifest, verbose=False, schema=False)
+        assert code != 0
+
+    def test_ascmhl_manifest_routes_to_asc_backend(self, tmp_path):
+        pkg = make_package(tmp_path / "pkg", {"top.txt": b"hello\n"})
+        manifest = next((pkg / "ascmhl").glob("*.mhl"))
+        code, _mr = verifyall.verify_item(manifest, verbose=False, schema=False)
+        assert code == 0
+
+    def test_ascmhl_tamper_surfaces_mismatch(self, tmp_path):
+        pkg = make_package(tmp_path / "pkg", {"top.txt": b"hello\n"})
+        (pkg / "top.txt").write_bytes(b"CORRUPT\n")
+        manifest = next((pkg / "ascmhl").glob("*.mhl"))
+        code, _mr = verifyall.verify_item(manifest, verbose=False, schema=False)
+        assert code == 11
+
+    def test_classic_nonzero_with_no_file_results_is_manifest_error(self, tmp_path, monkeypatch):
+        """A non-zero report carrying no per-file entries (and not the malformed-XML
+        case) is classified as a manifest-level 'error', not 'failed'."""
+        manifest = make_mhl_with_size(tmp_path, "clip.mov", b"hello world")
+        monkeypatch.setattr(
+            verifyall, "verify_classic", lambda *a, **kw: VerifyReport(entries=[], code=11, malformed=False)
+        )
+        code, mr = verifyall.verify_item(manifest, verbose=False, schema=False)
+        assert code == 11
+        assert mr is not None
+        assert mr.manifest_status == "error"
+
+
+class TestRenderAscmhlLines:
+    """_render_ascmhl_lines reproduces the terminal text from a VerifyReport."""
+
+    def _report(self):
+        return VerifyReport(
+            notices=["Verified with size-only checks"],
+            entries=[
+                VerifyEntry(path="ok.txt", status="ok", line="[OK] ok.txt"),
+                VerifyEntry(
+                    path="bad.txt",
+                    status="mismatch",
+                    line="[ERROR] size mismatch: bad.txt",
+                    detail_line="        (calc size: 9 | stored size: 4)",
+                ),
+            ],
+        )
+
+    def test_quiet_shows_notices_and_failures_only(self):
+        lines = verifyall._render_ascmhl_lines(self._report(), verbose=False)
+        assert lines == ["Verified with size-only checks", "[ERROR] size mismatch: bad.txt"]
+
+    def test_verbose_adds_ok_lines_and_detail_continuation(self):
+        lines = verifyall._render_ascmhl_lines(self._report(), verbose=True)
+        assert lines == [
+            "Verified with size-only checks",
+            "[OK] ok.txt",
+            "[ERROR] size mismatch: bad.txt",
+            "        (calc size: 9 | stored size: 4)",
+        ]
+
+
+class TestManifestWeights:
+    """_manifest_weights weights by byte volume, but by count under size-only."""
+
+    def test_size_only_weights_every_manifest_equally(self, tmp_path):
+        manifest = make_mhl_with_size(tmp_path, "clip.mov", b"x" * 50)
+        weights = verifyall._manifest_weights([manifest], size_only=True)
+        assert weights == {manifest: 1}
+
+    def test_byte_weight_counts_recomputable_entry_size(self, tmp_path):
+        content = b"x" * 50
+        manifest = make_mhl_with_size(tmp_path, "clip.mov", content)
+        weights = verifyall._manifest_weights([manifest], size_only=False)
+        assert weights[manifest] == len(content)
