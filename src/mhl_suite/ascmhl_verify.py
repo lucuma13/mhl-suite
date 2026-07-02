@@ -23,7 +23,7 @@ from ascmhl import errors
 from ascmhl.commands import test_for_missing_files
 from ascmhl.hasher import new_hasher_for_hash_type
 from ascmhl.history import MHLHistory
-from ascmhl.ignore import MHLIgnoreSpec
+from ascmhl.ignore import MHLIgnoreSpec, default_ignore_list
 from ascmhl.traverse import post_order_lexicographic
 from lxml import etree
 
@@ -105,7 +105,13 @@ def _verify_entire_folder(
     renamed_files = existing_history.renamed_path_with_previous_path()
     not_found_paths = {p if renamed_files.get(p, None) is None else renamed_files[p] for p in not_found_paths}
 
-    ignore_spec = MHLIgnoreSpec(existing_history.latest_ignore_patterns())
+    # The ASC-MHL default ignore set (.DS_Store, ascmhl) is mandated by the specification to always apply — those files
+    # and directories mutate as a history is appended, so no records for them can exist and they must never be flagged
+    # as new. MHLIgnoreSpec drops the defaults whenever the recorded pattern list is non-empty, so a foreign manifest
+    # that recorded custom patterns without the defaults would make verify descend into ascmhl/ and report the manifests
+    # and chain as new files. Passing default_ignore_list() as the on-top list guarantees the defaults are always
+    # present (a no-op de-dup for the reference tool, which already records them).
+    ignore_spec = MHLIgnoreSpec(existing_history.latest_ignore_patterns(), default_ignore_list())
 
     deferred = _collect_deferred(existing_history, root_path, ignore_spec, not_found_paths, report)
     num_failed_verifications = _hash_and_compare(deferred, report, on_progress)
@@ -156,8 +162,15 @@ def _collect_deferred(
                 continue
             rel_path, original_hash_entry = _find_original_hash_entry(existing_history, file_path)
             if original_hash_entry is None:
-                # The library's rel_path uses the native separator (os.path.relpath); the report keeps the
-                # canonical forward-slash form, so normalise here.
+                # No `action="original"` hash exists for this on-disk file, so we report it as a new/unknown file. This
+                # also swallows a degenerate-but-XSD-compliant case: a file whose only recorded hash across all
+                # generations is `action="failed"`. Such a file is recorded in the manifest — so "new file" is arguably
+                # inaccurate — but it has no usable hash either, and the spec defines no outcome for a
+                # recorded-yet-unverifiable file. We follow the reference implementation here, which treats a missing
+                # original as "new file", rather than inventing a distinct "unverifiable" or "already-failed".
+                #
+                # The library's rel_path uses the native separator (os.path.relpath); the report keeps the canonical
+                # forward-slash form, so normalise here.
                 rel = Path(rel_path).as_posix()
                 report.append(VerifyEntry(path=rel, status="new", line=f"[ERROR] new file found: {rel}"))
                 continue

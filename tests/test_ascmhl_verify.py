@@ -115,6 +115,15 @@ class TestVerifyPackage:
         assert report.code == 21
         assert statuses(report)["A/new.txt"] == "new"
 
+    def test_default_ignore_patterns_always_apply(self, package, monkeypatch):
+        """The spec-mandated default ignore set (.DS_Store, ascmhl) always applies, even when a manifest recorded custom
+        ignore patterns without the defaults. Otherwise verify would descend into ascmhl/ and flag its manifests and
+        chain as new files (exit 21). We simulate such a foreign manifest by returning a custom-only pattern list."""
+        monkeypatch.setattr(MHLHistory, "latest_ignore_patterns", lambda self: ["*.tmp"])
+        report = verify.verify_ascmhl(package)
+        assert report.code == 0
+        assert set(statuses(report).values()) == {"ok"}
+
     def test_no_history_is_exit_30(self, tmp_path):
         (tmp_path / "bare.txt").write_bytes(b"x")
         report = verify.verify_ascmhl(tmp_path)
