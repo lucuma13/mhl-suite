@@ -21,7 +21,7 @@ repos:
         exclude: \.md$
   # Spellcheck
   - repo: https://github.com/crate-ci/typos
-    rev: v1.47.2 # pin to a concrete release; v1 is a mutable rolling tag
+    rev: v1.48.0 # pin to a concrete release; v1 is a mutable rolling tag
     hooks:
       - id: typos
         args: [--force-exclude] # Flag only: removed default --write-changes
