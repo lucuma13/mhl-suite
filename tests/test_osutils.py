@@ -1,4 +1,5 @@
-"""Tests for mhl_suite.osutils — friendly_hostname and resolve_on_disk.
+"""
+Tests for mhl_suite.osutils — friendly_hostname and resolve_on_disk.
 
 The CLI wiring that consumes the resolver (the "did you mean" not-found hint)
 lives with the CLI tests; the resolver tests here pin it against a simulated
@@ -18,8 +19,10 @@ from .helpers import _sensitive_fs
 
 
 class TestFriendlyHostname:
-    """friendly_hostname prefers the macOS ComputerName, with fallbacks. Shared
-    by simple_mhl (manifest <hostname>) and mhlver (report Host field)."""
+    """
+    friendly_hostname prefers the macOS ComputerName, with fallbacks. Shared by
+    simple_mhl (manifest <hostname>) and mhlver (report Host field).
+    """
 
     def test_macos_uses_computer_name(self, monkeypatch):
         """On macOS the user-facing ComputerName from scutil is preferred over
@@ -78,7 +81,8 @@ class TestFriendlyHostname:
 
     def test_creatorinfo_uses_friendly_hostname(self, monkeypatch):
         """
-        The manifest's creatorinfo <hostname> is sourced from the shared helper, not the bare network hostname.
+        The manifest's creatorinfo <hostname> is sourced from the shared helper,
+        not the bare network hostname.
         """
         monkeypatch.setattr(core_seal, "friendly_hostname", lambda: "Luis's MacBook Pro")
         doc = etree.Element("hashlist", version="1.1")
@@ -87,8 +91,10 @@ class TestFriendlyHostname:
 
 
 class TestToTerminalSep:
-    """to_terminal_sep renders the canonical forward-slash path with the platform separator — the one place we leave
-    the forward-slash form. Both CLIs route terminal output through it, so the same manifest shows the same separators
+    """
+    to_terminal_sep renders the canonical forward-slash path with the platform
+    separator — the one place we leave the forward-slash form. Both CLIs route
+    terminal output through it, so the same manifest shows the same separators
     whichever tool verified it.
     """
 
@@ -104,7 +110,8 @@ class TestToTerminalSep:
 
 
 class TestResolveOnDisk:
-    """Unit tests for osutils.resolve_on_disk against a simulated
+    """
+    Unit tests for osutils.resolve_on_disk against a simulated
     normalization-sensitive filesystem.
 
     The host filesystem on dev machines (APFS) is normalization-*insensitive*
@@ -139,9 +146,11 @@ class TestResolveOnDisk:
         assert calls == []  # never scanned
 
     def test_scenario3_nfc_query_resolves_to_nfd_on_disk(self, monkeypatch):
-        """Scenario 3: NFC manifest path, NFD name on a sensitive filesystem.
-        The literal NFC lookup misses; the NFC-keyed index resolves the real
-        NFD entry."""
+        """
+        Scenario 3: NFC manifest path, NFD name on a sensitive filesystem. The
+        literal NFC lookup misses; the NFC-keyed index resolves the real NFD
+        entry.
+        """
         nfd_file = os.path.join(self._BASE, self._NFD, "text.txt")
         self._patch(
             monkeypatch,
@@ -151,9 +160,11 @@ class TestResolveOnDisk:
         assert result == nfd_file
 
     def test_scenario2_coexisting_forms_resolve_distinctly(self, monkeypatch):
-        """Scenario 2: NFC and NFD rosé/ both exist (sensitive FS). Each query
+        """
+        Scenario 2: NFC and NFD rosé/ both exist (sensitive FS). Each query
         resolves to its own distinct directory via the literal fast path — the
-        two forms never collapse onto one."""
+        two forms never collapse onto one.
+        """
         nfc_file = os.path.join(self._BASE, self._NFC, "text.txt")
         nfd_file = os.path.join(self._BASE, self._NFD, "text.txt")
         self._patch(
@@ -170,9 +181,11 @@ class TestResolveOnDisk:
         assert osutils.resolve_on_disk(self._BASE, os.path.join(self._NFD, "text.txt"), {}) == nfd_file
 
     def test_intermediate_directory_normalization_mismatch(self, monkeypatch):
-        """Normalization can differ on a non-leaf component: an ASCII parent, an
+        """
+        Normalization can differ on a non-leaf component: an ASCII parent, an
         NFD middle directory on disk addressed by an NFC manifest path, then an
-        ASCII leaf. The resolver must reconcile the middle component."""
+        ASCII leaf. The resolver must reconcile the middle component.
+        """
         real_file = os.path.join(self._BASE, "sub", self._NFD, "text.txt")
         self._patch(
             monkeypatch,

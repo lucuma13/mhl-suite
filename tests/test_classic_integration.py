@@ -1,4 +1,6 @@
-"""Adversarial, stress, symlink, TOCTOU and fuzz tests for classicmhl seal/verify."""
+"""
+Adversarial, stress, symlink, TOCTOU and fuzz tests for classicmhl seal/verify.
+"""
 
 import hashlib
 import os
@@ -201,9 +203,10 @@ class TestWalkEdgeCases:
     )
     def test_unreadable_subdir_is_skipped_with_warning(self, mhl_cli, tmp_path):
         """
-        A subdirectory that cannot be scanned (mode 000) is skipped, but the seal must surface a WARNING (always, not
-        just under -v) — a dropped directory means its files are absent from the manifest. The seal still succeeds and
-        includes the files that ARE accessible.
+        A subdirectory that cannot be scanned (mode 000) is skipped, but the
+        seal must surface a WARNING (always, not just under -v) — a dropped
+        directory means its files are absent from the manifest. The seal still
+        succeeds and includes the files that ARE accessible.
         """
         make_tree(
             tmp_path,
@@ -236,17 +239,20 @@ class TestSymlinks:
     """
     Symlink handling for both seal and verify.
 
-    seal() excludes symlinks entirely (follow_symlinks=False on both is_dir and is_file), making directory-cycle
-    traversal impossible by exclusion. verify() follows symlinks when named in a third-party manifest, hashing their
+    seal() excludes symlinks entirely (follow_symlinks=False on both is_dir and
+    is_file), making directory-cycle traversal impossible by exclusion. verify()
+    follows symlinks when named in a third-party manifest, hashing their
     targets.
 
-    Protection layers pinned here so a future refactor cannot silently remove the follow_symlinks=False calls without a
-    test failure.
+    Protection layers pinned here so a future refactor cannot silently remove
+    the follow_symlinks=False calls without a test failure.
     """
 
     def test_symlink_to_parent_is_excluded_from_seal(self, mhl_cli, tmp_path):
-        """A symlink pointing back to its own parent directory must be silently
-        excluded from the manifest — not descended into, not hashed."""
+        """
+        A symlink pointing back to its own parent directory must be silently
+        excluded from the manifest — not descended into, not hashed.
+        """
         pkg = tmp_path / "pkg"
         pkg.mkdir()
         (pkg / "real.bin").write_bytes(b"data")
@@ -266,8 +272,8 @@ class TestSymlinks:
 
     def test_mutual_symlinks_are_excluded_from_seal(self, mhl_cli, tmp_path):
         """
-        Two symlinks pointing at each other must both be silently excluded — neither causes infinite descent, neither
-        appears in the manifest.
+        Two symlinks pointing at each other must both be silently excluded —
+        neither causes infinite descent, neither appears in the manifest.
         """
         pkg = tmp_path / "pkg"
         pkg.mkdir()
@@ -290,7 +296,10 @@ class TestSymlinks:
         assert text.count("<hash>") == 1
 
     def test_symlink_to_file_inside_tree_verifies_correctly(self, mhl_cli, tmp_path):
-        """verify follows a symlink that resolves inside the tree and hashes its target."""
+        """
+        verify follows a symlink that resolves inside the tree and hashes its
+        target.
+        """
 
         pkg = tmp_path / "pkg"
         pkg.mkdir()
@@ -314,7 +323,10 @@ class TestSymlinks:
         assert rc == 0, f"unexpected output: {out}"
 
     def test_symlink_to_file_inside_tree_detects_mismatch(self, mhl_cli, tmp_path):
-        """A wrong digest for a symlink target is detected and reported as a hash mismatch → exit 40."""
+        """
+        A wrong digest for a symlink target is detected and reported as a hash
+        mismatch → exit 40.
+        """
         pkg = tmp_path / "pkg"
         pkg.mkdir()
         real = pkg / "real.bin"
@@ -338,9 +350,10 @@ class TestSymlinks:
 
     def test_mutual_symlinks_in_manifest_report_missing(self, mhl_cli, tmp_path):
         """
-        A manifest naming mutually-pointing symlinks (a → b, b → a) must not loop. os.path.exists() follows the chain
-        and returns False when it cannot resolve — the existence check fires before get_hash is ever called, so both
-        entries are reported as missing files → exit 10.
+        A manifest naming mutually-pointing symlinks (a → b, b → a) must not
+        loop. os.path.exists() follows the chain and returns False when it
+        cannot resolve — the existence check fires before get_hash is ever
+        called, so both entries are reported as missing files → exit 10.
         """
         pkg = tmp_path / "pkg"
         pkg.mkdir()
@@ -361,28 +374,31 @@ class TestSymlinks:
         )
 
         rc, out, _ = mhl_cli(["verify", str(mhl)])
-        # os.path.exists() returns False for unresolvable symlink chains; both entries hit the missing-file branch
-        # before get_hash is called.
+        # os.path.exists() returns False for unresolvable symlink chains; both
+        # entries hit the missing-file branch before get_hash is called.
         assert rc == 10
         assert "missing file: a.bin" in out
         assert "missing file: b.bin" in out
 
 
 class TestAdversarialXML:
-    """Adversarial and malformed XML inputs must never crash the tool.
+    """
+    Adversarial and malformed XML inputs must never crash the tool.
 
-    Covers XXE injection (lxml rejects external entities as XMLSyntaxError → exit 40) and structural anomalies
-    (Comment/PI nodes with callable .tag attributes that would break naive tag-name lookups).
+    Covers XXE injection (lxml rejects external entities as XMLSyntaxError →
+    exit 40) and structural anomalies (Comment/PI nodes with callable .tag
+    attributes that would break naive tag-name lookups).
     """
 
     def test_xxe_entity_payload_exits_40(self, mhl_cli, tmp_path):
         """
-        A manifest containing an XXE <!ENTITY> payload must exit 40 (malformed XML) and must never exfiltrate file
-        content via entity expansion.
+        A manifest containing an XXE <!ENTITY> payload must exit 40 (malformed
+        XML) and must never exfiltrate file content via entity expansion.
 
-        lxml's default parser does not resolve external entities; it raises XMLSyntaxError instead. simple_mhl.verify()
-        already maps that to exit 40. This test pins that behaviour as a regression guard — if the parser is ever
-        reconfigured to resolve entities, this test will fail loudly.
+        lxml's default parser does not resolve external entities; it raises
+        XMLSyntaxError instead. simple_mhl.verify() already maps that to exit
+        40. This test pins that behaviour as a regression guard — if the parser
+        is ever reconfigured to resolve entities, this test will fail loudly.
         """
         xxe_payload = (
             '<?xml version="1.0"?>\n'
@@ -405,10 +421,12 @@ class TestAdversarialXML:
 
     def test_comment_and_pi_nodes_inside_hash_do_not_crash(self, mhl_cli, tmp_path):
         """
-        lxml Comment and ProcessingInstruction nodes carry a callable (not a string) as their .tag attribute.
-        simple_mhl._localname() used to call .rpartition() on it, triggering an AttributeError crash.
+        lxml Comment and ProcessingInstruction nodes carry a callable (not a
+        string) as their .tag attribute. simple_mhl._localname() used to call
+        .rpartition() on it, triggering an AttributeError crash.
 
-        The fix: _localname() returns '' for non-string tags, making them invisible to the hash-tag recognition test.
+        The fix: _localname() returns '' for non-string tags, making them
+        invisible to the hash-tag recognition test.
         """
         (tmp_path / "target.bin").write_bytes(b"data")
 
@@ -432,8 +450,8 @@ class TestAdversarialXML:
 
     def test_comment_only_hash_reports_no_supported_hash(self, mhl_cli, tmp_path):
         """
-        A <hash> containing only Comment/PI nodes (no algorithm tag) must be reported as 'no supported hash found' (exit
-        40), not crash.
+        A <hash> containing only Comment/PI nodes (no algorithm tag) must be
+        reported as 'no supported hash found' (exit 40), not crash.
         """
         (tmp_path / "x.bin").write_bytes(b"x")
 
@@ -452,29 +470,36 @@ class TestAdversarialXML:
 
 class TestTOCTOURaceCondition:
     """
-    Files deleted between os.path.exists() and the next filesystem call must be handled gracefully.
+    Files deleted between os.path.exists() and the next filesystem call must be
+    handled gracefully.
 
     There are two distinct race windows in verify():
 
-      1. exists() -> getsize(): covered by test_file_vanishes_between_exists_and_getsize. Requires a manifest <size>
-         element; the OSError is caught by the size pre-check handler and reported as 'missing file' (exit 10).
+      1. exists() -> getsize(): covered by
+         test_file_vanishes_between_exists_and_getsize. Requires a manifest
+         <size> element; the OSError is caught by the size pre-check handler and
+         reported as 'missing file' (exit 10).
 
-      2. getsize() -> hash read: covered by test_file_deleted_before_hash_read. Requires NO <size> element so the size
-         block is skipped entirely; the OSError is caught by the get_hashes handler and reported as 'cannot verify'
-         (exit 40).
+      2. getsize() -> hash read: covered by test_file_deleted_before_hash_read.
+         Requires NO <size> element so the size block is skipped entirely; the
+         OSError is caught by the get_hashes handler and reported as 'cannot
+         verify' (exit 40).
 
-    Both handlers must produce a structured error message, not an unhandled exception.
+    Both handlers must produce a structured error message, not an unhandled
+    exception.
     """
 
     def test_file_vanishes_between_exists_and_getsize(self, mhl_cli, tmp_path, monkeypatch):
         """
         Race window 1: file disappears after exists() but before getsize().
 
-        The size pre-check's OSError handler (lines 549-555 of simple_mhl.py) must catch this and report 'missing file'
-        (exit 10), not propagate the exception.
+        The size pre-check's OSError handler (lines 549-555 of simple_mhl.py)
+        must catch this and report 'missing file' (exit 10), not propagate the
+        exception.
 
-        Manifest includes a <size> element so the size pre-check block is entered. os.path.getsize is patched to raise
-        OSError for the target file only.
+        Manifest includes a <size> element so the size pre-check block is
+        entered. os.path.getsize is patched to raise OSError for the target file
+        only.
         """
         mhl = make_mhl_with_size(tmp_path, "vanishing.bin", b"data")
 
@@ -494,13 +519,16 @@ class TestTOCTOURaceCondition:
 
     def test_file_deleted_before_hash_read(self, mhl_cli, tmp_path, monkeypatch):
         """
-        Race window 2: file disappears after getsize() but before the hash read opens it.
+        Race window 2: file disappears after getsize() but before the hash read
+        opens it.
 
-        verify() hashes through get_hashes (one read pass for one-or-many formats); its OSError handler must catch this
-        and report 'cannot verify' (exit 40), not propagate the exception.
+        verify() hashes through get_hashes (one read pass for one-or-many
+        formats); its OSError handler must catch this and report 'cannot verify'
+        (exit 40), not propagate the exception.
 
-        Manifest has NO <size> element so the size pre-check is skipped and the race happens at the hash read as
-        intended. get_hashes is patched to delete the file then attempt the real open, which raises OSError.
+        Manifest has NO <size> element so the size pre-check is skipped and the
+        race happens at the hash read as intended. get_hashes is patched to
+        delete the file then attempt the real open, which raises OSError.
         """
         target = tmp_path / "vanishing.bin"
         target.write_bytes(b"data")
@@ -531,13 +559,17 @@ class TestRobustness:
     """
     The tool must never crash or regress on unusual inputs.
 
-    Covers mutation-based fuzz resilience (random byte-level corruption of valid manifests must always produce a defined
-    exit code) and memory behaviour (verify() must use iterparse, not parse, to keep peak memory bounded for large
-    manifests tracking hundreds of thousands of frames).
+    Covers mutation-based fuzz resilience (random byte-level corruption of valid
+    manifests must always produce a defined exit code) and memory behaviour
+    (verify() must use iterparse, not parse, to keep peak memory bounded for
+    large manifests tracking hundreds of thousands of frames).
     """
 
     def test_verify_pure_garbage_bytes_exits_cleanly(self, mhl_cli, tmp_path):
-        """A file filled with random bytes must produce a defined exit code, never a traceback."""
+        """
+        A file filled with random bytes must produce a defined exit code, never
+        a traceback.
+        """
 
         fuzzed = tmp_path / "garbage.mhl"
         fuzzed.write_bytes(os.urandom(4096))
@@ -547,11 +579,12 @@ class TestRobustness:
 
     def test_verify_mutation_fuzz_loop(self, mhl_cli, tmp_path):
         """
-        Apply sequential random byte-level mutations to a valid manifest and assert the tool always exits with a defined
-        code — never crashes.
+        Apply sequential random byte-level mutations to a valid manifest and
+        assert the tool always exits with a defined code — never crashes.
 
-        20 iterations is enough to exercise truncation, bit-flip, null-injection, and garbage-insertion without making
-        the test suite noticeably slow.
+        20 iterations is enough to exercise truncation, bit-flip,
+        null-injection, and garbage-insertion without making the test suite
+        noticeably slow.
         """
 
         root = etree.Element("hashlist", version="1.1")
@@ -589,12 +622,15 @@ class TestRobustness:
         """
         Confirm verify() calls etree.iterparse() rather than etree.parse().
 
-        etree.parse() loads the full XML DOM into memory — for a 100MB manifest tracking hundreds of thousands of
-        DPX/EXR frames that means 300-500MB of RAM. etree.iterparse() yields one <hash> at a time and frees it
-        immediately, keeping peak memory proportional to one element, not the full document.
+        etree.parse() loads the full XML DOM into memory — for a 100MB manifest
+        tracking hundreds of thousands of DPX/EXR frames that means 300-500MB of
+        RAM. etree.iterparse() yields one <hash> at a time and frees it
+        immediately, keeping peak memory proportional to one element, not the
+        full document.
 
-        This test is implementation-level: it directly asserts the streaming path is taken so that a future refactor
-        cannot silently regress to DOM loading without a test failure.
+        This test is implementation-level: it directly asserts the streaming
+        path is taken so that a future refactor cannot silently regress to DOM
+        loading without a test failure.
         """
         parse_calls: list[str] = []
         iterparse_calls: list[str] = []
@@ -695,11 +731,11 @@ _FUZZ_FILES = [
 
 def _build_classic_fuzz_manifest(rng: random.Random) -> bytes:
     """
-    Build a well-formed classic-MHL manifest whose leaf values are drawn from the adversarial pools above. Structure
-    follows the XSD; only values vary.
+    Build a well-formed classic-MHL manifest whose leaf values are drawn from
+    the adversarial pools above. Structure follows the XSD; only values vary.
 
-    Built with lxml so the document is always well-formed and correctly escaped — the fuzzing targets the tool's value
-    handling, not the XML serializer.
+    Built with lxml so the document is always well-formed and correctly escaped
+    — the fuzzing targets the tool's value handling, not the XML serializer.
     """
     root = etree.Element("hashlist", version=rng.choice(_FUZZ_VERSIONS))
     for _ in range(rng.randint(1, 4)):
@@ -717,15 +753,20 @@ def _build_classic_fuzz_manifest(rng: random.Random) -> bytes:
 
 class TestSchemaShapedClassicMhlFuzz:
     """
-    Well-formed, XSD-shaped manifests with adversarial leaf values must always yield a defined exit code — never an
-    uncaught exception. A fixed seed keeps failures reproducible. Complements TestRobustness's byte-mutation fuzz."""
+    Well-formed, XSD-shaped manifests with adversarial leaf values must always
+    yield a defined exit code — never an uncaught exception. A fixed seed keeps
+    failures reproducible. Complements TestRobustness's byte-mutation fuzz.
+    """
 
     def test_verify_on_schema_shaped_values(self, mhl_cli, tmp_path):
         """
-        verify must return one of its documented codes for any schema-shaped manifest, whatever junk lives in the typed
-        value fields. The referenced files don't exist, so this exercises XML parsing, the version attribute, path
-        resolution and the missing-file path. (The size pre-check and digest comparison sit *after* the existence check,
-        so they are covered by the existing-file tests below, not here.)"""
+        verify must return one of its documented codes for any schema-shaped
+        manifest, whatever junk lives in the typed value fields. The referenced
+        files don't exist, so this exercises XML parsing, the version attribute,
+        path resolution and the missing-file path. (The size pre-check and
+        digest comparison sit *after* the existence check, so they are covered
+        by the existing-file tests below, not here.)
+        """
         rng = random.Random(1234)
         for i in range(80):
             mhl = tmp_path / f"fuzz_{i}.mhl"
@@ -735,10 +776,14 @@ class TestSchemaShapedClassicMhlFuzz:
 
     def test_verify_tampered_size_on_existing_files(self, mhl_cli, tmp_path):
         """
-        Model a user editing the <size> of an entry whose file exists and whose digest is correct: verify gets *past*
-        the missing-file check and actually runs the size pre-check. A malformed or mismatched size must be reported
-        (40); a coincidentally-correct one falls through to the matching hash and passes (0). Never a crash, whatever
-        odd characters or magnitudes the size carries — so the outcome here is driven purely by the size field."""
+        Model a user editing the <size> of an entry whose file exists and whose
+        digest is correct: verify gets *past* the missing-file check and
+        actually runs the size pre-check. A malformed or mismatched size must be
+        reported (40); a coincidentally-correct one falls through to the
+        matching hash and passes (0). Never a crash, whatever odd characters or
+        magnitudes the size carries — so the outcome here is driven purely by
+        the size field.
+        """
         rng = random.Random(24680)
         for i in range(80):
             content = bytes(rng.randint(0, 255) for _ in range(rng.randint(1, 32)))
@@ -760,10 +805,12 @@ class TestSchemaShapedClassicMhlFuzz:
 
     def test_verify_tampered_digest_on_existing_files(self, mhl_cli, tmp_path):
         """
-        Model a user editing the digest of an entry whose file exists with the recorded size: verify gets *past* the
-        existence and size pre-checks and actually reaches digest comparison. Whatever invalid characters or encoding
-        the tampered digest carries, verify must report a clean result (0 if it happens to match, 40 mismatch /
-        cannot-verify) — never crash."""
+        Model a user editing the digest of an entry whose file exists with the
+        recorded size: verify gets *past* the existence and size pre-checks and
+        actually reaches digest comparison. Whatever invalid characters or
+        encoding the tampered digest carries, verify must report a clean result
+        (0 if it happens to match, 40 mismatch / cannot-verify) — never crash.
+        """
         rng = random.Random(31337)
         for i in range(80):
             content = bytes(rng.randint(0, 255) for _ in range(rng.randint(1, 32)))
@@ -785,8 +832,11 @@ class TestSchemaShapedClassicMhlFuzz:
             assert rc in {0, 11}, f"verify exit {rc} on tampered-digest iteration {i}"
 
     def test_xsd_schema_check_on_schema_shaped_values(self, mhl_cli, tmp_path):
-        """xsd-schema-check must return one of its documented codes (0 valid,
-        41 schema-invalid, 40 parse/file error, 1 error (xsd missing)) — never crash."""
+        """
+        xsd-schema-check must return one of its documented codes (0 valid, 41
+        schema-invalid, 40 parse/file error, 1 error (xsd missing)) — never
+        crash.
+        """
         rng = random.Random(5678)
         for i in range(80):
             mhl = tmp_path / f"fuzz_{i}.mhl"

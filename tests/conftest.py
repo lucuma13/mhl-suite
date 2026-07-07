@@ -1,8 +1,10 @@
-"""Package-wide fixtures shared across the test suite.
+"""
+Package-wide fixtures shared across the test suite.
 
-The two CLI entry points are driven in-process: each fixture swaps sys.argv / sys.stdout / sys.stderr, calls main(),
-catches SystemExit, and returns (exit_code, stdout, stderr). Lifted here from the old monolithic CLI test files so every
-test module inherits them without re-defining.
+The two CLI entry points are driven in-process: each fixture swaps sys.argv /
+sys.stdout / sys.stderr, calls main(), catches SystemExit, and returns
+(exit_code, stdout, stderr). Lifted here from the old monolithic CLI test files
+so every test module inherits them without re-defining.
 """
 
 import io

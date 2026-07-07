@@ -1,10 +1,12 @@
-"""The cross-dialect orchestrator (mhl_suite.verifyall).
+"""
+The cross-dialect orchestrator (mhl_suite.verifyall).
 
 This is where "both dialects verify in-process" actually happens: discover every
-manifest under a tree, dedup ASC-MHL generations, route each to the right backend,
-and render its per-file lines. The mhlver CLI owns aggregation and is tested
-separately; here we pin the orchestrator's own seams — discovery filtering,
-generation dedup, backend dispatch, render fidelity, and progress weighting.
+manifest under a tree, dedup ASC-MHL generations, route each to the right
+backend, and render its per-file lines. The mhlver CLI owns aggregation and is
+tested separately; here we pin the orchestrator's own seams — discovery
+filtering, generation dedup, backend dispatch, render fidelity, and progress
+weighting.
 """
 
 import tempfile
@@ -19,14 +21,16 @@ from mhl_suite.verify_results import VerifyEntry, VerifyReport
 
 from .helpers import make_mhl_with_size, make_package, make_tree
 
-# Minimal ASC-MHL v2 manifest body — enough for is_ascmhl_v2()'s header check (namespace + version) to classify a file
-# as ASC-MHL during selection. Dedup groups generations by their `ascmhl/` package only when the header says v2.
+# Minimal ASC-MHL v2 manifest body — enough for is_ascmhl_v2()'s header check
+# (namespace + version) to classify a file as ASC-MHL during selection. Dedup
+# groups generations by their `ascmhl/` package only when the header says v2.
 _V2_MHL = b'<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0"/>'
 
 # Hypothesis strategy for valid filename stems: Unicode letters, digits and
 # symbols (including emoji), plus "_-". We keep only NFC-normalised stems so two
-# "distinct" names can't collapse onto the same file on a normalisation-insensitive
-# filesystem (APFS/HFS+), and skip leading "._" (the resource-fork filter) and blanks.
+# "distinct" names can't collapse onto the same file on a
+# normalisation-insensitive filesystem (APFS/HFS+), and skip leading "._" (the
+# resource-fork filter) and blanks.
 _filename_stem = strategies.text(
     alphabet=strategies.characters(
         whitelist_categories=("Ll", "Lu", "Nd", "So"),
@@ -40,7 +44,8 @@ _generations_per_pkg = strategies.integers(min_value=1, max_value=4)
 
 
 def _fs_name_key(name: str) -> str:
-    """Key under which two stems become the *same* file on a case-insensitive,
+    """
+    Key under which two stems become the *same* file on a case-insensitive,
     normalisation-insensitive filesystem (macOS APFS/HFS+): case-folded and
     NFC-normalised. Package-name lists are made unique by this key, not by plain
     string equality, so generated names like "Ŭ"/"ŭ" can't map to one on-disk
@@ -69,7 +74,10 @@ class TestFindMhlFiles:
 
 
 class TestSelectMhlFiles:
-    """_select_mhl_files keeps one manifest per ASC package and passes classic through."""
+    """
+    _select_mhl_files keeps one manifest per ASC package and passes classic
+    through.
+    """
 
     def test_ascmhl_package_dedups_to_latest_generation(self, tmp_path):
         make_tree(
@@ -102,8 +110,10 @@ class TestSelectMhlFiles:
         assert selected == {"data.mhl", "0002.mhl"}
 
     def test_ascmhl_folder_directly_under_scan_root_yields_latest(self, tmp_path):
-        """An ascmhl/ immediately under the scan root (no package dir) still dedups
-        to exactly one manifest — the latest generation."""
+        """
+        An ascmhl/ immediately under the scan root (no package dir) still dedups
+        to exactly one manifest — the latest generation.
+        """
         make_tree(
             tmp_path,
             {
@@ -117,8 +127,10 @@ class TestSelectMhlFiles:
         assert selected[0].name == "0003.mhl"
 
     def test_top_level_and_nested_ascmhl_dedup_independently(self, tmp_path):
-        """A top-level ascmhl/ and a nested package's ascmhl/ each contribute one
-        manifest — they must not share a dedup key despite both being 'ascmhl'."""
+        """
+        A top-level ascmhl/ and a nested package's ascmhl/ each contribute one
+        manifest — they must not share a dedup key despite both being 'ascmhl'.
+        """
         make_tree(
             tmp_path,
             {
@@ -131,9 +143,12 @@ class TestSelectMhlFiles:
         assert selected == {"0001.mhl", "0002.mhl"}
 
     def test_classic_v1_inside_ascmhl_folder_is_not_grouped_as_package(self, tmp_path):
-        """Dialect is decided by the header, not the folder name: a classic v1
-        manifest that happens to sit inside an `ascmhl/` folder passes through as its own classic manifest instead of
-        being folded into — and distorting — the real v2 package's generation dedup."""
+        """
+        Dialect is decided by the header, not the folder name: a classic v1
+        manifest that happens to sit inside an `ascmhl/` folder passes through
+        as its own classic manifest instead of being folded into — and
+        distorting — the real v2 package's generation dedup.
+        """
         make_tree(
             tmp_path,
             {
@@ -148,9 +163,11 @@ class TestSelectMhlFiles:
 
 
 class TestSelectMhlFilesInvariants:
-    """Property-based invariants over generated layouts, complementing the unit
-    cases above. @given tests manage their own TemporaryDirectory rather than the
-    function-scoped tmp_path, which is not reset between generated examples."""
+    """
+    Property-based invariants over generated layouts, complementing the unit
+    cases above. @given tests manage their own TemporaryDirectory rather than
+    the function-scoped tmp_path, which is not reset between generated examples.
+    """
 
     @given(
         pkg_names=strategies.lists(_filename_stem, min_size=1, max_size=5, unique_by=_fs_name_key),

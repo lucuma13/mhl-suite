@@ -2,8 +2,9 @@
 """
 simple-mhl — modern verification and sealing tool for classic MHL files.
 
-This module is the command-line interface. The hashing, sealing, and verification logic lives in mhl_suite; simple_mhl
-wires argparse up to it and renders the engine's structured results to the terminal.
+This module is the command-line interface. The hashing, sealing, and
+verification logic lives in mhl_suite; simple_mhl wires argparse up to it and
+renders the engine's structured results to the terminal.
 
 Three subcommands are exposed via argparse:
 
@@ -11,9 +12,11 @@ Three subcommands are exposed via argparse:
     simple-mhl verify <file.mhl>         — re-hash files listed in a manifest
     simple-mhl xsd-schema-check <file>   — validate XML structure against XSD
 
-A few engine helpers are re-exported here (see __all__) solely so the test suite can reach them through the simple_mhl
-namespace. The os and etree modules are imported for the same reason: simple_mhl.os and simple_mhl.etree resolve to the
-shared module singletons, so a test patching an attribute on them is seen by the engine's calls too.
+A few engine helpers are re-exported here (see __all__) solely so the test suite
+can reach them through the simple_mhl namespace. The os and etree modules are
+imported for the same reason: simple_mhl.os and simple_mhl.etree resolve to the
+shared module singletons, so a test patching an attribute on them is seen by the
+engine's calls too.
 """
 
 import argparse
@@ -46,8 +49,9 @@ from mhl_suite.hashing import (
 )
 from mhl_suite.osutils import to_terminal_sep
 
-# Re-exports for the test suite (see the module docstring). Only names the CLI itself uses or that a test reaches
-# through the simple_mhl namespace are kept here — do not prune them as "unused imports".
+# Re-exports for the test suite (see the module docstring). Only names the CLI
+# itself uses or that a test reaches through the simple_mhl namespace are kept
+# here — do not prune them as "unused imports".
 __all__ = [
     "ALGO_MAP",
     "_NULL_TAG",
@@ -73,9 +77,9 @@ __all__ = [
     "verify_classic",
 ]
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Verify command
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 def verify(
@@ -88,9 +92,9 @@ def verify(
     ASC-MHL v2, runs the engine, prints the rendered [OK]/[ERROR] lines, then
     exits on the report's code. Output is identical to the historic verify().
 
-    Exit codes (see _exit_codes.ExitCode): 0 clean, 1 not an MHL file,
-    2 bad algorithm, 40 malformed XML, 10 missing files only, 11 hash mismatch
-    (wins over missing); size-only mode reports 13 for any size mismatch.
+    Exit codes (see _exit_codes.ExitCode): 0 clean, 1 not an MHL file, 2 bad
+    algorithm, 40 malformed XML, 10 missing files only, 11 hash mismatch (wins
+    over missing); size-only mode reports 13 for any size mismatch.
     """
     _validate_mhl_path(mhl_file)
     _reject_ascmhl_v2(mhl_file)
@@ -100,15 +104,16 @@ def verify(
         sys.stderr.write(f"Error: {e}\n")
         sys.exit(2)
     for line in render_verify_lines(report, verbose):
-        # Paths are stored forward-slash internally; the terminal is the one place we show the native separator.
+        # Paths are stored forward-slash internally; the terminal is the one
+        # place we show the native separator.
         print(to_terminal_sep(line))
     if report.code:
         sys.exit(report.code)
 
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # XSD schema validation
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 def validate_schema(mhl_file: str) -> None:
@@ -120,17 +125,17 @@ def validate_schema(mhl_file: str) -> None:
         sys.exit(code)
 
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # CLI entry point
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 def _dedup_keys_by_tag(keys: list[str]) -> list[str]:
     """
     De-duplicate ALGO_MAP keys by their manifest tag, first occurrence wins.
 
-    Aliases resolving to the same manifest tag collapse, so `xxhash` and
-    `xxh64` together record a single <xxhash64be>.
+    Aliases resolving to the same manifest tag collapse, so `xxhash` and `xxh64`
+    together record a single <xxhash64be>.
     """
     out: list[str] = []
     seen_tags: set[str] = set()
@@ -148,10 +153,10 @@ def parse_algorithms(value: str) -> list[str]:
     names into a validated, de-duplicated list of ALGO_MAP keys.
 
     Aliases resolving to the same manifest tag are collapsed (first wins), so
-    `-a xxhash,xxh64` records a single <xxhash64be>. `null` (no digest) is accepted
-    here; its exclusivity is enforced later in _resolve_seal_algorithms.
-    Unknown names raise argparse.ArgumentTypeError, which argparse turns into a
-    usage error (exit 2).
+    `-a xxhash,xxh64` records a single <xxhash64be>. `null` (no digest) is
+    accepted here; its exclusivity is enforced later in
+    _resolve_seal_algorithms. Unknown names raise argparse.ArgumentTypeError,
+    which argparse turns into a usage error (exit 2).
     """
     keys: list[str] = []
     for raw in value.split(","):
@@ -172,9 +177,9 @@ def combine_seal_algorithms(parsed: list[list[str]] | None) -> list[str]:
     """
     Merge repeated `seal -a` occurrences into one de-duplicated key list.
 
-    With action="append" each `-a` yields its own parsed list, so `-a md5
-    -a sha1` arrives as [["md5"], ["sha1"]]. None means no `-a` was given,
-    so we fall back to the historic default of xxhash.
+    With action="append" each `-a` yields its own parsed list, so `-a md5 -a
+    sha1` arrives as [["md5"], ["sha1"]]. None means no `-a` was given, so we
+    fall back to the historic default of xxhash.
     """
     if not parsed:
         return ["xxhash"]
@@ -184,14 +189,15 @@ def combine_seal_algorithms(parsed: list[list[str]] | None) -> list[str]:
 
 def parse_verify_algorithms(value: str) -> "str | list[str]":
     """
-    argparse type= for `verify -a`: parse a comma-separated list of algorithm names
-    or the keyword 'all'.
+    argparse type= for `verify -a`: parse a comma-separated list of algorithm
+    names or the keyword 'all'.
 
-    Returns the _VERIFY_ALL sentinel if 'all' appears anywhere (it supersedes any
-    specific names), otherwise a de-duplicated list of canonical manifest tags
-    (aliases collapse, e.g. xxhash/xxh64 → xxhash64be). Requested order is preserved
-    for the error message only; selection itself is order-independent. Unknown names
-    raise argparse.ArgumentTypeError, which argparse turns into a usage error (exit 2).
+    Returns the _VERIFY_ALL sentinel if 'all' appears anywhere (it supersedes
+    any specific names), otherwise a de-duplicated list of canonical manifest
+    tags (aliases collapse, e.g. xxhash/xxh64 → xxhash64be). Requested order is
+    preserved for the error message only; selection itself is order-independent.
+    Unknown names raise argparse.ArgumentTypeError, which argparse turns into a
+    usage error (exit 2).
     """
     names = [raw.strip().lower() for raw in value.split(",")]
     names = [n for n in names if n]
@@ -219,10 +225,10 @@ def combine_verify_algorithms(
     """
     Merge repeated `verify -a` occurrences into one selection.
 
-    With action="append" each `-a` yields its own parsed value, so `-a md5
-    -a sha1` arrives as [["md5"], ["sha1"]]. None means no `-a` was given
-    (verify the fastest available). 'all' supersedes any specific names, and
-    specific tags are flattened and de-duplicated in order.
+    With action="append" each `-a` yields its own parsed value, so `-a md5 -a
+    sha1` arrives as [["md5"], ["sha1"]]. None means no `-a` was given (verify
+    the fastest available). 'all' supersedes any specific names, and specific
+    tags are flattened and de-duplicated in order.
     """
     if not parsed:
         return None
@@ -264,13 +270,13 @@ def main() -> None:
         # Anything else falls through to argparse, which will produce its
         # normal "argument command: invalid choice" error message.
 
-    # -v / --verbose is a global flag: sharing it through a parent parser lets it
-    # appear either before or after the subcommand, so "simple-mhl -v seal ." and
-    # "simple-mhl seal -v ." behave identically. default=SUPPRESS is essential:
-    # without it the subparser's own default would clobber a True set by the
-    # top-level parser. With SUPPRESS, the attribute is only written when -v is
-    # actually present, so whichever parser sees it wins; we fall back to False
-    # below when it appears nowhere.
+    # -v / --verbose is a global flag: sharing it through a parent parser lets
+    # it appear either before or after the subcommand, so "simple-mhl -v seal ."
+    # and "simple-mhl seal -v ." behave identically. default=SUPPRESS is
+    # essential: without it the subparser's own default would clobber a True set
+    # by the top-level parser. With SUPPRESS, the attribute is only written when
+    # -v is actually present, so whichever parser sees it wins; we fall back to
+    # False below when it appears nowhere.
     global_opts = argparse.ArgumentParser(add_help=False)
     global_opts.add_argument(
         "-v",
@@ -288,8 +294,8 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # seal subcommand. argparse choices= rejects bad algorithm names before
-    # we waste a directory walk on them.
+    # seal subcommand. argparse choices= rejects bad algorithm names before we
+    # waste a directory walk on them.
     seal_p = subparsers.add_parser(
         "seal",
         help="seal a directory",
@@ -346,10 +352,10 @@ def main() -> None:
     xsd_p.add_argument("path", help="path to MHL file")
     xsd_p.set_defaults(func=lambda a: validate_schema(a.path))
 
-    # --- '-h <algo>' (instead of -a <algo>) hint ---------------------------------------------------------------------
-    # A user who typed 'seal -h xxhash' probably meant '-a xxhash' ('-h' for "hash"
-    # instead of -a for "algorithm"). So when '-h' is immediately followed by a
-    # valid algorithm name, we prepend a hint to the help menu.
+    # --- '-h <algo>' (instead of -a <algo>) hint -----------------------------
+    # A user who typed 'seal -h xxhash' probably meant '-a xxhash' ('-h' for
+    # "hash" instead of -a for "algorithm"). So when '-h' is immediately
+    # followed by a valid algorithm name, we prepend a hint to the help menu.
     _argv = sys.argv[1:]
     for _i in range(len(_argv) - 1):
         if _argv[_i] not in ("-h", "--help"):
@@ -365,7 +371,8 @@ def main() -> None:
             sys.exit(2)
 
     args = parser.parse_args()
-    # SUPPRESS leaves verbose unset when -v is given nowhere; normalise to False.
+    # SUPPRESS leaves verbose unset when -v is given nowhere; normalise to
+    # False.
     if not hasattr(args, "verbose"):
         args.verbose = False
     args.func(args)

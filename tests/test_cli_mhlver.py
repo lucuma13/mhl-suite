@@ -1,9 +1,10 @@
 """
-CLI behaviour for the mhlver entry point: argument dispatch, run/main wiring, progress, output routing, byte-weight
-pre-reads, and end-to-end verify runs.
+CLI behaviour for the mhlver entry point: argument dispatch, run/main wiring,
+progress, output routing, byte-weight pre-reads, and end-to-end verify runs.
 
-The report model/renderer it drives is tested in test_report.py, and the cross-dialect orchestrator seams
-(_select_mhl_files, verify_item) in test_verifyall.py; this module owns the CLI surface and its integration.
+The report model/renderer it drives is tested in test_report.py, and the
+cross-dialect orchestrator seams (_select_mhl_files, verify_item) in
+test_verifyall.py; this module owns the CLI surface and its integration.
 """
 
 import io
@@ -27,22 +28,23 @@ from mhl_suite.verify_results import VerifyEntry, VerifyReport
 
 from .helpers import make_package
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Module-level helpers
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 _ASCMHL_NAMESPACE = "urn:ASC:MHL:v2.0"
 
-# Windows reserves these device names at every extension; attempting to create e.g. CON.mhl on Windows raises
-# PermissionError / FileNotFoundError.
+# Windows reserves these device names at every extension; attempting to create
+# e.g. CON.mhl on Windows raises PermissionError / FileNotFoundError.
 _WINDOWS_RESERVED_NAMES = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "LPT1", "LPT2"]
 
-# All vendor example fixtures (classic + ASC-MHL) are deliberately aligned to this total so each parser can be checked
-# against the same known value.
+# All vendor example fixtures (classic + ASC-MHL) are deliberately aligned to
+# this total so each parser can be checked against the same known value.
 _ALIGNED_FIXTURE_TOTAL_BYTES = 18_004_919_466
 
-#: Directory containing real-tool MHL fixture files used by the suite. Each file : is a verbatim (anonymised) MHL output
-# from a specific transfer tool, named : <tool>_<format>.mhl (e.g. shotputpro_ascmhl.mhl).
+#: Directory containing real-tool MHL fixture files used by the suite. Each file
+# : is a verbatim (anonymised) MHL output from a specific transfer tool, named :
+# <tool>_<format>.mhl (e.g. shotputpro_ascmhl.mhl).
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 # Templates for the write_mhl fixture's minimal ASC-MHL 2.0 generation files.
@@ -64,9 +66,10 @@ _HASH_ENTRY = """\
 def _write_ascmhl(path: Path, entries: list[dict]) -> None:
     """Write a minimal ASC-MHL 2.0 generation file to *path*.
 
-    Each entry dict must have "path", "size", "action", and "digest" keys. Used by the Unicode-guard tests that need to
-    craft specific size attributes without going through the write_mhl fixture (which only writes well-formed decimal
-    sizes).
+    Each entry dict must have "path", "size", "action", and "digest" keys. Used
+    by the Unicode-guard tests that need to craft specific size attributes
+    without going through the write_mhl fixture (which only writes well-formed
+    decimal sizes).
     """
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -87,9 +90,9 @@ def _write_ascmhl(path: Path, entries: list[dict]) -> None:
 def stub_verify_ascmhl(monkeypatch, code, entries=None):
     """Replace ascmhl.verify.verify_ascmhl with a stub returning a fixed report.
 
-    The in-process counterpart of the old stub_run_step: ASC-MHL verify now goes through
-    mhl_suite.ascmhl_verify.verify_ascmhl, so dispatch/wiring tests pin its structured result instead of a subprocess
-    StepResult.
+    The in-process counterpart of the old stub_run_step: ASC-MHL verify now goes
+    through mhl_suite.ascmhl_verify.verify_ascmhl, so dispatch/wiring tests pin
+    its structured result instead of a subprocess StepResult.
     """
     report = verifyall.VerifyReport(entries=entries or [], code=code)
     monkeypatch.setattr(verifyall.ascmhl_verify, "verify_ascmhl", lambda *a, **k: report)
@@ -102,8 +105,11 @@ def call_verify(manifest):
 
 
 class FakeConsole:
-    """Minimal stand-in for rich.Console: records what would be printed instead
-    of emitting it, so tests can assert on routed output without touching the real stdout/stderr."""
+    """
+    Minimal stand-in for rich.Console: records what would be printed instead
+    of emitting it, so tests can assert on routed output without touching the
+    real stdout/stderr.
+    """
 
     def __init__(self):
         self._out = io.StringIO()
@@ -122,7 +128,8 @@ class FakeConsole:
 
 @pytest.fixture
 def write_mhl():
-    """Factory fixture that writes a minimal ASC-MHL 2.0 generation file.
+    """
+    Factory fixture that writes a minimal ASC-MHL 2.0 generation file.
 
     Usage::
 
@@ -132,8 +139,8 @@ def write_mhl():
                  "action": "original", "digest": "aabbccdd"},
             ])
 
-    Each entry dict must contain ``path``, ``size``, ``action``, and ``digest``.  Returns the :class:`~pathlib.Path` of
-    the written file.
+    Each entry dict must contain ``path``, ``size``, ``action``, and ``digest``.
+    Returns the :class:`~pathlib.Path` of the written file.
     """
 
     def _write(ascdir: Path, name: str, entries: list[dict]) -> Path:
@@ -147,15 +154,17 @@ def write_mhl():
 
 @pytest.fixture
 def load_fixture_mhl():
-    """Factory fixture that copies a fixture MHL file into a test directory.
+    """
+    Factory fixture that copies a fixture MHL file into a test directory.
 
     Usage::
 
         def test_something(tmp_path, load_fixture_mhl):
             ascdir = tmp_path / "ascmhl" ascdir.mkdir() mhl = load_fixture_mhl(ascdir, "shotputpro_ascmhl.mhl")
 
-    The fixture file is read from the ``fixtures/`` directory next to this test module and written verbatim into
-    *dest_dir* under its original filename. Returns the :class:`~pathlib.Path` of the written file.
+    The fixture file is read from the ``fixtures/`` directory next to this test
+    module and written verbatim into *dest_dir* under its original filename.
+    Returns the :class:`~pathlib.Path` of the written file.
     """
 
     def _load(dest_dir: Path, fixture_name: str) -> Path:
@@ -203,7 +212,8 @@ class TestMhlver:
         for pkg in ["pkg1", "pkg2"]:
             ascdir = tmp_path / pkg / "ascmhl"
             ascdir.mkdir(parents=True)
-            # Real v2 header so is_ascmhl_v2() classifies these as ASC-MHL generations to dedup.
+            # Real v2 header so is_ascmhl_v2() classifies these as ASC-MHL
+            # generations to dedup.
             (ascdir / "0001.mhl").write_text('<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0"/>')
             (ascdir / "0002.mhl").write_text('<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0"/>')
         # Plus one regular MHL outside ascmhl/
@@ -214,9 +224,11 @@ class TestMhlver:
         assert len(selected) == 3
 
     def test_dot_underscore_filter_applies_only_to_filename_not_parent_dir(self, tmp_path):
-        """Files inside a directory named '._hidden' must NOT be excluded.
+        """
+        Files inside a directory named '._hidden' must NOT be excluded.
 
-        The macOS resource-fork filter checks p.name (the file's own name), not any parent directory component.
+        The macOS resource-fork filter checks p.name (the file's own name), not
+        any parent directory component.
         """
         hidden_dir = tmp_path / "._hidden"
         hidden_dir.mkdir()
@@ -230,11 +242,13 @@ class TestMhlver:
         assert "._resource.mhl" not in names, "File named ._resource.mhl should be excluded"
 
     def test_windows_reserved_names_are_found_when_they_exist(self, tmp_path):
-        """Files named CON.mhl, PRN.mhl, etc. are yielded by find_mhl_files
-        when they exist on disk.
+        """
+        Files named CON.mhl, PRN.mhl, etc. are yielded by find_mhl_files when
+        they exist on disk.
 
-        find_mhl_files must have no special-case filtering that would silently drop them — an operator copying media to
-        a card with such a filename (unlikely but possible) must not lose it from the verification pass.
+        find_mhl_files must have no special-case filtering that would silently
+        drop them — an operator copying media to a card with such a filename
+        (unlikely but possible) must not lose it from the verification pass.
         """
         created = []
         for stem in _WINDOWS_RESERVED_NAMES:
@@ -253,10 +267,13 @@ class TestMhlver:
             assert f.name in found_names, f"{f.name} exists on disk but was not yielded by find_mhl_files"
 
     def test_windows_reserved_names_are_not_suppressed_by_dot_underscore_filter(self, tmp_path):
-        """The '._' resource-fork filter must not accidentally suppress reserved names.
+        """
+        The '._' resource-fork filter must not accidentally suppress reserved
+        names.
 
-        None of the Windows reserved names start with '._', so the filter should never touch them.  This is a
-        belt-and-suspenders assertion to catch any future broadening of the filter logic.
+        None of the Windows reserved names start with '._', so the filter should
+        never touch them.  This is a belt-and-suspenders assertion to catch any
+        future broadening of the filter logic.
         """
         created = []
         for stem in _WINDOWS_RESERVED_NAMES:
@@ -308,7 +325,10 @@ class TestAscMhlTotalBytes:
         assert verifyall._ascmhl_total_bytes(ascdir / "0001.mhl") == 223591 + 329746
 
     def test_verification_pass_does_not_double_count(self, tmp_path, write_mhl):
-        """A second generation that re-verifies the same files must not add to the total."""
+        """
+        A second generation that re-verifies the same files must not add to the
+        total.
+        """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
         entries = [
@@ -367,11 +387,14 @@ class TestAscMhlTotalBytes:
         assert verifyall._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000000 + 2000000
 
     def test_directory_hashes_without_size_are_skipped(self, tmp_path, write_mhl):
-        """<directoryhash><path> elements carry no size attribute and must be silently ignored.
+        """
+        <directoryhash><path> elements carry no size attribute and must be
+        silently ignored.
 
-        ASC-MHL packages produced by transfer tools include <directoryhash> blocks alongside <hash> blocks. Their <path>
-        elements have no size attribute — only lastmodificationdate and creationdate — so the size guard must skip them
-        without raising and without affecting the total.
+        ASC-MHL packages produced by transfer tools include <directoryhash>
+        blocks alongside <hash> blocks. Their <path> elements have no size
+        attribute — only lastmodificationdate and creationdate — so the size
+        guard must skip them without raising and without affecting the total.
         """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
@@ -396,10 +419,12 @@ class TestAscMhlTotalBytes:
         assert verifyall._ascmhl_total_bytes(mhl) == 1073741824
 
     def test_ascmhl_from_shotputpro_two_generation_transfer(self, tmp_path, write_mhl):
-        """Six files transferred in generation 1, all re-verified in generation 2.
+        """
+        Six files transferred in generation 1, all re-verified in generation 2.
 
-        Exercises the full deduplication path with a realistic file count and a mix of large and small sizes (video +
-        sidecar XML pattern). Expected total: 223591+329746+363999+153415+288179+452705 = 1_811_635
+        Exercises the full deduplication path with a realistic file count and a
+        mix of large and small sizes (video + sidecar XML pattern). Expected
+        total: 223591+329746+363999+153415+288179+452705 = 1_811_635
         """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
@@ -432,19 +457,23 @@ class TestAscMhlTotalBytes:
         ],
     )
     def test_ascmhl_real_world_single_generation_total(self, tmp_path, load_fixture_mhl, fixture_name):
-        """Real-world single-generation ASC-MHL exports (with directory hashes)
-        from each vendor sum to the same aligned total."""
+        """
+        Real-world single-generation ASC-MHL exports (with directory hashes)
+        from each vendor sum to the same aligned total.
+        """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
         mhl = load_fixture_mhl(ascdir, fixture_name)
         assert verifyall._ascmhl_total_bytes(mhl) == _ALIGNED_FIXTURE_TOTAL_BYTES
 
     def test_corrupt_generation_file_is_skipped_others_still_counted(self, tmp_path, write_mhl):
-        """A corrupt .mhl in the ascmhl dir must be silently skipped; valid
+        """
+        A corrupt .mhl in the ascmhl dir must be silently skipped; valid
         generations still contribute their sizes to the total.
 
-        The inner exception handler in _ascmhl_total_bytes swallows parse failures per-file so a single bad generation
-        doesn't zero out the entire package weight.
+        The inner exception handler in _ascmhl_total_bytes swallows parse
+        failures per-file so a single bad generation doesn't zero out the entire
+        package weight.
         """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
@@ -464,7 +493,10 @@ class TestAscMhlTotalBytes:
         assert verifyall._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000000
 
     def test_generations_parsed_in_filename_order(self, tmp_path, write_mhl):
-        """Earlier generation's size wins when the same path appears in multiple files."""
+        """
+        Earlier generation's size wins when the same path appears in multiple
+        files.
+        """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
         write_mhl(
@@ -495,11 +527,13 @@ class TestAscMhlTotalBytes:
         assert verifyall._ascmhl_total_bytes(ascdir / "0002.mhl") == 100
 
     def test_superscript_only_entry_contributes_zero_sibling_generation_unaffected(self, tmp_path):
-        """A generation containing only a superscript size contributes 0 bytes,
-        and a sibling generation is unaffected.
+        """
+        A generation containing only a superscript size contributes 0 bytes, and
+        a sibling generation is unaffected.
 
-        With isdecimal(), the superscript entry is skipped without raising ValueError, so the outer except does not fire
-        and generation 0001 still contributes its 1000 bytes.
+        With isdecimal(), the superscript entry is skipped without raising
+        ValueError, so the outer except does not fire and generation 0001 still
+        contributes its 1000 bytes.
         """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
@@ -523,8 +557,10 @@ class TestAscMhlTotalBytes:
         assert verifyall._ascmhl_total_bytes(ascdir / "0002.mhl") == 1000
 
     def test_all_common_superscript_digits_are_rejected_by_guard(self, tmp_path):
-        """The three common Unicode superscript digits — ¹ ² ³ — are all
-        rejected by isdecimal() and produce no contribution; only the plain decimal sibling entry is counted.
+        """
+        The three common Unicode superscript digits — ¹ ² ³ — are all rejected
+        by isdecimal() and produce no contribution; only the plain decimal
+        sibling entry is counted.
         """
         ascdir = tmp_path / "ascmhl"
         ascdir.mkdir()
@@ -566,17 +602,24 @@ class TestAscMhlTotalBytes:
 
 
 class TestAscMhlSizeOnly:
-    """The mhlver wiring for size-only ASC-MHL verify (_verify_ascmhl size_only=True): the loaded-history integrity
-    gate, the byte-free size compare, and how each maps to an exit code + ManifestResult. The size engine itself
-    (verify_ascmhl_sizes: matching/missing/mismatch, no-size, renames, nested child histories) is unit-tested in
-    test_ascmhl_verify.py — here we drive real sealed packages end to end through _verify_ascmhl."""
+    """
+    The mhlver wiring for size-only ASC-MHL verify (_verify_ascmhl
+    size_only=True): the loaded-history integrity gate, the byte-free size
+    compare, and how each maps to an exit code + ManifestResult. The size engine
+    itself (verify_ascmhl_sizes: matching/missing/mismatch, no-size, renames,
+    nested child histories) is unit-tested in test_ascmhl_verify.py — here we
+    drive real sealed packages end to end through _verify_ascmhl.
+    """
 
     @staticmethod
     def _manifest(pkg):
         return next((pkg / "ascmhl").glob("*.mhl"))
 
     def test_size_phase_runs_when_gate_passes(self, tmp_path):
-        """A clean package: the history load (the gate) passes, sizes match, entries are flagged size-only."""
+        """
+        A clean package: the history load (the gate) passes, sizes match,
+        entries are flagged size-only.
+        """
         pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
         rc, mr = verifyall._verify_ascmhl(self._manifest(pkg), verbose=False, schema=False, size_only=True)
         assert rc == 0
@@ -585,7 +628,9 @@ class TestAscMhlSizeOnly:
         assert mr.n_size_only == 1
 
     def test_size_mismatch_through_wiring(self, tmp_path):
-        """A shrunk file yields exit 13 and a failed manifest with one mismatch."""
+        """
+        A shrunk file yields exit 13 and a failed manifest with one mismatch.
+        """
         pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
         (pkg / "a.mov").write_bytes(b"x" * 50)
         rc, mr = verifyall._verify_ascmhl(self._manifest(pkg), verbose=False, schema=False, size_only=True)
@@ -595,8 +640,11 @@ class TestAscMhlSizeOnly:
         assert mr.n_mismatch == 1
 
     def test_tampered_manifest_gate_failure_is_manifest_error(self, tmp_path):
-        """A corrupted generation manifest fails the history load (the gate), so the result is a manifest integrity
-        error, not a size verdict — the size phase never runs."""
+        """
+        A corrupted generation manifest fails the history load (the gate), so
+        the result is a manifest integrity error, not a size verdict — the size
+        phase never runs.
+        """
         pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
         manifest = self._manifest(pkg)
         manifest.write_text(manifest.read_text().replace("<creatorinfo>", "<creatorinfo> "))
@@ -606,7 +654,10 @@ class TestAscMhlSizeOnly:
         assert mr.manifest_status == "error"
 
     def test_malformed_chain_is_manifest_error(self, tmp_path):
-        """A chain file that won't parse surfaces as the malformed-XML manifest error (exit 40)."""
+        """
+        A chain file that won't parse surfaces as the malformed-XML manifest
+        error (exit 40).
+        """
         pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
         (pkg / "ascmhl" / "ascmhl_chain.xml").write_text("<ascmhl_chain><not closed")
         rc, mr = verifyall._verify_ascmhl(self._manifest(pkg), verbose=False, schema=False, size_only=True)
@@ -621,7 +672,8 @@ class TestAscMhlSizeOnly:
 
 
 class TestAscMhlDispatch:
-    """ASC-MHL exit-code translation, schema dispatch, and schema=False routing,
+    """
+    ASC-MHL exit-code translation, schema dispatch, and schema=False routing,
     all verified in-process via mhl_suite.ascmhl_verify.
     """
 
@@ -630,8 +682,10 @@ class TestAscMhlDispatch:
         [0, 10, 11, 12, 30, 31, 99],  # documented failures plus an unknown code
     )
     def test_verify_exit_code_propagates(self, ascmhl_setup, monkeypatch, exit_code):
-        """verify_ascmhl's code is returned unchanged — documented failures and
-        unknown codes alike (an unknown code must never be mapped to 0)."""
+        """
+        verify_ascmhl's code is returned unchanged — documented failures and
+        unknown codes alike (an unknown code must never be mapped to 0).
+        """
         entries = (
             []
             if exit_code == 0
@@ -647,7 +701,9 @@ class TestAscMhlDispatch:
         assert rc == 0
 
     def test_schema_check_manifest_failure_takes_precedence(self, ascmhl_setup, monkeypatch):
-        """If the manifest fails schema check, that code wins over the chain's."""
+        """
+        If the manifest fails schema check, that code wins over the chain's.
+        """
         calls = {"n": 0}
 
         def _stub(file_path, *, directory_file=False):
@@ -660,16 +716,22 @@ class TestAscMhlDispatch:
         assert rc == 11
 
     def test_dispatch_table_covers_all_known_codes(self):
-        """The ASC-MHL verify dispatch table must cover every verify exit code
-        ascmhl/errors.py defines, so we never fall through to the 'unexpected exit' branch for a documented failure.
-        (127 was the subprocess command-not-found code and no longer applies now that verify is in-process.)"""
+        """
+        The ASC-MHL verify dispatch table must cover every verify exit code
+        ascmhl/errors.py defines, so we never fall through to the 'unexpected
+        exit' branch for a documented failure. (127 was the subprocess
+        command-not-found code and no longer applies now that verify is
+        in-process.)
+        """
         documented_codes = {0, 10, 11, 12, 20, 21, 30, 31, 32, 33}
         missing = documented_codes - set(verifyall._ASCMHL_VERIFY_RESULTS.keys())
         assert missing == set(), f"Dispatch table missing codes: {missing}"
 
     def test_ascmhl_failure_detail_shown_on_terminal(self, ascmhl_setup, monkeypatch, capsys):
-        """A failure's per-file detail (rendered from the structured report) is
-        shown on the terminal so the operator sees what went wrong."""
+        """
+        A failure's per-file detail (rendered from the structured report) is
+        shown on the terminal so the operator sees what went wrong.
+        """
         entries = [VerifyEntry(path="b.mxf", status="mismatch", line="[ERROR] hash mismatch: b.mxf")]
         stub_verify_ascmhl(monkeypatch, 11, entries)
         # The orchestrator is print-free; the CLI sink (_render_status) does the printing.
@@ -723,14 +785,19 @@ class TestAscMhlDispatch:
 
 
 class TestClassicMhlDispatch:
-    """Classic MHL is verified in-process via the core engine. These pin
-    exit-code propagation, manifest-status derivation, size-only flagging, and schema-check dispatch — with
-    verify_classic / schema_report stubbed so the tests don't depend on real hashing or the filesystem."""
+    """
+    Classic MHL is verified in-process via the core engine. These pin exit-code
+    propagation, manifest-status derivation, size-only flagging, and
+    schema-check dispatch — with verify_classic / schema_report stubbed so the
+    tests don't depend on real hashing or the filesystem.
+    """
 
     @pytest.fixture
     def classic_mhl(self, tmp_path):
-        """A path for a classic manifest. The engine is stubbed per test, so the
-        file contents are irrelevant."""
+        """
+        A path for a classic manifest. The engine is stubbed per test, so the
+        file contents are irrelevant.
+        """
         mhl = tmp_path / "dummy.mhl"
         mhl.write_text("")
         return mhl
@@ -818,7 +885,9 @@ class TestLogHelpers:
     """Unit tests for _log and _emit_step_output."""
 
     def test_log_routes_through_console(self, capsys):
-        """When a console object is passed, _log uses console.print, not print()."""
+        """
+        When a console object is passed, _log uses console.print, not print().
+        """
         console = FakeConsole()
         mhlver._log("hello", colour="", stream=None, console=console)
         assert "hello" in console.getvalue()
@@ -862,8 +931,10 @@ class TestLogHelpers:
         assert captured.err == ""
 
     def test_report_via_table_shown_success_logs_to_terminal(self, capsys):
-        """With show_status_on_terminal=True an exit-0 entry surfaces its success
-        line (the inverse of test_suppressed_success_is_silent)."""
+        """
+        With show_status_on_terminal=True an exit-0 entry surfaces its success
+        line (the inverse of test_suppressed_success_is_silent).
+        """
         mhlver._report_via_table(
             verifyall._CLASSICMHL_RESULTS,
             0,
@@ -884,8 +955,10 @@ class TestReportViaTable:
     """Tests for _report_via_table edge cases."""
 
     def test_suppressed_success_is_silent(self, capsys):
-        """When show_status_on_terminal=False and exit=0, the success line is
-        suppressed entirely (the silent-progress-bar path)."""
+        """
+        When show_status_on_terminal=False and exit=0, the success line is
+        suppressed entirely (the silent-progress-bar path).
+        """
         mhlver._report_via_table(
             verifyall._CLASSICMHL_RESULTS,
             0,
@@ -899,8 +972,10 @@ class TestReportViaTable:
         assert captured.err == ""
 
     def test_errors_always_shown_on_terminal_regardless_of_suppression(self, capsys):
-        """Errors must always appear on the terminal regardless of
-        show_status_on_terminal, because operators need immediate visibility."""
+        """
+        Errors must always appear on the terminal regardless of
+        show_status_on_terminal, because operators need immediate visibility.
+        """
         mhlver._report_via_table(
             verifyall._CLASSICMHL_RESULTS,
             40,
@@ -1231,9 +1306,11 @@ class TestRunWithProgress:
         assert progress.advance.call_count == 2
 
     def test_progress_branch_collects_manifest_result_and_advances_via_on_bytes(self, tmp_path, monkeypatch):
-        """When verify_item returns a ManifestResult and reports bytes through
-        on_bytes, the result is collected and the per-chunk _advance callback runs (driving progress.advance with the
-        streamed byte counts)."""
+        """
+        When verify_item returns a ManifestResult and reports bytes through
+        on_bytes, the result is collected and the per-chunk _advance callback
+        runs (driving progress.advance with the streamed byte counts).
+        """
         monkeypatch.setattr(mhlver.sys.stdout, "isatty", lambda: True)
         progress = self._stub_build_live(monkeypatch)
         mr = mhlver.ManifestResult(
@@ -1256,8 +1333,11 @@ class TestRunWithProgress:
         assert progress.advance.call_count >= 1
 
     def test_build_live_returns_live_progress_label_console(self):
-        """_build_live constructs the rich Live display: a Live, a Progress, a Text
-        label and a Console, all bound together (no stubbing — the real builder)."""
+        """
+        _build_live constructs the rich Live display: a Live, a Progress, a Text
+        label and a Console, all bound together (no stubbing — the real
+        builder).
+        """
         live, progress, label, console = mhlver._build_live()
         assert isinstance(live, Live)
         assert isinstance(progress, Progress)
@@ -1286,15 +1366,20 @@ class TestMain:
     """Integration tests for mhlver.main() — argument parsing and dispatch."""
 
     def test_nonexistent_path_exits_2(self, mhlver_cli):
-        """Passing a path that doesn't exist must exit 2 with an error message."""
+        """
+        Passing a path that doesn't exist must exit 2 with an error message.
+        """
         rc, _, err = mhlver_cli(["/nonexistent/path/ghost.mhl"])
         assert rc == 2
         assert "file or directory" in err.lower() or "exist" in err.lower()
 
     def test_nonexistent_path_suggests_normalization_variant(self, mhlver_cli, monkeypatch):
-        """When the typed path is missing but a Unicode-normalization variant
-        exists, mhlver appends a 'did you mean' hint — parity with simple-mhl via the shared osutils helper. The helper
-        is stubbed here; its own resolution logic is covered by the simple-mhl test suite."""
+        """
+        When the typed path is missing but a Unicode-normalization variant
+        exists, mhlver appends a 'did you mean' hint — parity with simple-mhl
+        via the shared osutils helper. The helper is stubbed here; its own
+        resolution logic is covered by the simple-mhl test suite.
+        """
         monkeypatch.setattr(mhlver, "normalization_variant_on_disk", lambda p: "/vol/rosé_nfd.mhl")
         rc, _, err = mhlver_cli(["/vol/rosé_nfc.mhl"])
         assert rc == 2
@@ -1302,7 +1387,10 @@ class TestMain:
         assert "rosé_nfd.mhl" in err
 
     def test_nonexistent_path_no_variant_is_plain_error(self, mhlver_cli, monkeypatch):
-        """A genuine typo (no normalization variant) gives the plain error, no hint."""
+        """
+        A genuine typo (no normalization variant) gives the plain error, no
+        hint.
+        """
         monkeypatch.setattr(mhlver, "normalization_variant_on_disk", lambda p: None)
         rc, _, err = mhlver_cli(["/vol/ghost.mhl"])
         assert rc == 2
@@ -1435,9 +1523,9 @@ class TestMain:
 # TestSchemaShapedAscMhlFuzz
 # ---------------------------------------------------------------------------
 
-# Adversarial leaf values for the typed fields the ASC-MHL 2.0 schema defines. The <path size="…"> attribute is
-# xs:integer (so negatives are schema-legal), and the byte-counting helpers must treat anything non-decimal as "no
-# size".
+# Adversarial leaf values for the typed fields the ASC-MHL 2.0 schema defines.
+# The <path size="…"> attribute is xs:integer (so negatives are schema-legal),
+# and the byte-counting helpers must treat anything non-decimal as "no size".
 _fuzz_text = strategies.text(
     alphabet=strategies.characters(blacklist_categories=("Cs", "Cc", "Cn")),
     max_size=40,
@@ -1455,12 +1543,14 @@ _asc_entry = strategies.tuples(_fuzz_text, _fuzz_size_attr, _fuzz_action, _fuzz_
 
 
 def _build_ascmhl_fuzz(entries) -> bytes:
-    """Build a well-formed ASC-MHL 2.0 manifest (correct namespace + structure)
-    with fuzzed <path> text/size and hash action/digest. lxml guarantees well-formedness so the fuzzing targets size
-    parsing, not the serializer.
+    """
+    Build a well-formed ASC-MHL 2.0 manifest (correct namespace + structure)
+    with fuzzed <path> text/size and hash action/digest. lxml guarantees
+    well-formedness so the fuzzing targets size parsing, not the serializer.
 
-    Tags use Clark notation (``{ns}tag``) so the namespace URI is correct; we don't force a default-namespace nsmap
-    because the parser under test queries with a ``{*}`` wildcard, so the prefix style is irrelevant.
+    Tags use Clark notation (``{ns}tag``) so the namespace URI is correct; we
+    don't force a default-namespace nsmap because the parser under test queries
+    with a ``{*}`` wildcard, so the prefix style is irrelevant.
     """
     root = etree.Element(f"{{{_ASCMHL_NAMESPACE}}}hashlist", version="2.0")
     hashes = etree.SubElement(root, f"{{{_ASCMHL_NAMESPACE}}}hashes")
@@ -1479,10 +1569,13 @@ def _build_ascmhl_fuzz(entries) -> bytes:
 
 
 class TestSchemaShapedAscMhlFuzz:
-    """Schema-shaped value fuzzing of the byte-counting helpers that parse
-    manifest XML directly (no external backend needed). For any well-formed, XSD-shaped manifest with adversarial typed
-    values, the helpers must return a non-negative int and never raise — they are called while building the progress
-    bar, so a crash there aborts an otherwise-fine verify run."""
+    """
+    Schema-shaped value fuzzing of the byte-counting helpers that parse manifest
+    XML directly (no external backend needed). For any well-formed, XSD-shaped
+    manifest with adversarial typed values, the helpers must return a
+    non-negative int and never raise — they are called while building the
+    progress bar, so a crash there aborts an otherwise-fine verify run.
+    """
 
     @given(entries=strategies.lists(_asc_entry, min_size=1, max_size=6))
     @settings(max_examples=120, suppress_health_check=[HealthCheck.too_slow])
@@ -1521,11 +1614,14 @@ class TestSchemaShapedAscMhlFuzz:
 
 
 class TestSinglePassVerify:
-    """Locks the single-pass property: a default (non-verbose) ASC-MHL verify
-    hashes the package exactly once. verify_ascmhl is the sole hashing pass now (the old code shelled out to
-    ascmhl-debug twice — once -v for the report, once plain for the terminal — re-hashing everything), so a regression
-    that reintroduced a second pass would call verify_ascmhl more than once. (Classic MHL is in-process too; see
-    TestClassicMhlDispatch.)"""
+    """
+    Locks the single-pass property: a default (non-verbose) ASC-MHL verify
+    hashes the package exactly once. verify_ascmhl is the sole hashing pass now
+    (the old code shelled out to ascmhl-debug twice — once -v for the report,
+    once plain for the terminal — re-hashing everything), so a regression that
+    reintroduced a second pass would call verify_ascmhl more than once. (Classic
+    MHL is in-process too; see TestClassicMhlDispatch.)
+    """
 
     def test_ascmhl_verify_invokes_engine_once(self, monkeypatch, tmp_path):
         calls = {"n": 0}

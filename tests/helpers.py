@@ -1,7 +1,9 @@
-"""Importable test helpers shared across the test suite.
+"""
+Importable test helpers shared across the test suite.
 
-Plain functions only — fixtures live in conftest.py. These are reusable builders and filesystem models pulled out of the
-old monolithic CLI test files so the test modules can share them without importing each other.
+Plain functions only — fixtures live in conftest.py. These are reusable builders
+and filesystem models pulled out of the old monolithic CLI test files so the
+test modules can share them without importing each other.
 """
 
 import os
@@ -14,10 +16,12 @@ from lxml import etree
 
 
 def make_package(root, files, hash_format="xxh64"):
-    """Create *files* (rel path -> bytes) under *root* and seal an ASC-MHL package.
+    """
+    Create *files* (rel path -> bytes) under *root* and seal an ASC-MHL package.
 
-    `create` runs with its default directory hashes, so the resulting package carries both file and directory hash
-    entries — the latter is what the `-dh` directory-hash verify path checks.
+    `create` runs with its default directory hashes, so the resulting package
+    carries both file and directory hash entries — the latter is what the `-dh`
+    directory-hash verify path checks.
     """
     root = Path(root)
     for rel, content in files.items():
@@ -54,9 +58,11 @@ def seal_helper(mhl_cli, path: Path, algo="md5"):
 
 
 def make_mhl_with_size(dest_dir: Path, filename: str, content: bytes, size_override: str | None = None) -> Path:
-    """Write a file and a matching MHL, optionally overriding the <size> value.
+    """
+    Write a file and a matching MHL, optionally overriding the <size> value.
 
-    Uses xxhash64 (the tool's default algorithm) for the digest so tests exercise the primary production code path.
+    Uses xxhash64 (the tool's default algorithm) for the digest so tests
+    exercise the primary production code path.
     """
     filepath = dest_dir / filename
     filepath.write_bytes(content)
@@ -79,9 +85,11 @@ def make_mhl_with_size(dest_dir: Path, filename: str, content: bytes, size_overr
 
 
 def make_mhl(dest_dir: Path, entries: list[dict]) -> Path:
-    """Write a minimal MHL referencing the given entries.
+    """
+    Write a minimal MHL referencing the given entries.
 
-    Each entry dict must contain 'file', 'size', and 'md5'. Used by symlink tests that build manifests by hand.
+    Each entry dict must contain 'file', 'size', and 'md5'. Used by symlink
+    tests that build manifests by hand.
     """
     root = etree.Element("hashlist", version="1.1")
     for e in entries:
@@ -97,10 +105,11 @@ def make_mhl(dest_dir: Path, entries: list[dict]) -> Path:
 
 
 def make_multi_hash_mhl(dest_dir: Path, filename: str, content: bytes, hashes: dict[str, str]) -> Path:
-    """Write a file and a manifest entry carrying the given {tag: value} hashes.
+    """
+    Write a file and a manifest entry carrying the given {tag: value} hashes.
 
-    Elements are emitted in dict order before a single <hashdate>, letting a test pin both which hashes are present and
-    their document order.
+    Elements are emitted in dict order before a single <hashdate>, letting a
+    test pin both which hashes are present and their document order.
     """
     target = dest_dir / filename
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -128,12 +137,14 @@ class _FakeEntry:
 
 
 def _sensitive_fs(existing: set[str]):
-    """Build (lexists, scandir) callables modelling a normalization-sensitive,
+    """
+    Build (lexists, scandir) callables modelling a normalization-sensitive,
     byte-exact filesystem (exFAT/ext4/NTFS) from a set of absolute paths.
 
-    lexists is exact-string membership, so an NFC name and its NFD equivalent are distinct entries (the behaviour that
-    cannot be reproduced on the APFS host). scandir returns the immediate children of a path and raises OSError when the
-    path has none (modelling a file or a missing directory).
+    lexists is exact-string membership, so an NFC name and its NFD equivalent
+    are distinct entries (the behaviour that cannot be reproduced on the APFS
+    host). scandir returns the immediate children of a path and raises OSError
+    when the path has none (modelling a file or a missing directory).
     """
 
     def lexists(p: str) -> bool:

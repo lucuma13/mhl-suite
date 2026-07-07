@@ -1,4 +1,5 @@
-"""The shared verify-result contract (mhl_suite.verify_results).
+"""
+The shared verify-result contract (mhl_suite.verify_results).
 
 VerifyReport is the single type both dialects return; `ok` is its only derived
 behaviour (exit code 0). These pin it, independent of either engine.
@@ -31,7 +32,10 @@ class TestOk:
 
 
 class TestVerifyEntryDefaults:
-    """VerifyEntry is a formatting-free carrier with size/existence flags off by default."""
+    """
+    VerifyEntry is a formatting-free carrier with size/existence flags off by
+    default.
+    """
 
     def test_defaults(self):
         e = VerifyEntry(path="clip.mov", status="ok")

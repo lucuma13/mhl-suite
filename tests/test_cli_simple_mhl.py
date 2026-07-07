@@ -1,6 +1,7 @@
 """
-CLI behaviour for simple-mhl: smart dispatch, help hints, Unicode-normalization wiring, and the algorithm
-parsing/selection that drives seal/verify hash-format handling.
+CLI behaviour for simple-mhl: smart dispatch, help hints, Unicode-normalization
+wiring, and the algorithm parsing/selection that drives seal/verify hash-format
+handling.
 """
 
 import argparse
@@ -33,11 +34,13 @@ class TestSmartDispatch:
     """
 
     def test_bare_directory_dispatches_to_seal(self, mhl_cli, tmp_path):
-        """Passing only a directory path (no subcommand) should seal it.
+        """
+        Passing only a directory path (no subcommand) should seal it.
 
-        The smart-dispatch logic in main() inspects sys.argv[1], detects an existing directory, and injects the 'seal'
-        subcommand before argparse sees the arguments.  The result must be identical to calling 'simple-mhl seal <dir>'
-        explicitly.
+        The smart-dispatch logic in main() inspects sys.argv[1], detects an
+        existing directory, and injects the 'seal' subcommand before argparse
+        sees the arguments.  The result must be identical to calling 'simple-mhl
+        seal <dir>' explicitly.
         """
         make_tree(tmp_path, {"clip.bin": b"data"})
 
@@ -49,10 +52,11 @@ class TestSmartDispatch:
         assert len(mhls) == 1, "Expected exactly one .mhl file to be created"
 
     def test_bare_directory_dispatch_produces_valid_manifest(self, mhl_cli, tmp_path):
-        """The manifest produced by implicit seal must be verifiable.
+        """
+        The manifest produced by implicit seal must be verifiable.
 
-        Ensures dispatch injects the right subcommand *and* that all normal seal arguments (default algorithm, etc.) are
-        preserved.
+        Ensures dispatch injects the right subcommand *and* that all normal seal
+        arguments (default algorithm, etc.) are preserved.
         """
         make_tree(tmp_path, {"a.bin": b"hello", "sub/b.bin": b"world"})
         mhl_cli([str(tmp_path)])
@@ -62,10 +66,11 @@ class TestSmartDispatch:
         assert rc == 0, "Manifest produced by implicit seal did not verify clean"
 
     def test_bare_mhl_path_dispatches_to_verify(self, mhl_cli, tmp_path):
-        """Passing only a .mhl path (no subcommand) should verify it.
+        """
+        Passing only a .mhl path (no subcommand) should verify it.
 
-        The smart-dispatch logic detects a .mhl extension and injects the 'verify' subcommand.  A clean manifest must
-        exit 0.
+        The smart-dispatch logic detects a .mhl extension and injects the
+        'verify' subcommand.  A clean manifest must exit 0.
         """
         make_tree(tmp_path, {"a.bin": b"data"})
         mhl = seal_helper(mhl_cli, tmp_path)
@@ -76,15 +81,18 @@ class TestSmartDispatch:
         assert rc == 0, f"Expected exit 0 from implicit verify of clean manifest, got {rc}"
 
     def test_bare_mhl_path_dispatch_reports_corruption(self, mhl_cli, tmp_path):
-        """Implicit verify must surface errors just as explicit verify does.
+        """
+        Implicit verify must surface errors just as explicit verify does.
 
-        Corrupting a file after sealing then invoking via bare .mhl path must produce exit 40 and the expected ERROR
-        line — confirming dispatch reaches the real verify() code path, not a stub.
+        Corrupting a file after sealing then invoking via bare .mhl path must
+        produce exit 40 and the expected ERROR line — confirming dispatch
+        reaches the real verify() code path, not a stub.
         """
         make_tree(tmp_path, {"a.bin": b"original"})
         mhl = seal_helper(mhl_cli, tmp_path)
-        # Write same-length replacement so size pre-check passes and the hash check is what catches the corruption —
-        # confirming the full verify code path is exercised by implicit dispatch.
+        # Write same-length replacement so size pre-check passes and the hash
+        # check is what catches the corruption — confirming the full verify code
+        # path is exercised by implicit dispatch.
         (tmp_path / "a.bin").write_bytes(b"ORIGINAL")  # 8 bytes == len("original")
 
         rc, out, _ = mhl_cli([str(mhl)])
@@ -93,9 +101,11 @@ class TestSmartDispatch:
         assert "[ERROR] hash mismatch: a.bin" in out
 
     def test_explicit_subcommand_not_intercepted(self, mhl_cli, tmp_path):
-        """An explicit 'seal' or 'verify' subcommand must pass through unchanged.
+        """
+        An explicit 'seal' or 'verify' subcommand must pass through unchanged.
 
-        Regression guard: the dispatch block must only fire when the first token is NOT already a recognised subcommand.
+        Regression guard: the dispatch block must only fire when the first token
+        is NOT already a recognised subcommand.
         """
         make_tree(tmp_path, {"a.bin": b"x"})
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
@@ -106,11 +116,13 @@ class TestSmartDispatch:
         assert rc == 0
 
     def test_bare_non_mhl_file_falls_through_to_argparse_error(self, mhl_cli, tmp_path):
-        """A bare path that is neither a directory nor a .mhl file must fall
+        """
+        A bare path that is neither a directory nor a .mhl file must fall
         through the dispatch block unmodified and let argparse reject it.
 
-        The path is passed as the first argument with no subcommand, so it lands in argparse as an unrecognised
-        subcommand → exit 2. This covers the fall-through branch (673→679) in main().
+        The path is passed as the first argument with no subcommand, so it lands
+        in argparse as an unrecognised subcommand → exit 2. This covers the
+        fall-through branch (673→679) in main().
         """
         plain = tmp_path / "plain_text_file.txt"
         plain.write_text("data")
@@ -123,10 +135,11 @@ class TestSmartDispatch:
 
 
 class TestAlgorithmHelpHint:
-    """'-h <algo>' is a common slip for '-a <algo>' and gets a pointing hint.
+    """
+    '-h <algo>' is a common slip for '-a <algo>' and gets a pointing hint.
 
-    '-h' is argparse's help flag (consumes no value), so the mistake would otherwise silently print help and ignore the
-    algorithm/path.
+    '-h' is argparse's help flag (consumes no value), so the mistake would
+    otherwise silently print help and ignore the algorithm/path.
     """
 
     def test_hint_points_to_algorithm_flag_then_shows_help(self, mhl_cli, tmp_path):
@@ -162,8 +175,8 @@ class TestAlgorithmHelpHint:
         assert "--algorithm" in out
 
     def test_help_before_any_subcommand_gets_no_hint(self, mhl_cli):
-        # '-h' with no seal/verify subcommand preceding it (e.g. top-level help) is ordinary help — the hint only fires
-        # for a seal/verify slip.
+        # '-h' with no seal/verify subcommand preceding it (e.g. top-level help)
+        # is ordinary help — the hint only fires for a seal/verify slip.
         rc, _, err = mhl_cli(["-h", "xxhash"])
 
         assert rc == 0
@@ -171,37 +184,46 @@ class TestAlgorithmHelpHint:
 
 
 class TestUnicodeNormalization:
-    """NFC normalization of accented filenames at seal and verify time.
+    """
+    NFC normalization of accented filenames at seal and verify time.
 
-    macOS HFS+/APFS returns filenames in NFD (decomposed) form — e.g. the single codepoint é (U+00E9) is decomposed to e
-    (U+0065) + combining acute (U+0301).  Linux ext4 does byte-exact filename matching, so an NFD path from the manifest
-    would silently fail os.path.exists() against an NFC file on disk.
+    macOS HFS+/APFS returns filenames in NFD (decomposed) form — e.g. the single
+    codepoint é (U+00E9) is decomposed to e (U+0065) + combining acute (U+0301).
+    Linux ext4 does byte-exact filename matching, so an NFD path from the
+    manifest would silently fail os.path.exists() against an NFC file on disk.
 
     simple_mhl reconciles normalization forms at two points:
-      1. seal — rel_path_posix is normalized to NFC before writing the <file>
-                element, so manifests are written in canonical NFC.
-      2. verify — osutils.resolve_on_disk() matches the manifest path against real
-                  directory entries across normalization forms (literal bytes first, NFC-keyed index as fallback) so it
-                  finds the file whatever form it is stored in, without assuming the filesystem normalizes for us.
+      1. seal   — rel_path_posix is normalized to NFC before writing the <file>
+                  element, so manifests are written in canonical NFC.
+      2. verify — osutils.resolve_on_disk() matches the manifest path against
+                  real directory entries across normalization forms (literal
+                  bytes first, NFC-keyed index as fallback) so it finds the file
+                  whatever form it is stored in, without assuming the filesystem
+                  normalizes for us.
 
-    These tests construct NFD filenames explicitly so the behaviour is deterministic regardless of what the host OS
-    normalizes at mkdir/write time.
+    These tests construct NFD filenames explicitly so the behaviour is
+    deterministic regardless of what the host OS normalizes at mkdir/write time.
     """
 
-    # NFD forms used across tests: NFC: "Ré.txt"  = R + U+00E9 (precomposed é) NFD: "Ré.txt"  = R + e + U+0301
-    #   (combining acute)
+    # NFD forms used across tests:
+    #   NFC: "Ré.txt"  = R + U+00E9 (precomposed é)
+    #   NFD: "Ré.txt"  = R + e + U+0301 (combining acute)
     _NFC_NAME = "R\u00e9.txt"  # R + precomposed é
     _NFD_NAME = "Re\u0301.txt"  # R + e + combining acute
 
     def test_seal_writes_nfc_for_nfd_filesystem_path(self, mhl_cli, tmp_path, monkeypatch):
-        """seal() must write NFC <file> entries even when the filesystem returns NFD paths.
+        """
+        seal() must write NFC <file> entries even when the filesystem returns
+        NFD paths.
 
-        We write the file under its NFD name (so get_hash can open it on any OS, since the path we hand to seal must
-        actually exist on disk) and patch _iter_files_for_seal to yield that NFD path — simulating what macOS HFS+/APFS
-        returns from rglob.  The manifest must contain the NFC form.
+        We write the file under its NFD name (so get_hash can open it on any OS,
+        since the path we hand to seal must actually exist on disk) and patch
+        _iter_files_for_seal to yield that NFD path — simulating what macOS
+        HFS+/APFS returns from rglob.  The manifest must contain the NFC form.
 
-        On macOS, HFS+/APFS treats NFC and NFD as the same file, so both names resolve to the same inode.  On Linux
-        ext4, filenames are byte-exact, so we must create the file with the NFD name to allow get_hash to open it.
+        On macOS, HFS+/APFS treats NFC and NFD as the same file, so both names
+        resolve to the same inode.  On Linux ext4, filenames are byte-exact, so
+        we must create the file with the NFD name to allow get_hash to open it.
         Either way, the assertion is the same: the manifest entry must be NFC.
         """
 
@@ -213,9 +235,11 @@ class TestUnicodeNormalization:
 
         def nfd_iter(root, mhl_path, on_skip=None):
             for p, stat_result in real_iter(root, mhl_path, on_skip=on_skip):
-                # Yield the path as-is; real_iter already found the NFD file. Normalize to NFD explicitly in case the OS
-                # returned NFC (e.g. on a case-insensitive macOS volume that normalizes on readback), ensuring the test
-                # exercises the NFC fix on all OSes.
+                # Yield the path as-is; real_iter already found the NFD file.
+                # Normalize to NFD explicitly in case the OS returned NFC (e.g.
+                # on a case-insensitive macOS volume that normalizes on
+                # readback), ensuring the test exercises the NFC fix on all
+                # OSes.
                 nfd_str = unicodedata.normalize("NFD", str(p))
                 yield Path(nfd_str), stat_result
 
@@ -226,7 +250,8 @@ class TestUnicodeNormalization:
 
         mhl = next(tmp_path.glob("*.mhl"))
         text = mhl.read_text(encoding="utf-8")
-        # The <file> element must contain the NFC form regardless of what was on disk or what the iterator yielded.
+        # The <file> element must contain the NFC form regardless of what was on
+        # disk or what the iterator yielded.
         assert self._NFC_NAME in text, (
             f"Expected NFC name {self._NFC_NAME!r} in manifest. "
             f"Manifest snippet: {text[text.find('<file>') : text.find('</file>') + 7]!r}"
@@ -237,10 +262,11 @@ class TestUnicodeNormalization:
         )
 
     def test_seal_nfc_is_idempotent_for_already_nfc_paths(self, mhl_cli, tmp_path):
-        """NFC normalization of an already-NFC path must produce the same result.
+        """
+        NFC normalization of an already-NFC path must produce the same result.
 
-        Regression guard: applying NFC to a path that is already NFC must not corrupt the filename or produce a
-        different string.
+        Regression guard: applying NFC to a path that is already NFC must not
+        corrupt the filename or produce a different string.
         """
         nfc_path = tmp_path / self._NFC_NAME
         nfc_path.write_bytes(b"data")
@@ -252,9 +278,11 @@ class TestUnicodeNormalization:
         assert self._NFC_NAME in text
 
     def test_verify_nfc_manifest_finds_nfc_file(self, mhl_cli, tmp_path):
-        """verify() must find a file when both the manifest and disk use NFC.
+        """
+        verify() must find a file when both the manifest and disk use NFC.
 
-        This is the baseline happy path for NFC filenames — seal then verify on the same OS must always work.
+        This is the baseline happy path for NFC filenames — seal then verify on
+        the same OS must always work.
         """
         make_tree(tmp_path, {self._NFC_NAME: b"data"})
         mhl = seal_helper(mhl_cli, tmp_path)
@@ -263,10 +291,13 @@ class TestUnicodeNormalization:
         assert rc == 0
 
     def test_verify_normalizes_nfd_manifest_path_to_find_nfc_file(self, mhl_cli, tmp_path):
-        """verify() must find an NFC file on disk even when the manifest contains an NFD path.
+        """
+        verify() must find an NFC file on disk even when the manifest contains
+        an NFD path.
 
-        This is the cross-platform scenario: manifest sealed on macOS (NFD paths) verified on Linux (NFC files,
-        byte-exact matching). We construct the manifest by hand with an NFD <file> entry pointing at an NFC file on
+        This is the cross-platform scenario: manifest sealed on macOS (NFD
+        paths) verified on Linux (NFC files, byte-exact matching). We construct
+        the manifest by hand with an NFD <file> entry pointing at an NFC file on
         disk.
         """
 
@@ -291,7 +322,8 @@ class TestUnicodeNormalization:
         assert rc == 0, f"verify() failed to find NFC file via NFD manifest path. Exit {rc}, output: {out!r}"
 
     def test_verify_nfd_manifest_path_correct_hash_passes(self, mhl_cli, tmp_path):
-        """Complement to the above: NFD manifest + correct digest = clean verify.
+        """
+        Complement to the above: NFD manifest + correct digest = clean verify.
 
         Confirms the normalization does not break the hash check that follows.
         """
@@ -315,10 +347,12 @@ class TestUnicodeNormalization:
         assert rc == 0
 
     def test_verify_nfd_manifest_path_wrong_hash_still_fails(self, mhl_cli, tmp_path):
-        """NFD normalization must not suppress a genuine hash mismatch.
+        """
+        NFD normalization must not suppress a genuine hash mismatch.
 
-        Regression guard: the normalization step must not interfere with the hash check. A correct NFC path resolution
-        followed by a wrong digest must still exit 40.
+        Regression guard: the normalization step must not interfere with the
+        hash check. A correct NFC path resolution followed by a wrong digest
+        must still exit 40.
         """
         nfc_path = tmp_path / self._NFC_NAME
         nfc_path.write_bytes(b"original")
@@ -339,12 +373,15 @@ class TestUnicodeNormalization:
         assert "hash mismatch" in out.lower()
 
     def test_verify_nfc_manifest_finds_nfd_file_on_disk(self, mhl_cli, tmp_path):
-        """Scenario 3 (end-to-end): manifest path is NFC, the file on disk is NFD.
+        """
+        Scenario 3 (end-to-end): manifest path is NFC, the file on disk is NFD.
 
-        Mirror of test_verify_normalizes_nfd_manifest_path_to_find_nfc_file. On a normalization-*sensitive* filesystem
-        (ext4/exFAT/NTFS — e.g. Linux CI) the literal NFC lookup misses and resolution scans the directory and matches
-        on NFC; on an *insensitive* volume (APFS/HFS+ — e.g. macOS dev) the literal lookup already succeeds. Either way
-        verify must find and check the file, so this passes regardless of host filesystem.
+        Mirror of test_verify_normalizes_nfd_manifest_path_to_find_nfc_file. On
+        a normalization-*sensitive* filesystem (ext4/exFAT/NTFS — e.g. Linux CI)
+        the literal NFC lookup misses and resolution scans the directory and
+        matches on NFC; on an *insensitive* volume (APFS/HFS+ — e.g. macOS dev)
+        the literal lookup already succeeds. Either way verify must find and
+        check the file, so this passes regardless of host filesystem.
         """
         nfd_path = tmp_path / self._NFD_NAME
         content = b"data"
@@ -367,8 +404,8 @@ class TestUnicodeNormalization:
 
 def _patch_sensitive(monkeypatch, files, dirs):
     """
-    Patch exists/isdir/lexists/scandir to model a normalization-sensitive, byte-exact filesystem from explicit file and
-    directory path sets.
+    Patch exists/isdir/lexists/scandir to model a normalization-sensitive,
+    byte-exact filesystem from explicit file and directory path sets.
     """
     files = set(files)
     dirs = set(dirs)
@@ -385,9 +422,10 @@ def _patch_sensitive(monkeypatch, files, dirs):
 
 class TestNormalizationVariantHint:
     """
-    The typed CLI path (verify's .mhl, seal's root) is left to the OS, but a not-found error suggests a real on-disk
-    path that differs only in Unicode normalization. Simulated on a sensitive filesystem (the only place the mismatch is
-    observable).
+    The typed CLI path (verify's .mhl, seal's root) is left to the OS, but a
+    not-found error suggests a real on-disk path that differs only in Unicode
+    normalization. Simulated on a sensitive filesystem (the only place the
+    mismatch is observable).
     """
 
     _VOL = os.path.join(os.sep, "vol")
@@ -467,7 +505,10 @@ class TestNormalizationVariantHint:
 
 
 class TestVerifyAlgorithmSelection:
-    """verify defaults to the fastest recorded hash (xxhash > md5 > sha1); -a overrides."""
+    """
+    verify defaults to the fastest recorded hash (xxhash > md5 > sha1); -a
+    overrides.
+    """
 
     def test_default_uses_xxhash_when_md5_is_wrong(self, mhl_cli, tmp_path):
         """md5 deliberately wrong but xxhash correct → default (xxhash) passes."""
@@ -479,8 +520,10 @@ class TestVerifyAlgorithmSelection:
         assert rc == 0
 
     def test_default_picks_xxhash_even_when_listed_last(self, mhl_cli, tmp_path):
-        """md5 correct but xxhash (last element) wrong → default chooses xxhash and
-        fails, proving selection is by speed, not document order."""
+        """
+        md5 correct but xxhash (last element) wrong → default chooses xxhash and
+        fails, proving selection is by speed, not document order.
+        """
         content = b"hello"
         mhl = make_multi_hash_mhl(
             tmp_path, "a.bin", content, {"md5": hashlib.md5(content).hexdigest(), "xxhash64be": "00" * 8}
@@ -490,7 +533,8 @@ class TestVerifyAlgorithmSelection:
         assert "hash mismatch" in out
 
     def test_override_md5_passes_when_md5_correct(self, mhl_cli, tmp_path):
-        """Same manifest where xxhash is wrong but md5 is right: -a md5 passes."""
+        """Same manifest where xxhash is wrong but md5 is right: -a md5
+        passes."""
         content = b"hello"
         mhl = make_multi_hash_mhl(
             tmp_path, "a.bin", content, {"md5": hashlib.md5(content).hexdigest(), "xxhash64be": "00" * 8}
@@ -499,7 +543,9 @@ class TestVerifyAlgorithmSelection:
         assert rc == 0
 
     def test_override_md5_detects_corrupt_md5(self, mhl_cli, tmp_path):
-        """-a md5 forces md5 even though the correct xxhash would pass by default."""
+        """
+        -a md5 forces md5 even though the correct xxhash would pass by default.
+        """
         content = b"hello"
         mhl = make_multi_hash_mhl(
             tmp_path, "a.bin", content, {"md5": "0" * 32, "xxhash64be": xxhash.xxh64(content).hexdigest()}
@@ -565,8 +611,9 @@ class TestVerifyAlgorithmSelection:
 
     def test_all_fails_on_any_bad_recorded_hash(self, mhl_cli, tmp_path):
         """
-        -a all checks ALL recorded hashes, so one wrong stored digest fails the entry even when the fastest (default)
-        hash matches. Verbose marks per format which matched and which didn't.
+        -a all checks ALL recorded hashes, so one wrong stored digest fails the
+        entry even when the fastest (default) hash matches. Verbose marks per
+        format which matched and which didn't.
         """
         content = b"hello world"
         mhl = make_multi_hash_mhl(
@@ -591,8 +638,9 @@ class TestVerifyAlgorithmSelection:
 
     def test_comma_list_checks_each_selected_hash_order_independent(self, mhl_cli, tmp_path):
         """
-        -a md5,sha1 verifies exactly those two; the unrequested xxhash is skipped, and requested order doesn't change
-        the result (output stays in manifest order).
+        -a md5,sha1 verifies exactly those two; the unrequested xxhash is
+        skipped, and requested order doesn't change the result (output stays in
+        manifest order).
         """
         content = b"hello world"
         mhl = make_multi_hash_mhl(
@@ -614,8 +662,9 @@ class TestVerifyAlgorithmSelection:
 
     def test_comma_list_reports_missing_requested_tags(self, mhl_cli, tmp_path):
         """
-        Requesting tags the entry doesn't record fails it, naming each missing one; the list is sorted so the message is
-        stable regardless of requested order.
+        Requesting tags the entry doesn't record fails it, naming each missing
+        one; the list is sorted so the message is stable regardless of requested
+        order.
         """
         content = b"hello"
         mhl = make_multi_hash_mhl(tmp_path, "a.bin", content, {"xxhash64be": xxhash.xxh64(content).hexdigest()})
@@ -681,7 +730,9 @@ class TestCombineAlgorithms:
 
 
 class TestParseVerifyAlgorithms:
-    """The verify -a comma-list parser (accepts the 'all' keyword, dedups by tag)."""
+    """
+    The verify -a comma-list parser (accepts the 'all' keyword, dedups by tag).
+    """
 
     def test_all_keyword_supersedes(self):
         assert simple_mhl.parse_verify_algorithms("md5,all") is simple_mhl._VERIFY_ALL
