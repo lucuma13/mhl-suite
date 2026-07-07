@@ -1,14 +1,18 @@
 """
 Cross-dialect verification orchestrator.
 
-The engine behind the `mhlver` CLI: walk a path, find every MHL manifest, verify each via the right backend, and
-aggregate the results. It is print-free — instead of writing to the terminal it returns structured ManifestResults and
-emits per-manifest StatusLine render data through an injected `emit` callback, so the CLI (mhl_suite.cli.mhlver) owns
-all terminal I/O and this stays a testable library.
+The engine behind the `mhlver` CLI: walk a path, find every MHL manifest, verify
+each via the right backend, and aggregate the results. It is print-free —
+instead of writing to the terminal it returns structured ManifestResults and
+emits per-manifest StatusLine render data through an injected `emit` callback,
+so the CLI (mhl_suite.cli.mhlver) owns all terminal I/O and this stays a
+testable library.
 
-Detection rule: a manifest inside an `ascmhl/` folder is an ASC-MHL package (AscMHLBackend, via mhl_suite); otherwise
-it is classic MHL (ClassicMHLBackend, via mhl_suite). Both verify in-process. Each backend's exit code is translated
-to a human-readable message via dispatch tables (see _CLASSICMHL_RESULTS, _ASCMHL_VERIFY_RESULTS).
+Detection rule: a manifest inside an `ascmhl/` folder is an ASC-MHL package
+(AscMHLBackend, via mhl_suite); otherwise it is classic MHL (ClassicMHLBackend,
+via mhl_suite). Both verify in-process. Each backend's exit code is translated
+to a human-readable message via dispatch tables (see _CLASSICMHL_RESULTS,
+_ASCMHL_VERIFY_RESULTS).
 """
 
 from collections.abc import Callable, Iterator
@@ -30,11 +34,14 @@ def _routes_to_ascmhl_backend(mhl_file: Path) -> bool:
     """
     True if `mhl_file` is an ASC-MHL v2 manifest.
 
-    The single dialect rule used everywhere in the orchestrator — backend routing, package dedup, and progress
-    weighting all consult it, so they cannot disagree. The dialect is decided authoritatively by the manifest header
-    (is_ascmhl_v2), so a classic v1 file is never treated as ASC-MHL, even one sitting inside a folder named `ascmhl`.
-    The `parent.name == "ascmhl"` check is a pure performance gate: a v2 manifest always lives directly in an `ascmhl/`
-    folder (ASC-MHL spec), so a classic-only tree never opens a manifest just to classify it.
+    The single dialect rule used everywhere in the orchestrator — backend
+    routing, package dedup, and progress weighting all consult it, so they
+    cannot disagree. The dialect is decided authoritatively by the manifest
+    header (is_ascmhl_v2), so a classic v1 file is never treated as ASC-MHL,
+    even one sitting inside a folder named `ascmhl`. The `parent.name ==
+    "ascmhl"` check is a pure performance gate: a v2 manifest always lives
+    directly in an `ascmhl/` folder (ASC-MHL spec), so a classic-only tree never
+    opens a manifest just to classify it.
     """
     return mhl_file.parent.name == "ascmhl" and is_ascmhl_v2(mhl_file)
 
@@ -42,18 +49,21 @@ def _routes_to_ascmhl_backend(mhl_file: Path) -> bool:
 # -----------------------------------------------------------------------------
 # Per-manifest status rendering data
 # -----------------------------------------------------------------------------
-# A verify produces one or more StatusLine values describing what to print: which dispatch table, the exit code, the
-# target label, and the per-file output text. The orchestrator never prints — it hands these to the injected `emit`
-# callback, which the CLI turns into coloured terminal output (see cli.mhlver._report_via_table). Emitting per manifest
-# as the loop yields it preserves live status streaming; `emit=None` discards (a library caller that only wants the
-# ManifestResults).
+# A verify produces one or more StatusLine values describing what to print:
+# which dispatch table, the exit code, the target label, and the per-file output
+# text. The orchestrator never prints — it hands these to the injected `emit`
+# callback, which the CLI turns into coloured terminal output (see
+# cli.mhlver._report_via_table). Emitting per manifest as the loop yields it
+# preserves live status streaming; `emit=None` discards (a library caller that
+# only wants the ManifestResults).
 
 
 @dataclass
 class StatusLine:
     """
-    One per-manifest status to render: a dispatch-table lookup plus the
-    per-file output text. `table` maps an exit code to (message template, severity)."""
+    One per-manifest status to render: a dispatch-table lookup plus the per-file
+    output text. `table` maps an exit code to (message template, severity).
+    """
 
     table: "dict[int, tuple[str, str]]"
     code: int
@@ -73,21 +83,25 @@ def _emit(
         emit(StatusLine(table, code, label, output))
 
 
-# --- ASC-MHL output rendering ----------------------------------------------------------------------------------------
+# --- ASC-MHL output rendering ------------------------------------------------
 #
-# Both dialects are verified in-process now: classic via mhl_suite.classic_verify and ASC-MHL via
-# mhl_suite.ascmhl_verify, each returning structured outcomes — so there is no backend stdout to parse.
-# _render_ascmhl_lines reproduces the per-file terminal text from a VerifyReport (the ASC-MHL counterpart to
-# classic_verify.render_verify_lines): failure lines always, OK lines only when verbose, matching the old `ascmhl-debug
-# verify [-v]` output mhlver used to relay.
+# Both dialects are verified in-process now: classic via
+# mhl_suite.classic_verify and ASC-MHL via mhl_suite.ascmhl_verify, each
+# returning structured outcomes — so there is no backend stdout to parse.
+# _render_ascmhl_lines reproduces the per-file terminal text from a VerifyReport
+# (the ASC-MHL counterpart to classic_verify.render_verify_lines): failure lines
+# always, OK lines only when verbose, matching the old `ascmhl-debug verify
+# [-v]` output mhlver used to relay.
 
 
 def _render_ascmhl_lines(report: VerifyReport, verbose: bool) -> list[str]:
     """
     Render a VerifyReport to the per-file lines shown on the terminal.
 
-    Manifest-level notices first (e.g. a size-only integrity-gate message), then OK lines (verbose only), then failures
-    — each with its verbose-only detail continuation if present (size-only mismatches carry one; hash failures don't).
+    Manifest-level notices first (e.g. a size-only integrity-gate message), then
+    OK lines (verbose only), then failures — each with its verbose-only detail
+    continuation if present (size-only mismatches carry one; hash failures
+    don't).
     """
     out: list[str] = list(report.notices)
     if verbose:
@@ -100,22 +114,25 @@ def _render_ascmhl_lines(report: VerifyReport, verbose: bool) -> list[str]:
     return out
 
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Exit-code dispatch tables
-# ---------------------------------------------------------------------------------------------------------------------
-# Both backends return structured exit codes. Rather than long if/elif chains, we map exit_code -> (template, severity)
-# and dispatch through a small helper. severity is "success" / "warning" / "error" and selects the logger.
+# -----------------------------------------------------------------------------
+# Both backends return structured exit codes. Rather than long if/elif chains,
+# we map exit_code -> (template, severity) and dispatch through a small helper.
+# severity is "success" / "warning" / "error" and selects the logger.
 #
-# Templates use {target} which we .format() with the manifest's name or its package directory depending on the action.
+# Templates use {target} which we .format() with the manifest's name or its
+# package directory depending on the action.
 
-# --- simple-mhl (classic MHL) verify exit codes ----------------------------------------------------------------------
-# These are the harmonised _exit_codes.ExitCode values classic verify returns (shared with the ASC-MHL table — one
-# integer, one meaning suite-wide).
+# --- simple-mhl (classic MHL) verify exit codes ------------------------------
+# These are the harmonised _exit_codes.ExitCode values classic verify returns
+# (shared with the ASC-MHL table — one integer, one meaning suite-wide).
 #
-# Wording note: the per-file detail (which files, what kind of failure) comes from the engine itself, which builds
-# structured `[ERROR] <category>: <path>` lines that are self-explanatory standalone. mhlver therefore only needs to say
-# "this manifest failed" — the lines below explain why. The exit code itself still encodes the precise failure category
-# for tooling.
+# Wording note: the per-file detail (which files, what kind of failure) comes
+# from the engine itself, which builds structured `[ERROR] <category>: <path>`
+# lines that are self-explanatory standalone. mhlver therefore only needs to say
+# "this manifest failed" — the lines below explain why. The exit code itself
+# still encodes the precise failure category for tooling.
 _CLASSICMHL_RESULTS: dict[int, tuple[str, str]] = {
     ExitCode.OK: ("✅ MHL verified: {target}", "success"),
     ExitCode.ERROR: (
@@ -135,20 +152,23 @@ _CLASSICMHL_SCHEMA_RESULTS: dict[int, tuple[str, str]] = {
     ExitCode.OK: ("📝 MHL schema valid: {target}", "success"),
 }
 
-# --- ASC-MHL (2.0) verify exit codes ---------------------------------------------------------------------------------
-# The pinned codes (MISSING/HASH_MISMATCH/.../MISSING_MANIFEST) come from the ascmhl library's errors.py, surfaced
-# in-process by mhl_suite.ascmhl_verify; SIZE_MISMATCH and MALFORMED_XML are suite extensions for the size-only path.
+# --- ASC-MHL (2.0) verify exit codes -----------------------------------------
+# The pinned codes (MISSING/HASH_MISMATCH/.../MISSING_MANIFEST) come from the
+# ascmhl library's errors.py, surfaced in-process by mhl_suite.ascmhl_verify;
+# SIZE_MISMATCH and MALFORMED_XML are suite extensions for the size-only path.
 #
-# As with the classic MHL table, mhlver gives a single short status line per manifest; the per-file detail (which file
-# mismatched, which manifest is missing) comes from the structured VerifyReport, rendered by _render_ascmhl_lines. The
-# exit code preserves the precise failure category.
+# As with the classic MHL table, mhlver gives a single short status line per
+# manifest; the per-file detail (which file mismatched, which manifest is
+# missing) comes from the structured VerifyReport, rendered by
+# _render_ascmhl_lines. The exit code preserves the precise failure category.
 _ASCMHL_VERIFY_RESULTS: dict[int, tuple[str, str]] = {
     ExitCode.OK: ("✅ ASC-MHL verified: {target}", "success"),
     ExitCode.MISSING: ("❌ ASC-MHL verification failed: {target}", "error"),
     ExitCode.HASH_MISMATCH: ("❌ ASC-MHL verification failed: {target}", "error"),
     ExitCode.DIRECTORY_HASH_MISMATCH: ("❌ ASC-MHL verification failed: {target}", "error"),
-    # SIZE_MISMATCH (13) is a suite extension (ascmhl has no size check), kept distinct from HASH_MISMATCH so size
-    # failures don't look like hash failures.
+    # SIZE_MISMATCH (13) is a suite extension (ascmhl has no size check), kept
+    # distinct from HASH_MISMATCH so size failures don't look like hash
+    # failures.
     ExitCode.SIZE_MISMATCH: ("❌ ASC-MHL verification failed: {target}", "error"),
     ExitCode.SINGLE_FILE_NOT_FOUND: ("❌ ASC-MHL verification failed: {target}", "error"),
     ExitCode.NEW_FILES: (
@@ -163,8 +183,9 @@ _ASCMHL_VERIFY_RESULTS: dict[int, tuple[str, str]] = {
     ExitCode.MALFORMED_XML: ("🚨 Malformed XML: {target} cannot be parsed.", "warning"),
 }
 
-# Schema-check has its own SCHEMA_NONCOMPLIANT code (41), distinct from the verify path's HASH_MISMATCH (11) — no longer
-# overloaded onto a single ascmhl code.
+# Schema-check has its own SCHEMA_NONCOMPLIANT code (41), distinct from the
+# verify path's HASH_MISMATCH (11) — no longer overloaded onto a single ascmhl
+# code.
 _ASCMHL_SCHEMA_RESULTS: dict[int, tuple[str, str]] = {
     ExitCode.OK: ("📝 ASC-MHL schema valid: {target}", "success"),
     ExitCode.SCHEMA_NONCOMPLIANT: (
@@ -173,23 +194,26 @@ _ASCMHL_SCHEMA_RESULTS: dict[int, tuple[str, str]] = {
     ),
     ExitCode.MALFORMED_XML: ("🚨 Malformed XML: {target} cannot be parsed.", "warning"),
 }
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Verify backends — the port
-# ---------------------------------------------------------------------------------------------------------------------
-# Both backends verify in-process and return the same (exit_code, ManifestResult | None), so the orchestrator stays
-# uniform. ClassicMHLBackend drives mhl_suite.classic_verify; AscMHLBackend drives mhl_suite.ascmhl_verify. Both advance
-# the progress bar through the same on_bytes hook, called per chunk as files are hashed (so the bar moves within a large
-# file, not just at its end).
+# -----------------------------------------------------------------------------
+# Both backends verify in-process and return the same (exit_code, ManifestResult
+# | None), so the orchestrator stays
+# uniform. ClassicMHLBackend drives mhl_suite.classic_verify; AscMHLBackend
+# drives mhl_suite.ascmhl_verify. Both advance the progress bar through the same
+# on_bytes hook, called per chunk as files are hashed (so the bar moves within a
+# large file, not just at its end).
 
 
 class VerifyBackend(Protocol):
     """
     A manifest-verification backend.
 
-    Print-free: it returns `(exit_code, ManifestResult | None)` and reports each per-manifest status to the injected
-    `emit` callback (a StatusLine the CLI renders). `on_bytes` advances a progress bar from the in-process hasher with
-    each chunk's byte count as files are hashed (called when verifying, not in schema mode); it may fire from a worker
-    thread, so it must be thread-safe.
+    Print-free: it returns `(exit_code, ManifestResult | None)` and reports each
+    per-manifest status to the injected `emit` callback (a StatusLine the CLI
+    renders). `on_bytes` advances a progress bar from the in-process hasher with
+    each chunk's byte count as files are hashed (called when verifying, not in
+    schema mode); it may fire from a worker thread, so it must be thread-safe.
     """
 
     def verify(
@@ -250,9 +274,9 @@ class AscMHLBackend:
         )
 
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # verify_item — main per-MHL dispatcher
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 def verify_item(
@@ -266,16 +290,19 @@ def verify_item(
     """
     Verify a single MHL manifest by selecting the right backend.
 
-    Detection rule (see _routes_to_ascmhl_backend): a manifest whose header declares ASC-MHL v2 is verified through the
-    ASC-MHL backend (AscMHLBackend); otherwise it is classic MHL, verified through the classic engine
-    (ClassicMHLBackend). Both verify in-process and satisfy the VerifyBackend port, so the orchestrator only ever sees
-    `(exit_code, ManifestResult | None)`.
+    Detection rule (see _routes_to_ascmhl_backend): a manifest whose header
+    declares ASC-MHL v2 is verified through the ASC-MHL backend (AscMHLBackend);
+    otherwise it is classic MHL, verified through the classic engine
+    (ClassicMHLBackend). Both verify in-process and satisfy the VerifyBackend
+    port, so the orchestrator only ever sees `(exit_code, ManifestResult |
+    None)`.
 
-    `size_only` requests a fast size-only check. `emit`, if given, receives a StatusLine per manifest for the CLI to
-    render; `on_bytes` advances a progress bar as each file is hashed (both backends).
+    `size_only` requests a fast size-only check. `emit`, if given, receives a
+    StatusLine per manifest for the CLI to render; `on_bytes` advances a
+    progress bar as each file is hashed (both backends).
 
-    Returns (exit_code, ManifestResult | None). ManifestResult is None when schema-check mode is active (no per-file
-    detail is available then).
+    Returns (exit_code, ManifestResult | None). ManifestResult is None when
+    schema-check mode is active (no per-file detail is available then).
     """
     backend: VerifyBackend = AscMHLBackend() if _routes_to_ascmhl_backend(target) else ClassicMHLBackend()
     return backend.verify(
@@ -288,7 +315,7 @@ def verify_item(
     )
 
 
-# --- Classic MHL (v1) path -------------------------------------------------------------------------------------------
+# --- Classic MHL (v1) path ---------------------------------------------------
 
 
 def _verify_classicmhl(
@@ -302,12 +329,14 @@ def _verify_classicmhl(
     """
     Verify a classic MHL manifest in-process via the core engine.
 
-    Schema mode runs classic_verify.schema_report; verify/size-only run classic_verify.verify_classic, whose structured
-    VerifyEntries map straight onto FileResult — no subprocess, no text round-trip. render_verify_lines reproduces the
-    exact `simple-mhl verify` stdout so the terminal output is unchanged.
+    Schema mode runs classic_verify.schema_report; verify/size-only run
+    classic_verify.verify_classic, whose structured VerifyEntries map straight
+    onto FileResult — no subprocess, no text round-trip. render_verify_lines
+    reproduces the exact `simple-mhl verify` stdout so the terminal output is
+    unchanged.
 
-    `on_bytes`, when given, advances the caller's progress bar as each file is hashed (the in-process equivalent of the
-    old subprocess animation tick).
+    `on_bytes`, when given, advances the caller's progress bar as each file is
+    hashed (the in-process equivalent of the old subprocess animation tick).
     """
     if schema:
         code, lines = schema_report(str(target))
@@ -327,8 +356,9 @@ def _verify_classicmhl(
         )
         return ExitCode.MALFORMED_XML, mr
 
-    # render_verify_lines reproduces the exact `simple-mhl verify` stdout at the requested verbosity (OK lines and the
-    # indented detail continuations are included only when verbose), matching the old subprocess terminal output.
+    # render_verify_lines reproduces the exact `simple-mhl verify` stdout at the
+    # requested verbosity (OK lines and the indented detail continuations are
+    # included only when verbose), matching the old subprocess terminal output.
     output = "\n".join(render_verify_lines(report, verbose))
     _emit(emit, _CLASSICMHL_RESULTS, report.code, target.name, output)
 
@@ -360,7 +390,7 @@ def _verify_classicmhl(
     return report.code, mr
 
 
-# --- ASC-MHL (v2) path -----------------------------------------------------------------------------------------------
+# --- ASC-MHL (v2) path -------------------------------------------------------
 
 
 def _verify_ascmhl(
@@ -375,8 +405,9 @@ def _verify_ascmhl(
     if schema:
         code = _ascmhl_schema_check(target, verbose, emit=emit)
         return code, None
-    # Both full and size-only verify go through _ascmhl_verify -> verify_ascmhl; size_only does the integrity gate +
-    # byte-free size compare inside the engine.
+    # Both full and size-only verify go through _ascmhl_verify -> verify_ascmhl;
+    # size_only does the integrity gate + byte-free size compare inside the
+    # engine.
     return _ascmhl_verify(target, verbose, size_only=size_only, emit=emit, on_bytes=on_bytes)
 
 
@@ -386,12 +417,14 @@ def _ascmhl_schema_check(
     emit: "Callable[[StatusLine], None] | None" = None,
 ) -> int:
     """
-    Schema-check both halves of an ASC-MHL package in-process: the manifest itself against ASCMHL.xsd and the sibling
-    ascmhl_chain.xml against the directory schema.
+    Schema-check both halves of an ASC-MHL package in-process: the manifest
+    itself against ASCMHL.xsd and the sibling ascmhl_chain.xml against the
+    directory schema.
 
-    Both checks always run; the worst exit code (preferring the manifest's) is returned so the caller has a single
-    signal. Validation errors are always shown — they carry the line numbers and structural detail an operator needs to
-    fix the file.
+    Both checks always run; the worst exit code (preferring the manifest's) is
+    returned so the caller has a single signal. Validation errors are always
+    shown — they carry the line numbers and structural detail an operator needs
+    to fix the file.
     """
     # Step 1: the .mhl manifest against the manifest schema.
     mhl_code, mhl_lines = ascmhl_verify.schema_check(target)
@@ -416,10 +449,12 @@ def _ascmhl_verify(
     """
     Verify an ASC-MHL package in-process via mhl_suite.ascmhl_verify.
 
-    ASC-MHL convention: the manifest at <root>/ascmhl/<gen>.mhl describes the contents of <root>, so we verify the
-    parent of the ascmhl/ folder (target.parent.parent). verify_ascmhl returns a structured VerifyReport; `size_only`
-    runs the integrity gate + byte-free size compare (no hashing), otherwise on_bytes drives per-file progress as each
-    file is hashed. _render_ascmhl_lines reproduces the per-file terminal text.
+    ASC-MHL convention: the manifest at <root>/ascmhl/<gen>.mhl describes the
+    contents of <root>, so we verify the parent of the ascmhl/ folder
+    (target.parent.parent). verify_ascmhl returns a structured VerifyReport;
+    `size_only` runs the integrity gate + byte-free size compare (no hashing),
+    otherwise on_bytes drives per-file progress as each file is hashed.
+    _render_ascmhl_lines reproduces the per-file terminal text.
     """
     package_dir = target.parent.parent
     report = ascmhl_verify.verify_ascmhl(package_dir, size_only=size_only, on_progress=on_bytes)
@@ -456,18 +491,18 @@ def _ascmhl_verify(
     return report.code, mr
 
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Filesystem walking
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 def find_mhl_files(root: Path) -> Iterator[Path]:
     """
-    Yield every .mhl file under `root`, case-insensitively, skipping macOS resource forks (filenames starting with
-    '._').
+    Yield every .mhl file under `root`, case-insensitively, skipping macOS
+    resource forks (filenames starting with '._').
 
-    rglob's pattern syntax with character classes is the only portable way to do case-insensitive matching in pathlib
-    without a fnmatch fallback.
+    rglob's pattern syntax with character classes is the only portable way to do
+    case-insensitive matching in pathlib without a fnmatch fallback.
     """
     for p in root.rglob("*.[mM][hH][lL]"):
         if not p.name.startswith("._"):
@@ -476,45 +511,51 @@ def find_mhl_files(root: Path) -> Iterator[Path]:
 
 def _select_mhl_files(root: Path) -> list[Path]:
     """
-    Return a sorted list of MHL files to verify, deduplicating ASC-MHL packages (one MHL per package even if multiple
-    .mhl files exist).
+    Return a sorted list of MHL files to verify, deduplicating ASC-MHL packages
+    (one MHL per package even if multiple .mhl files exist).
 
-    An ASC-MHL package is identified by its `ascmhl/` folder. When that folder contains multiple manifests (one per
-    generation, e.g. 0001.mhl, 0002.mhl), running verify on any of them verifies the whole package, so we pick the
-    lexicographically last one (latest generation) per package and skip the rest.
+    An ASC-MHL package is identified by its `ascmhl/` folder. When that folder
+    contains multiple manifests (one per generation, e.g. 0001.mhl, 0002.mhl),
+    running verify on any of them verifies the whole package, so we pick the
+    lexicographically last one (latest generation) per package and skip the
+    rest.
 
-    Implementation: we iterate in sorted order and track the chosen manifest per package root in a dict. Because later
-    entries in sorted order are lexicographically greater, the final value in the dict is always the latest generation —
-    no list rebuild needed.
+    Implementation: we iterate in sorted order and track the chosen manifest per
+    package root in a dict. Because later entries in sorted order are
+    lexicographically greater, the final value in the dict is always the latest
+    generation — no list rebuild needed.
     """
-    # Maps package_root -> the latest manifest seen so far for that package. For classic MHL files (not inside an
-    # ascmhl/ folder) we use the file path itself as its own key so they pass through unchanged.
+    # Maps package_root -> the latest manifest seen so far for that package. For
+    # classic MHL files (not inside an ascmhl/ folder) we use the file path
+    # itself as its own key so they pass through unchanged.
     latest: dict[Path, Path] = {}
 
     for f in sorted(find_mhl_files(root)):
-        key = f.parent.parent if _routes_to_ascmhl_backend(f) else f  # ascmhl: pkg root; classic mhl: file itself
+        key = f.parent.parent if _routes_to_ascmhl_backend(f) else f
         latest[key] = f  # sorted order → last write wins
 
-    # Re-sort the values to preserve the original output order (dict insertion order is sorted-key order here, but an
-    # explicit sort is clearer).
+    # Re-sort the values to preserve the original output order (dict insertion
+    # order is sorted-key order here, but an explicit sort is clearer).
     return sorted(latest.values())
 
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Progress bar helpers
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 def _mhl_total_bytes(mhl_file: Path) -> int:
     """
-    Sum the <size> of every recomputable-hash entry in a classic MHL manifest to get the byte weight of the files verify
-    will actually read.
+    Sum the <size> of every recomputable-hash entry in a classic MHL manifest to
+    get the byte weight of the files verify will actually read.
 
-    Used to weight progress-bar units by actual data volume rather than manifest count, giving a more accurate ETA when
-    manifests vary wildly in size (e.g. 500 GB camera originals vs 2 GB proxies).
+    Used to weight progress-bar units by actual data volume rather than manifest
+    count, giving a more accurate ETA when manifests vary wildly in size (e.g.
+    500 GB camera originals vs 2 GB proxies).
 
-    A <null> (size-only / existence-only) entry is verified with a single stat() and reads zero bytes, so its <size> is
-    excluded — counting it would surge the bar ahead of real hashing progress.
+    A <null> (size-only / existence-only) entry is verified with a single stat()
+    and reads zero bytes, so its <size> is excluded — counting it would surge
+    the bar ahead of real hashing progress.
     """
 
     try:
@@ -526,7 +567,8 @@ def _mhl_total_bytes(mhl_file: Path) -> int:
         size_el = h.find("{*}size")
         if size_el is None or not size_el.text or not size_el.text.strip().isdecimal():
             continue
-        # Only count entries verify reads bytes for (skip <null>-only / no-hash entries).
+        # Only count entries verify reads bytes for (skip <null>-only / no-hash
+        # entries).
         if any(
             isinstance(c.tag, str) and (c.tag.rpartition("}")[2] if "}" in c.tag else c.tag).lower() in ALGO_MAP
             for c in h
@@ -537,24 +579,28 @@ def _mhl_total_bytes(mhl_file: Path) -> int:
 
 def _ascmhl_total_bytes(latest_mhl: Path) -> int:
     """
-    Sum the ``size`` attributes on ``<path>`` elements across every .mhl generation file in an ASC-MHL package, counting
-    each file path only once.
+    Sum the ``size`` attributes on ``<path>`` elements across every .mhl
+    generation file in an ASC-MHL package, counting each file path only once.
 
-    Per the ASC-MHL 2.0 schema (ASCMHL.xsd), file sizes are stored as an attribute of the ``<path>`` element inside each
-    ``<hash>`` record::
+    Per the ASC-MHL 2.0 schema (ASCMHL.xsd), file sizes are stored as an
+    attribute of the ``<path>`` element inside each ``<hash>`` record::
 
         <hash>
           <path size="1234567">relative/path/to/clip.mov</path> …
         </hash>
 
-    ``latest_mhl`` is the lexicographically last generation file chosen by ``_select_mhl_files`` (e.g.
-    ``ascmhl/0003.mhl``).  Because each generation only records *new or changed* files, summing only the latest
-    generation would undercount the full corpus.  We therefore parse all ``.mhl`` files in the same ``ascmhl/``
-    directory in filename order (which matches the ``sequencenr`` order in ``ascmhl_chain.xml``).
+    ``latest_mhl`` is the lexicographically last generation file chosen by
+    ``_select_mhl_files`` (e.g. ``ascmhl/0003.mhl``).  Because each generation
+    only records *new or changed* files, summing only the latest generation
+    would undercount the full corpus.  We therefore parse all ``.mhl`` files in
+    the same ``ascmhl/`` directory in filename order (which matches the
+    ``sequencenr`` order in ``ascmhl_chain.xml``).
 
-    A verification pass re-records every file with ``action="verified"`` at the same size, so naively summing all
-    generations double- (or triple-) counts files that appear in multiple passes.  We deduplicate by relative path: the
-    first generation to record a path wins its size; later occurrences of the same path are skipped.
+    A verification pass re-records every file with ``action="verified"`` at the
+    same size, so naively summing all generations double- (or triple-) counts
+    files that appear in multiple passes.  We deduplicate by relative path: the
+    first generation to record a path wins its size; later occurrences of the
+    same path are skipped.
     """
 
     ascmhl_dir = latest_mhl.parent  # the ascmhl/ folder
@@ -580,9 +626,10 @@ def _manifest_weights(mhl_files: "list[Path]", size_only: bool) -> "dict[Path, i
     """
     Per-manifest progress-bar weights: byte volume normally, count under -S.
 
-    Size-only reads no file bytes (one stat() per entry), so byte weights are meaningless — every manifest finishes
-    near-instantly. Weighting each manifest equally then makes the bar track manifest count instead of a byte total that
-    would jump straight to full.
+    Size-only reads no file bytes (one stat() per entry), so byte weights are
+    meaningless — every manifest finishes near-instantly. Weighting each
+    manifest equally then makes the bar track manifest count instead of a byte
+    total that would jump straight to full.
     """
     if size_only:
         return dict.fromkeys(mhl_files, 1)

@@ -1,8 +1,10 @@
 """
-The data model (FileResult / ManifestResult) and the writer for mhlver's `--report` log.
+The data model (FileResult / ManifestResult) and the writer for mhlver's
+`--report` log.
 
-Kept separate from the terminal-output path so the streaming log behaviour isn't affected. Used only by mhlver today;
-it lives alongside hashing and verify_results as the cross-dialect layer that survives the ASC-MHL absorption.
+Kept separate from the terminal-output path so the streaming log behaviour isn't
+affected. Used only by mhlver today; it lives alongside hashing and
+verify_results as the cross-dialect layer that survives the ASC-MHL absorption.
 """
 
 import getpass
@@ -16,18 +18,25 @@ from typing import TextIO
 from mhl_suite import __version__
 from mhl_suite.osutils import friendly_hostname
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Report data model
-# ---------------------------------------------------------------------------------------------------------------------
-# FileResult and ManifestResult are populated from each backend's structured result when --report is requested. They are
-# kept entirely separate from the terminal output path so that the existing streaming log behaviour is not affected.
+# -----------------------------------------------------------------------------
+# FileResult and ManifestResult are populated from each backend's structured
+# result when --report is requested. They are kept entirely separate from the
+# terminal output path so that the existing streaming log behaviour is not
+# affected.
 #
-# status values: "ok"        — file verified successfully "missing"   — file not found on disk "mismatch"  — hash (or
-#   size) does not match the manifest "new"       — file found on disk but not recorded in ASC-MHL history "error"     —
-#   any other per-file problem (traversal block, bad algo, etc.)
+# status values:
+#   * "ok"        — file verified successfully
+#   * "missing"   — file not found on disk
+#   * "mismatch"  — hash (or size) does not match the manifest
+#   * "new".      — file found on disk but not recorded in ASC-MHL history
+#   * "error"     — any other per-file problem (traversal block, bad algo, etc.)
 #
-# manifest_status values: "ok"        — all files verified "failed"    — one or more per-file failures "error"     —
-#   manifest-level failure (malformed XML, backend not found, etc.)
+# manifest_status values:
+#   * "ok"        — all files verified
+#   * "failed"    — one or more per-file failures
+#   * "error"     — manifest-level failure (malformed XML, etc.)
 
 
 @dataclass
@@ -84,9 +93,9 @@ class ManifestResult:
         return len(self.file_results)
 
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Report file
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 @contextmanager
@@ -94,11 +103,13 @@ def _open_report(src: Path) -> Iterator[tuple[TextIO, Path]]:
     """
     Open a timestamped report log next to `src` and yield (file, path).
 
-    Context-manager form ensures the file is always closed and we don't have to thread try/finally through the main
-    flow. The path is yielded so we can echo it on completion ("report saved to: ...").
+    Context-manager form ensures the file is always closed and we don't have to
+    thread try/finally through the main flow. The path is yielded so we can echo
+    it on completion ("report saved to: ...").
 
-    Unlike the old streaming approach, this file handle is only used by _render_report() which writes the complete
-    structured report at the end of the verification run. Nothing is written here at open time.
+    Unlike the old streaming approach, this file handle is only used by
+    _render_report() which writes the complete structured report at the end of
+    the verification run. Nothing is written here at open time.
     """
     report_dir = src if src.is_dir() else src.parent
     timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
@@ -127,14 +138,15 @@ def _summary_line(
     n_manifests: int | None = None,
 ) -> str:
     """
-    Build the ' | '-joined verdict line shared by the global summary and
-    each per-manifest sub-summary. Pass n_manifests=None to omit the manifest count (per-manifest lines don't repeat
-    it).
+    Build the ' | '-joined verdict line shared by the global summary and each
+    per-manifest sub-summary. Pass n_manifests=None to omit the manifest count
+    (per-manifest lines don't repeat it).
 
-    When the run passed but relied on weak (non-hash) checks — size-only or existence-only <null> entries — the verdict
-    names which kinds were used and, when warn_weak is set, is downgraded to ⚠️ VERIFIED WITH WARNINGS. The two kinds
-    are labelled distinctly: an existence-only entry checked neither hash nor size, so it must not read as a SIZE-ONLY
-    check."""
+    When the run passed but relied on weak (non-hash) checks — size-only or
+    existence-only <null> entries — the verdict names which kinds were used and,
+    when warn_weak is set, is downgraded to ⚠️ VERIFIED WITH WARNINGS. The two
+    kinds are labelled distinctly: an existence-only entry checked neither hash
+    nor size, so it must not read as a SIZE-ONLY check."""
     n_weak = n_size_only + n_existence_only
     if not passed:
         verdict = "❌ FAILED"
@@ -180,7 +192,7 @@ def _render_report(
     def line(s: str = "") -> None:
         fh.write(s + "\n")
 
-    # -- Header -------------------------------------------------------------------------------------------------------
+    # -- Header ---------------------------------------------------------------
     line(_SEP_HEAVY)
     line("MHL Verification Report")
     line(_SEP_HEAVY)
@@ -212,7 +224,7 @@ def _render_report(
     n_size_only = sum(mr.n_size_only for mr in manifest_results)
     n_existence_only = sum(mr.n_existence_only for mr in manifest_results)
 
-    # -- Summary ------------------------------------------------------------------------------------------------------
+    # -- Summary --------------------------------------------------------------
     line("Summary")
     line(_SEP_LIGHT)
     line(
@@ -232,9 +244,9 @@ def _render_report(
     )
     line()
 
-    # -- Issues -------------------------------------------------------------------------------------------------------
-    # Everything that isn't a clean OK, pulled to the top across all manifests Omitted entirely when there's nothing to
-    # show.
+    # -- Issues ---------------------------------------------------------------
+    # Everything that isn't a clean OK, pulled to the top across all manifests
+    # Omitted entirely when there's nothing to show.
     issue_lines: list[str] = []
     for mr in manifest_results:
         if mr.manifest_status == "error":
@@ -249,21 +261,23 @@ def _render_report(
             line(s)
         line()
 
-    # -- Manifests ----------------------------------------------------------------------------------------------------
+    # -- Manifests ------------------------------------------------------------
     if manifest_results:
         line("Manifest" if n_manifests == 1 else "Manifests")
         line(_SEP_LIGHT)
 
     for mr in manifest_results:
-        # Manifest header line — show the .mhl path (for classic MHL) or the asc-mhl directory (for ASC-MHL)
+        # Manifest header line — show the .mhl path (for classic MHL) or the
+        # asc-mhl directory (for ASC-MHL)
         line(f"📄 {mr.manifest_path}")
 
         if mr.manifest_status == "error":
             line(f"    ✗ {mr.manifest_error or 'manifest-level error'}")
             continue
 
-        # Per-manifest sub-summary — same fields as the global verdict minus the manifest count. New/untracked is a
-        # warning, not a verification failure, so it doesn't flip the manifest's PASSED/FAILED state.
+        # Per-manifest sub-summary — same fields as the global verdict minus the
+        # manifest count. New/untracked is a warning, not a verification
+        # failure, so it doesn't flip the manifest's PASSED/FAILED state.
         line(
             _summary_line(
                 passed=mr.n_missing == 0 and mr.n_mismatch == 0 and mr.n_error == 0,
@@ -287,13 +301,15 @@ def _render_report(
 
 def _format_file_result(fr: "FileResult", indent: str = "    ") -> str:
     """
-    Return the report line(s) for a single FileResult (without trailing newline).
+    Return the report line(s) for a single FileResult (without trailing
+    newline).
 
-    `indent` is the leading whitespace for the primary line; the Details section indents under its manifest header (4
-    spaces) while the Issues section sits at column 0. Continuation (detail) lines are indented `indent` + 3 spaces.
+    `indent` is the leading whitespace for the primary line; the Details section
+    indents under its manifest header (4 spaces) while the Issues section sits
+    at column 0. Continuation (detail) lines are indented `indent` + 3 spaces.
 
-    Mismatch entries with detail render across two lines, using the label embedded in the detail string (e.g. "hash
-    mismatch", "size mismatch"):
+    Mismatch entries with detail render across two lines, using the label
+    embedded in the detail string (e.g. "hash mismatch", "size mismatch"):
 
         ❌ hash mismatch: path/to/file.mxf
            (calc xxh64: abc123 | stored xxh64: def456)

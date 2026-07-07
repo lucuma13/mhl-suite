@@ -1,19 +1,20 @@
 """
 ASC-MHL verification engine.
 
-The in-process entry point mhlver drives. It mirrors classic_verify's contract: never prints, never sys.exit()s,
-returns a structured report whose VerifyEntries mhlver maps straight onto its own report model — no stdout round-trip,
-no regex parsing.
+The in-process entry point mhlver drives. It mirrors classic_verify's contract:
+never prints, never sys.exit()s, returns a structured report whose VerifyEntries
+mhlver maps straight onto its own report model — no stdout round-trip, no regex
+parsing.
 
-Hashing/parsing uses the reference `mhllib` for ASC-MHL, while the verify loop itself lives here so we can drive the
-suite's adaptive parallel hasher (mhl_suite.hashing) and emit truthful per-file progress — neither of which the
+Hashing/parsing uses the reference `mhllib` for ASC-MHL, while the verify loop
+itself lives here so we can drive the suite's adaptive parallel hasher
+(mhl_suite.hashing) and emit truthful per-file progress — neither of which the
 library's own verify exposes.
 """
 
 import os
 import time
 from dataclasses import dataclass
-from functools import partial
 from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,10 +38,12 @@ if TYPE_CHECKING:
 
     from ascmhl.hashlist import MHLMediaHash
 
-# NOTE: we check only the first `original` hash entry per file (find_original_hash_entry_for_path), so a file recorded
-# with several formats (the XSD allows one of each: c4/md5/sha1/xxh128/xxh3/xxh64) is verified on just one — there is no
-# ASC equivalent of classic's `-a all` yet. A future multi-hash mode should arrive as verify_ascmhl(..., algorithm=...)
-# mirroring classic_verify.verify_classic's shape (None / list of tags / "all").
+# NOTE: we check only the first `original` hash entry per file
+# (find_original_hash_entry_for_path), so a file recorded with several formats
+# (the XSD allows one of each: c4/md5/sha1/xxh128/xxh3/xxh64) is verified on
+# just one — there is no ASC equivalent of classic's `-a all` yet. A future
+# multi-hash mode should arrive as verify_ascmhl(..., algorithm=...) mirroring
+# classic_verify.verify_classic's shape (None / list of tags / "all").
 
 
 def verify_ascmhl(
@@ -52,16 +55,20 @@ def verify_ascmhl(
     """
     Verify the ASC-MHL package rooted at `root_path` in-process.
 
-    `root_path` is the directory the manifest describes (the parent of the `ascmhl/` folder). `size_only` checks
-    recorded sizes against disk without hashing media (see _verify_sizes); `on_progress`, given, is called with each
-    chunk's byte size as files are hashed, so a caller can drive a progress bar — the ASC-MHL counterpart to
-    classic_verify.verify_classic(size_only=, on_progress=).
+    `root_path` is the directory the manifest describes (the parent of the
+    `ascmhl/` folder). `size_only` checks recorded sizes against disk without
+    hashing media (see _verify_sizes); `on_progress`, given, is called with each
+    chunk's byte size as files are hashed, so a caller can drive a progress bar
+    — the ASC-MHL counterpart to classic_verify.verify_classic(size_only=,
+    on_progress=).
 
-    Returns a verify_results.VerifyReport (same type as classic verify). `code` is the ASC-MHL exit code (see
-    ascmhl.errors): 0 clean, 10 missing files, 11 hash mismatch, 20 single-file-not-found, 21 new files, 30/31/32/33
-    history/chain/manifest problems — plus 13 for a size mismatch on the size-only path (a suite extension; ascmhl has
-    no size check). Failure is signalled by `code`, never by an exception or process exit; `report.ok` (clean vs failed)
-    and `report.code` (the precise category) give the result.
+    Returns a verify_results.VerifyReport (same type as classic verify). `code`
+    is the ASC-MHL exit code (see ascmhl.errors): 0 clean, 10 missing files, 11
+    hash mismatch, 20 single-file-not-found, 21 new files, 30/31/32/33
+    history/chain/manifest problems — plus 13 for a size mismatch on the
+    size-only path (a suite extension; ascmhl has no size check). Failure is
+    signalled by `code`, never by an exception or process exit; `report.ok`
+    (clean vs failed) and `report.code` (the precise category) give the result.
     """
     if size_only:
         return _verify_sizes(root_path)
@@ -71,8 +78,9 @@ def verify_ascmhl(
         _verify_entire_folder(str(root_path), entries, on_progress=on_progress)
         code = 0
     except click.ClickException as exc:
-        # Every ascmhl failure mode is a click.ClickException subclass carrying an `exit_code` (see ascmhl.errors).
-        # Anything else is a genuine bug and propagates.
+        # Every ascmhl failure mode is a click.ClickException subclass carrying
+        # an `exit_code` (see ascmhl.errors). Anything else is a genuine bug and
+        # propagates.
         code = getattr(exc, "exit_code", 1)
     return VerifyReport(entries=entries, code=code)
 
@@ -86,10 +94,12 @@ def _verify_entire_folder(
     """
     Hash every file recorded in the ASC-MHL history and compare to disk.
 
-    A faithful reimplementation of ascmhl.commands.verify_entire_folder (file verify, no directory-hash / single-file /
-    packing-list modes), split into two passes so the hashing runs through mhl_suite.hashing's adaptive parallel
-    controller and fills `report` with structured VerifyEntries. Raises the same ascmhl.errors exceptions on failure
-    (their exit_code drives verify_ascmhl's `code`); the library's logger is never touched, so the caller owns all
+    A faithful reimplementation of ascmhl.commands.verify_entire_folder (file
+    verify, no directory-hash / single-file / packing-list modes), split into
+    two passes so the hashing runs through mhl_suite.hashing's adaptive parallel
+    controller and fills `report` with structured VerifyEntries. Raises the same
+    ascmhl.errors exceptions on failure (their exit_code drives verify_ascmhl's
+    `code`); the library's logger is never touched, so the caller owns all
     output.
     """
     if not Path(root_path).is_absolute():
@@ -99,25 +109,29 @@ def _verify_entire_folder(
     if len(existing_history.hash_lists) == 0:
         raise errors.NoMHLHistoryException(root_path)
 
-    # Collect everything we expect to find; discard each as we meet it on disk so what remains is the set of missing
-    # files.
+    # Collect everything we expect to find; discard each as we meet it on disk
+    # so what remains is the set of missing files.
     not_found_paths = existing_history.set_of_file_paths()
     renamed_files = existing_history.renamed_path_with_previous_path()
     not_found_paths = {p if renamed_files.get(p, None) is None else renamed_files[p] for p in not_found_paths}
 
-    # The ASC-MHL default ignore set (.DS_Store, ascmhl) is mandated by the specification to always apply — those files
-    # and directories mutate as a history is appended, so no records for them can exist and they must never be flagged
-    # as new. MHLIgnoreSpec drops the defaults whenever the recorded pattern list is non-empty, so a foreign manifest
-    # that recorded custom patterns without the defaults would make verify descend into ascmhl/ and report the manifests
-    # and chain as new files. Passing default_ignore_list() as the on-top list guarantees the defaults are always
-    # present (a no-op de-dup for the reference tool, which already records them).
+    # The ASC-MHL default ignore set (.DS_Store, ascmhl) is mandated by the
+    # specification to always apply — those files and directories mutate as a
+    # history is appended, so no records for them can exist and they must never
+    # be flagged as new. MHLIgnoreSpec drops the defaults whenever the recorded
+    # pattern list is non-empty, so a foreign manifest that recorded custom
+    # patterns without the defaults would make verify descend into ascmhl/ and
+    # report the manifests and chain as new files. Passing default_ignore_list()
+    # as the on-top list guarantees the defaults are always present (a no-op
+    # de-dup for the reference tool, which already records them).
     ignore_spec = MHLIgnoreSpec(existing_history.latest_ignore_patterns(), default_ignore_list())
 
     deferred = _collect_deferred(existing_history, root_path, ignore_spec, not_found_paths, report)
     num_failed_verifications = _hash_and_compare(deferred, report, on_progress)
 
-    # Record still-missing files (mirroring test_for_missing_files' ignore filter), then let it raise the
-    # completeness-check exception (exit 10) if any remain.
+    # Record still-missing files (mirroring test_for_missing_files' ignore
+    # filter), then let it raise the completeness-check exception (exit 10) if
+    # any remain.
     ignore_path_spec = ignore_spec.get_path_spec()
     for path in not_found_paths:
         if ignore_path_spec.match_file(path):
@@ -125,8 +139,9 @@ def _verify_entire_folder(
         rel = Path(path).relative_to(root_path).as_posix()
         report.append(VerifyEntry(path=rel, status="missing", line=f"[ERROR] missing file: {rel}"))
 
-    # Exception precedence mirrors ascmhl.commands.verify_entire_folder exactly: a hash mismatch (11) trumps new files
-    # (21), which trump "no file found at all" (20), which trumps a missing-file completeness failure (10).
+    # Exception precedence mirrors ascmhl.commands.verify_entire_folder exactly:
+    # a hash mismatch (11) trumps new files (21), which trump "no file found at
+    # all" (20), which trumps a missing-file completeness failure (10).
     exception = test_for_missing_files(not_found_paths, root_path, ignore_spec)
     if not deferred:
         exception = errors.SingleFileNotFoundException()
@@ -148,10 +163,11 @@ def _collect_deferred(
     """
     PASS 1 — traverse the tree, resolve each file against the history.
 
-    New files (no recorded hash) read no bytes and are reported inline; files needing a hash are returned as
-    `(file_path, rel_path, original_hash_entry, size)` tuples in post-order-lexicographic traversal order so PASS
-    2's emit order matches the library's inline order. `not_found_paths` is discarded in place as files are met on disk,
-    leaving the still-missing set.
+    New files (no recorded hash) read no bytes and are reported inline; files
+    needing a hash are returned as `(file_path, rel_path, original_hash_entry,
+    size)` tuples in post-order-lexicographic traversal order so PASS 2's emit
+    order matches the library's inline order. `not_found_paths` is discarded in
+    place as files are met on disk, leaving the still-missing set.
     """
     deferred: list[tuple[str, str, object, int]] = []
     for folder_path, children in post_order_lexicographic(root_path, ignore_spec.get_path_spec()):
@@ -162,14 +178,19 @@ def _collect_deferred(
                 continue
             rel_path, original_hash_entry = _find_original_hash_entry(existing_history, file_path)
             if original_hash_entry is None:
-                # No `action="original"` hash exists for this on-disk file, so we report it as a new/unknown file. This
-                # also swallows a degenerate-but-XSD-compliant case: a file whose only recorded hash across all
-                # generations is `action="failed"`. Such a file is recorded in the manifest — so "new file" is arguably
-                # inaccurate — but it has no usable hash either, and the spec defines no outcome for a
-                # recorded-yet-unverifiable file. We follow the reference implementation here, which treats a missing
-                # original as "new file", rather than inventing a distinct "unverifiable" or "already-failed".
+                # No `action="original"` hash exists for this on-disk file, so
+                # we report it as a new/unknown file. This also swallows a
+                # degenerate-but-XSD-compliant case: a file whose only recorded
+                # hash across all generations is `action="failed"`. Such a file
+                # is recorded in the manifest — so "new file" is arguably
+                # inaccurate — but it has no usable hash either, and the spec
+                # defines no outcome for a recorded-yet-unverifiable file. We
+                # follow the reference implementation here, which treats a
+                # missing original as "new file", rather than inventing a
+                # distinct "unverifiable" or "already-failed".
                 #
-                # The library's rel_path uses the native separator (os.path.relpath); the report keeps the canonical
+                # The library's rel_path uses the native separator
+                # (os.path.relpath); the report keeps the canonical
                 # forward-slash form, so normalise here.
                 rel = Path(rel_path).as_posix()
                 report.append(VerifyEntry(path=rel, status="new", line=f"[ERROR] new file found: {rel}"))
@@ -187,13 +208,16 @@ def _find_original_hash_entry(existing_history: MHLHistory, file_path: str) -> "
     """
     Resolve an absolute file path to its ORIGINAL hash entry.
 
-    Routes the path to its owning history, follows a recorded ``previousPath`` back to the pre-rename name, then returns
-    the first-generation entry for it. Returns ``(rel_path, original_hash_entry | None)`` where ``rel_path`` is
-    native-separator and relative to the top history root (the report normalises it to forward slashes); ``None`` means
-    the path has no original record (a new file).
+    Routes the path to its owning history, follows a recorded ``previousPath``
+    back to the pre-rename name, then returns the first-generation entry for it.
+    Returns ``(rel_path, original_hash_entry | None)`` where ``rel_path`` is
+    native-separator and relative to the top history root (the report normalises
+    it to forward slashes); ``None`` means the path has no original record (a
+    new file).
 
-    Shared by the hash path (``_collect_deferred``) and the size path (``verify_ascmhl_sizes``) so both group files
-    across generations identically.
+    Shared by the hash path (``_collect_deferred``) and the size path
+    (``verify_ascmhl_sizes``) so both group files across generations
+    identically.
     """
     rel_path = existing_history.get_relative_file_path(file_path)
     history, history_rel_path = existing_history.find_history_for_path(rel_path)
@@ -216,8 +240,9 @@ def _hash_and_compare(
     """
     PASS 2 — hash the deferred files in parallel, compare, fill `report`.
 
-    Returns the number of hash mismatches. Hashing is driven through mhl_suite.hashing's adaptive controller so ASC-MHL
-    verify gets the same auto-tuned concurrency as classic MHL.
+    Returns the number of hash mismatches. Hashing is driven through
+    mhl_suite.hashing's adaptive controller so ASC-MHL verify gets the same
+    auto-tuned concurrency as classic MHL.
     """
     if not deferred:
         return 0
@@ -226,8 +251,9 @@ def _hash_and_compare(
     sizes = [d[3] for d in deferred]
     calib_format = deferred[0][2].hash_format
 
-    jobs: list[Callable[[], str]] = [
-        partial(_hash_file, fp, entry.hash_format, on_progress) for fp, _r, entry, _s in deferred
+    jobs: list[Callable[[Callable[[int], None]], str]] = [
+        (lambda mon, fp=fp, fmt=entry.hash_format: _hash_file(fp, fmt, hashing._chain_progress(on_progress, mon)))
+        for fp, _r, entry, _s in deferred
     ]
     hashed = hashing._hash_jobs_auto(paths, sizes, jobs, lambda: _calibrate_hash_bw(calib_format))
 
@@ -258,9 +284,10 @@ def _hash_file(filepath: str, hash_format: str, on_progress: "Callable[[int], No
     """
     Hash `filepath` with the library's incremental hasher, reporting progress.
 
-    The library's own ascmhl.hasher.hash_file reads in chunks but exposes no progress hook, so we own the read loop here
-    (using its hasher classes) to advance a progress bar within large files — `on_progress(nbytes)` fires per chunk and
-    may run on a worker thread.
+    The library's own ascmhl.hasher.hash_file reads in chunks but exposes no
+    progress hook, so we own the read loop here (using its hasher classes) to
+    advance a progress bar within large files — `on_progress(nbytes)` fires per
+    chunk and may run on a worker thread.
     """
     hasher = new_hasher_for_hash_type(hash_format)
     with open(filepath, "rb") as f:
@@ -275,9 +302,11 @@ def _calibrate_hash_bw(hash_format: str) -> float:
     """
     In-RAM hashing throughput (bytes/sec) for an ASC-MHL hash format.
 
-    mhl_suite.hashing's adaptive controller needs the pure-CPU hash bandwidth to decide whether the disk can outrun a
-    single hash thread. mhl_suite.hashing only knows md5/sha1/xxh64; ASC-MHL also uses xxh128/xxh3/c4, so this
-    calibrates against the library's own incremental hasher. Mirrors mhl_suite.hashing._calibrate_hash_bw.
+    mhl_suite.hashing's adaptive controller needs the pure-CPU hash bandwidth to
+    decide whether the disk can outrun a single hash thread. mhl_suite.hashing
+    only knows md5/sha1/xxh64; ASC-MHL also uses xxh128/xxh3/c4, so this
+    calibrates against the library's own incremental hasher. Mirrors
+    mhl_suite.hashing._calibrate_hash_bw.
     """
     buf = bytes(hashing.HASH_CHUNK_SIZE)
     hasher = new_hasher_for_hash_type(hash_format)
@@ -290,18 +319,21 @@ def _calibrate_hash_bw(hash_format: str) -> float:
     return done / elapsed if elapsed > 0 else float("inf")
 
 
-# ---------------------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Size-only verification.
 #
-# The ASC-MHL library's `verify` always re-hashes the whole package; there is no size-only mode. So we drive our own
-# check off the same loaded MHLHistory the hash path uses (mhl_suite.ascmhl_verify._verify_entire_folder and the
-# reference's verify_entire_folder): for every recorded file — across the top history and every nested child history —
-# we compare the original generation's recorded size to the file on disk, reading no file bytes (one stat() per entry).
-# Grouping across generations, rename (previousPath) resolution and child-history descent are therefore consistent with
-# ASC-MHL reference implementation. ASC-MHL's <path size> is defined as an optional attribute on the specification,
-# whose absence has no defined meaning, so such a file is existence-checked only, not failed. Driven by _verify_sizes
-# below.
-# ---------------------------------------------------------------------------------------------------------------------
+# The ASC-MHL library's `verify` always re-hashes the whole package; there is no
+# size-only mode. So we drive our own check off the same loaded MHLHistory the
+# hash path uses (mhl_suite.ascmhl_verify._verify_entire_folder and the
+# reference's verify_entire_folder): for every recorded file — across the top
+# history and every nested child history — we compare the original generation's
+# recorded size to the file on disk, reading no file bytes (one stat() per
+# entry). Grouping across generations, rename (previousPath) resolution and
+# child-history descent are therefore consistent with ASC-MHL reference
+# implementation. ASC-MHL's <path size> is defined as an optional attribute on
+# the specification, whose absence has no defined meaning, so such a file is
+# existence-checked only, not failed. Driven by _verify_sizes below.
+# -----------------------------------------------------------------------------
 
 
 @dataclass
@@ -309,10 +341,11 @@ class SizeCheckResult:
     """
     Outcome of a single size-only check for one recorded ASC-MHL entry.
 
-    `status` is one of "ok" | "missing" | "mismatch". For "ok", `detail` holds the human-readable size ("size: 4170",
-    or "size: not recorded" when the file exists but the optional <path size> was omitted); for a mismatch it carries
-    the reason in the same shape the report formatter expects ("size mismatch: calc size: … | stored size: …",
-    "blocked traversal attempt").
+    `status` is one of "ok" | "missing" | "mismatch". For "ok", `detail` holds
+    the human-readable size ("size: 4170", or "size: not recorded" when the file
+    exists but the optional <path size> was omitted); for a mismatch it carries
+    the reason in the same shape the report formatter expects ("size mismatch:
+    calc size: … | stored size: …", "blocked traversal attempt").
     """
 
     path: str
@@ -322,53 +355,62 @@ class SizeCheckResult:
 
 def verify_ascmhl_sizes(existing_history: MHLHistory, root_path: "str | Path") -> list[SizeCheckResult]:
     """
-    Size-only verify a loaded ASC-MHL history, returning one result per recorded file.
+    Size-only verify a loaded ASC-MHL history, returning one result per recorded
+    file.
 
-    ``existing_history`` is the ``MHLHistory`` loaded by ``_verify_sizes`` (its load doubles as the integrity gate);
-    ``root_path`` is the package root (parent of the top ``ascmhl/`` folder). The recorded file set comes from
-    ``existing_history.set_of_file_paths()``, which spans the top history AND every nested child history, and a recorded
-    rename contributes only its post-rename path (via ``renamed_path_with_previous_path``) — exactly as the hash path
-    builds its set. For each file we take the first generation's recorded size
-    (``_find_original_hash_entry(...).media_hash.file_size``), so generation grouping and rename resolution match the
-    reference by construction rather than being re-derived from XML.
+    ``existing_history`` is the ``MHLHistory`` loaded by ``_verify_sizes`` (its
+    load doubles as the integrity gate); ``root_path`` is the package root
+    (parent of the top ``ascmhl/`` folder). The recorded file set comes from
+    ``existing_history.set_of_file_paths()``, which spans the top history AND
+    every nested child history, and a recorded rename contributes only its
+    post-rename path (via ``renamed_path_with_previous_path``) — exactly as the
+    hash path builds its set. For each file we take the first generation's
+    recorded size (``_find_original_hash_entry(...).media_hash.file_size``), so
+    generation grouping and rename resolution match the reference by
+    construction rather than being re-derived from XML.
 
-    Each entry compares that recorded size to the file on disk — no bytes are read. Results, in sorted-path order:
-      * ok        — the file exists and its size matches, or the file exists but the record stored no size (the
-                    ``<path size>`` attribute is optional in ASC-MHL)
+    Each entry compares that recorded size to the file on disk — no bytes are
+    read. Results, in sorted-path order:
+      * ok        — the file exists and its size matches, or the file exists but
+                    the record stored no size (the ``<path size>`` attribute is
+                    optional in ASC-MHL)
       * missing   — the file is not on disk
       * mismatch  — the size differs, or the path escapes the root
 
-    Path matching reuses ``resolve_on_disk`` so NFC/NFD filename forms reconcile exactly as simple-mhl's verify does.
+    Path matching reuses ``resolve_on_disk`` so NFC/NFD filename forms reconcile
+    exactly as simple-mhl's verify does.
     """
     root_path = os.path.abspath(str(root_path))
-    # Trailing separator avoids prefix-collision: '/foo' matches '/foo/bar' but not '/foobar' — the same jail check
-    # simple_mhl.verify applies.
+    # Trailing separator avoids prefix-collision: '/foo' matches '/foo/bar' but
+    # not '/foobar' — the same jail check simple_mhl.verify applies.
     root_path_with_sep = root_path + os.sep
 
-    # The full recorded set across the top history and all nested child histories; a rename contributes its post-rename
-    # path only, mirroring _verify_entire_folder's not_found_paths construction.
+    # The full recorded set across the top history and all nested child
+    # histories; a rename contributes its post-rename path only, mirroring
+    # _verify_entire_folder's not_found_paths construction.
     recorded_paths = existing_history.set_of_file_paths()
     renamed_files = existing_history.renamed_path_with_previous_path()
     recorded_paths = {p if renamed_files.get(p, None) is None else renamed_files[p] for p in recorded_paths}
 
     results: list[SizeCheckResult] = []
-    # Per-call cache of directory listings used by resolve_on_disk; a fresh view per verify run (never module-global) so
-    # a stale listing can't leak across runs.
+    # Per-call cache of directory listings used by resolve_on_disk; a fresh view
+    # per verify run (never module-global) so a stale listing can't leak across
+    # runs.
     dir_index: dict[str, dict[str, str]] = {}
 
     for abs_path in sorted(recorded_paths):
         rel_native = os.path.relpath(abs_path, root_path)
         rel_posix = Path(rel_native).as_posix()
 
-        # Path traversal guard: collapse '..'/'.' then require the result inside root, blocking a malicious manifest
-        # pointing at "../../etc/passwd".
+        # Path traversal guard: collapse '..'/'.' then require the result inside
+        # root, blocking a malicious manifest pointing at "../../etc/passwd".
         jailed = os.path.normpath(abs_path)
         if jailed != root_path and not jailed.startswith(root_path_with_sep):
             results.append(SizeCheckResult(rel_posix, "mismatch", "blocked traversal attempt"))
             continue
 
-        # A recorded path with no original file entry is a directory hash or a nested child-history reference, not a
-        # file to size-check.
+        # A recorded path with no original file entry is a directory hash or a
+        # nested child-history reference, not a file to size-check.
         _rel, original_hash_entry = _find_original_hash_entry(existing_history, abs_path)
         if original_hash_entry is None:
             continue
@@ -378,12 +420,15 @@ def verify_ascmhl_sizes(existing_history: MHLHistory, root_path: "str | Path") -
             results.append(SizeCheckResult(rel_posix, "missing"))
             continue
 
-        # The ASC-MHL <path size> attribute is optional and the specification assigns no meaning to its absence, so a
-        # record without it simply has no size to compare. We confirm the file exists (above) and leave its size
-        # unchecked. This deliberately differs from classic MHL, whose schema makes <size> a required positiveInteger,
-        # so there a missing size is a genuine malformation worth failing.
-        # media_hash is a runtime backref the library attaches in MHLMediaHash.append_hash but never declares on
-        # MHLHashEntry, so pull it through getattr with an explicit type rather than tripping the type checker.
+        # The ASC-MHL <path size> attribute is optional and the specification
+        # assigns no meaning to its absence, so a record without it simply has
+        # no size to compare. We confirm the file exists (above) and leave its
+        # size unchecked. This deliberately differs from classic MHL, whose
+        # schema makes <size> a required positiveInteger, so there a missing
+        # size is a genuine malformation worth failing. media_hash is a runtime
+        # backref the library attaches in MHLMediaHash.append_hash but never
+        # declares on MHLHashEntry, so pull it through getattr with an explicit
+        # type rather than tripping the type checker.
         owning_media_hash: MHLMediaHash | None = getattr(original_hash_entry, "media_hash", None)
         recorded_size = owning_media_hash.file_size if owning_media_hash is not None else None
         if recorded_size is None:
@@ -411,17 +456,22 @@ def verify_ascmhl_sizes(existing_history: MHLHistory, root_path: "str | Path") -
 
 def _verify_sizes(root_path: "str | Path") -> VerifyReport:
     """
-    Size-only verify: load the history (integrity gate + source), then compare recorded sizes to disk.
+    Size-only verify: load the history (integrity gate + source), then compare
+    recorded sizes to disk.
 
-    A single ``MHLHistory.load_from_path`` does double duty, reading no media bytes: loading validates the chain file
-    and each generation manifest's own hash (the integrity gate), and the loaded history is also the source of recorded
-    sizes and nested child histories that ``verify_ascmhl_sizes`` walks — so the size check groups files exactly as the
-    hash path (and the reference) does. A malformed manifest/chain surfaces as MALFORMED_XML; a modified manifest or
-    missing history surfaces its own ascmhl exit code (30/31/32/33) via the raised ClickException.
+    A single ``MHLHistory.load_from_path`` does double duty, reading no media
+    bytes: loading validates the chain file and each generation manifest's own
+    hash (the integrity gate), and the loaded history is also the source of
+    recorded sizes and nested child histories that ``verify_ascmhl_sizes`` walks
+    — so the size check groups files exactly as the hash path (and the
+    reference) does. A malformed manifest/chain surfaces as MALFORMED_XML; a
+    modified manifest or missing history surfaces its own ascmhl exit code
+    (30/31/32/33) via the raised ClickException.
 
-    Codes: 0 all match (a record with no stored size is not a failure — ASC-MHL's <path size> is optional); 10 a
-    referenced file is missing; 13 a size mismatch (or a blocked-traversal size failure) — `13` is distinct from `11`
-    so size failures don't masquerade as hash failures.
+    Codes: 0 all match (a record with no stored size is not a failure —
+    ASC-MHL's <path size> is optional); 10 a referenced file is missing; 13 a
+    size mismatch (or a blocked-traversal size failure) — `13` is distinct from
+    `11` so size failures don't masquerade as hash failures.
     """
     try:
         existing_history = MHLHistory.load_from_path(str(root_path))
@@ -473,8 +523,9 @@ def _bundled_xsd_path(schema_name: str) -> str:
     """
     Absolute path to a bundled XSD shipped in the mhl_suite.xsd package.
 
-    The pip-installed `ascmhl` wheel does NOT ship the XSD files (upstream loads them from a CWD-relative `xsd/` path
-    that only resolves inside a repo checkout), so schema validation uses our own bundled copy regardless of the
+    The pip-installed `ascmhl` wheel does NOT ship the XSD files (upstream loads
+    them from a CWD-relative `xsd/` path that only resolves inside a repo
+    checkout), so schema validation uses our own bundled copy regardless of the
     library. Raises FileNotFoundError if the schema is missing.
     """
     path = files("mhl_suite.xsd") / schema_name
@@ -487,11 +538,13 @@ def schema_check(file_path: "str | Path", *, directory_file: bool = False) -> "t
     """
     Validate an ASC-MHL file against its bundled XSD, returning (code, lines).
 
-    `directory_file=True` validates an ascmhl_chain.xml against the directory schema; otherwise a manifest is validated
-    against ASCMHL.xsd. Mirrors classic_verify.schema_report: code is 0 (valid), 41 (schema non-compliant) or 40
-    (malformed/unreadable XML). Schema non-compliance has its own code, deliberately NOT the 11 ascmhl reuses for
-    hash-mismatch (see _exit_codes). A missing bundled XSD is a broken install, surfaced as the generic error code (1).
-    Never prints.
+    `directory_file=True` validates an ascmhl_chain.xml against the directory
+    schema; otherwise a manifest is validated against ASCMHL.xsd. Mirrors
+    classic_verify.schema_report: code is 0 (valid), 41 (schema non-compliant)
+    or 40 (malformed/unreadable XML). Schema non-compliance has its own code,
+    deliberately NOT the 11 ascmhl reuses for hash-mismatch (see _exit_codes). A
+    missing bundled XSD is a broken install, surfaced as the generic error code
+    (1). Never prints.
     """
     schema_name = "ASCMHLDirectory__combined.xsd" if directory_file else "ASCMHL.xsd"
     try:

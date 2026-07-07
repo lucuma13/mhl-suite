@@ -482,10 +482,14 @@ class TestSealConcurrency:
     @staticmethod
     def _force_parallel(monkeypatch):
         monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", 0)
+        monkeypatch.setattr(core_hashing, "_AUTO_WARMUP_SECONDS", 0.0)
+        monkeypatch.setattr(core_hashing, "_AUTO_PROBE_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
         monkeypatch.setattr(core_hashing, "_calibrate_hash_bw", lambda a: 1000.0)
         monkeypatch.setattr(core_hashing, "_calibrate_hash_bw_multi", lambda f: 1000.0)
-        monkeypatch.setattr(core_hashing, "_probe_read_bw", lambda p: 8000.0)  # read >> hash ⇒ parallel
+        monkeypatch.setattr(core_hashing, "_warmup_seq_bw", lambda nbytes, elapsed: 1000.0)
+        # aggregate >> sequential baseline ⇒ parallel
+        monkeypatch.setattr(core_hashing, "_probe_read_bw_multi", lambda slots, n: 8000.0)
 
     def test_auto_parallel_produces_correct_digests(self, mhl_cli, tmp_path, monkeypatch):
         make_tree(tmp_path, {"a.bin": b"hello", "sub/b.bin": b"world"})
@@ -504,6 +508,6 @@ class TestSealConcurrency:
         monkeypatch.setattr(core_hashing, "_calibrate_hash_bw", lambda a: 1000.0)
         monkeypatch.setattr(core_hashing, "_calibrate_hash_bw_multi", lambda f: 1000.0)
         probed: list[int] = []
-        monkeypatch.setattr(core_hashing, "_probe_read_bw", lambda p: probed.append(1) or 100.0)  # disk-bound
+        monkeypatch.setattr(core_hashing, "_probe_read_bw_multi", lambda slots, n: probed.append(1) or 100.0)
         simple_mhl.seal_classic(str(tmp_path), ["md5"], verbose=False)
         assert probed == [1], "the default must probe the disk to decide"

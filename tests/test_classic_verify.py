@@ -605,9 +605,12 @@ class TestVerifyConcurrency:
 
     def _force_parallel(self, monkeypatch):
         monkeypatch.setattr(hashing, "_AUTO_MIN_BYTES", 0)
+        monkeypatch.setattr(hashing, "_AUTO_WARMUP_SECONDS", 0.0)
+        monkeypatch.setattr(hashing, "_AUTO_PROBE_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
         monkeypatch.setattr(hashing, "_calibrate_hash_bw", lambda a: 1000.0)
-        monkeypatch.setattr(hashing, "_probe_read_bw", lambda p: 8000.0)  # read >> hash ⇒ parallel
+        monkeypatch.setattr(hashing, "_warmup_seq_bw", lambda nbytes, elapsed: 1000.0)
+        monkeypatch.setattr(hashing, "_probe_read_bw_multi", lambda slots, n: 8000.0)  # aggregate >> seq ⇒ parallel
         monkeypatch.setattr(hashing, "_AUTO_RECHECK_BYTES", 4096)  # several windows over tiny files
 
     def test_parallel_matches_sequential_clean(self, mhl_cli, tmp_path, monkeypatch):

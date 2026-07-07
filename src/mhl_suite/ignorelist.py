@@ -3,14 +3,16 @@ OS-junk ignore list.
 
 The set of OS-generated names that should never be sealed in a manifest.
 
-These files/dirs are rewritten by the system on its own (Finder, Spotlight, Time Machine, Windows Explorer) or back
-the filesystem itself. Hashing them would make a later `verify` fail with spurious mismatches and "new file" reports
-every time the OS touches them.
+These files/dirs are rewritten by the system on its own (Finder, Spotlight, Time
+Machine, Windows Explorer) or back the filesystem itself. Hashing them would
+make a later `verify` fail with spurious mismatches and "new file" reports every
+time the OS touches them.
 
-Matched case-sensitively against the exact-name set, or by prefix — the OS always writes these names with fixed
-casing, so an exact match can never drop a user file that differs only in case. Two macOS names carry a trailing
-carriage return as a literal byte in the on-disk name — the custom-folder "Icon\\r" and the HFS+ private hard-link
-directory — so they appear here with that '\\r'.
+Matched case-sensitively against the exact-name set, or by prefix — the OS
+always writes these names with fixed casing, so an exact match can never drop a
+user file that differs only in case. Two macOS names carry a trailing carriage
+return as a literal byte in the on-disk name — the custom-folder "Icon\\r" and
+the HFS+ private hard-link directory — so they appear here with that '\\r'.
 """
 
 OS_JUNK_NAMES = frozenset(
@@ -41,8 +43,8 @@ OS_JUNK_NAMES = frozenset(
     }
 )
 
-# macOS '._' AppleDouble resource forks (._MyClip.mov mirror the real name) and the boot '.disk_label' /
-# '.disk_label_2x' images — matched by prefix.
+# macOS '._' AppleDouble resource forks (._MyClip.mov mirror the real name) and
+# the boot '.disk_label' / '.disk_label_2x' images — matched by prefix.
 OS_JUNK_PREFIXES = ("._", ".disk_label")
 
 
