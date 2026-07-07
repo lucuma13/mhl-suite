@@ -9,8 +9,10 @@
 
 `mhl-suite` is a toolkit for sealing and verifying MHL files. It consists of two primary executables:
 
-* `mhlver`: one tool to verify them all. Recursively verifies every MHL file under a path (both classic flat MHL and ASC-MHL), with a per-file progress bar, reports and optional XSD schema validation. The official [ASC-MHL](https://github.com/ascmitc/mhl) library runs in-process alongside the classic-MHL engine from `simple-mhl`. Both verify with the same auto-tuned parallel hashing (it compares the hash and storage performance and parallelises only when that's faster), giving ASC-MHL verification a speed-up over the reference implementation.
-* `simple-mhl`: a modern sealing and verification tool, for classic flat MHL files. A successor of the discontinued [mhl-tool](https://github.com/pomfort/mhl-tool) and backwards compatible with legacy manifests - 2 to 5 times faster (automatically parallelises when it pays off), full support for standard `xxhash64be` hashes, correct NFC/NFD handling independently of the filesystem, XSD schema validation features, cleaner output and structured exit codes.
+* `mhlver`: one tool to verify them all. Recursively verifies every MHL file under a path (both classic flat MHL and ASC-MHL), with a per-file progress bar, reports and optional XSD schema validation. The official [ASC-MHL](https://github.com/ascmitc/mhl) library runs in-process alongside the classic-MHL engine from `simple-mhl`. Both verify with the same smart parallel hashing, giving ASC-MHL verification a speed-up over the reference implementation.
+* `simple-mhl`: a modern sealing and verification tool, for classic flat MHL files. A successor of the discontinued [mhl-tool](https://github.com/pomfort/mhl-tool) and backwards compatible with legacy manifests - 2 to 5 times faster (smart parallel hashing), full support for standard `xxhash64be` hashes, correct NFC/NFD handling independently of the filesystem, XSD schema validation features, cleaner output and structured exit codes.
+
+Both tools use smart parallel hashing. They measure real sequential hashing throughput, aggregate read speed (across several concurrent streams), and the in-memory speed of the selected hash algorithm(s) to always achieve the highest performance in any volume (HDD, SSD, RAID, NAS or SAN) and parallelise only if it pays off.
 
 ### 🚀 Installation
 
