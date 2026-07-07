@@ -25,6 +25,7 @@ jobs:
       package-name: ${{ steps.meta.outputs.package-name }}
       smoke-test-cmds: ${{ steps.meta.outputs.smoke-test-cmds }}
       version: ${{ steps.meta.outputs.version }}
+      python-versions: ${{ steps.meta.outputs.python-versions }}
     steps:
       - name: Checkout source code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -34,7 +35,7 @@ jobs:
         id: meta
         shell: python3 {0}
         run: |
-          import tomllib, os
+          import json, re, tomllib, os
 
           with open("pyproject.toml", "rb") as f:
               data = tomllib.load(f)
@@ -44,10 +45,20 @@ jobs:
           version = project["version"]
           cmds = " ".join(project.get("scripts", {}).keys())
 
+          # Derive the floor and ceiling of the supported Python range from the
+          # Trove classifiers.
+          pattern = re.compile(r"Programming Language :: Python :: (\d+\.\d+)$")
+          pys = sorted(
+              (m.group(1) for c in project.get("classifiers", []) if (m := pattern.match(c))),
+              key=lambda v: tuple(int(p) for p in v.split(".")),
+          )
+          python_versions = json.dumps([pys[0], pys[-1]] if pys else [])
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               print(f"package-name={name}", file=out)
               print(f"smoke-test-cmds={cmds}", file=out)
               print(f"version={version}", file=out)
+              print(f"python-versions={python_versions}", file=out)
   # JOB 2: Verify tag, build and publish (only runs if CI passes)
   build-n-publish:
     name: Build and publish Python distro to PyPI
@@ -97,7 +108,7 @@ jobs:
         run: uv publish
   # JOB 3: Post-deployment smoke test (verifies index installation and packaging)
   verify-deployment:
-    name: Verify Live Package (${{ matrix.os }})
+    name: Verify Live Package (${{ matrix.os }}, py${{ matrix.python-version }})
     needs: [read-metadata, build-n-publish]
     runs-on: ${{ matrix.os }}
     permissions: {}
@@ -105,6 +116,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # Floor and ceiling of the support range, derived from Trove classifiers
+        python-version: ${{ fromJSON(needs.read-metadata.outputs.python-versions) }}
     steps:
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
@@ -113,7 +126,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python-version }}
       - name: Install deployed package from PyPI
         env:
           PACKAGE_NAME: ${{ needs.read-metadata.outputs.package-name }}
