@@ -67,7 +67,49 @@ class TestLoadHistory:
         gen1 = history.generations[0]
         rec = gen1.by_path["top.txt"]
         assert rec.size == len(b"hello\n")
-        assert any(action == "original" for _fmt, _digest, action in rec.entries)
+        assert any(entry.action == "original" for entry in rec.entries)
+
+    def test_records_carry_dirhash_entries_path_dates_and_hashdates(self, tmp_path):
+        # The loader keeps what record-copying operations (rename, flatten)
+        # need: directoryhash content/structure entries, the <path> element's
+        # date attributes, and per-entry hashdate.
+        root = tmp_path / "pkg"
+        (root / "Clips").mkdir(parents=True)
+        (root / "Clips" / "a.mov").write_bytes(b"x")
+        dirhash = (
+            "  <directoryhash>\n"
+            '   <path creationdate="2026-01-01T00:00:00Z" lastmodificationdate="2026-01-02T00:00:00Z">Clips</path>\n'
+            '   <content><xxh64 action="original" hashdate="2026-01-03T00:00:00Z">7680e5f98f4a80fd</xxh64></content>\n'
+            '   <structure><xxh64 action="original">8f4a80fd7680e5f9</xxh64></structure>\n'
+            "  </directoryhash>"
+        )
+        file_record = asc_hash_record("Clips/a.mov", "b4bd9633d79bc5b9", "original", size=1)
+        make_asc_package(root, [[file_record, dirhash]])
+
+        gen1 = verify.load_history(root).generations[0]
+        rec = gen1.by_path["Clips"]
+        assert rec.is_directory
+        assert (rec.creation_date, rec.last_modification_date) == ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")
+        assert rec.dir_content == [verify.HashEntry("xxh64", "7680e5f98f4a80fd", "original", "2026-01-03T00:00:00Z")]
+        assert rec.dir_structure == [verify.HashEntry("xxh64", "8f4a80fd7680e5f9", "original")]
+        assert gen1.by_path["Clips/a.mov"].entries == [verify.HashEntry("xxh64", "b4bd9633d79bc5b9", "original")]
+
+    def test_metadata_children_are_not_read_as_hash_entries(self, tmp_path):
+        # <metadata> may contain arbitrary XML — an <md5> inside it is custom
+        # metadata, not a recorded hash.
+        root = tmp_path / "pkg"
+        root.mkdir()
+        (root / "a.txt").write_bytes(b"x")
+        record = (
+            "  <hash>\n"
+            '   <path size="1">a.txt</path>\n'
+            '   <xxh64 action="original">b4bd9633d79bc5b9</xxh64>\n'
+            f"   <metadata><md5>{'0' * 32}</md5></metadata>\n"
+            "  </hash>"
+        )
+        make_asc_package(root, [[record]])
+        rec = verify.load_history(root).generations[0].by_path["a.txt"]
+        assert [e.fmt for e in rec.entries] == ["xxh64"]
 
     def test_missing_chain_file_is_exit_32(self, package):
         (package / "ascmhl" / "ascmhl_chain.xml").unlink()
@@ -631,9 +673,9 @@ class TestSizeOnlyRecordedSet:
         record = verify.MediaRecord(path="../escape.txt", size=3)
         monkeypatch.setattr(
             verify,
-            "_collect_recorded",
+            "collect_recorded",
             lambda hist, ignore: [
-                verify._Recorded(
+                verify.Recorded(
                     path="../escape.txt", record=record, original=("md5", "0" * 32), usable=[("md5", "0" * 32)]
                 )
             ],

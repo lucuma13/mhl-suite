@@ -108,6 +108,16 @@ class MissingManifestError(HistoryError):
 # -----------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class HashEntry:
+    """One hash-format element of a <hash> / <directoryhash> record."""
+
+    fmt: str
+    digest: str
+    action: "str | None" = None
+    hashdate: "str | None" = None
+
+
 @dataclass
 class MediaRecord:
     """One <hash> / <directoryhash> element of a generation manifest."""
@@ -116,8 +126,14 @@ class MediaRecord:
     size: "int | None" = None
     previous_path: "str | None" = None
     is_directory: bool = False
-    # (format, digest, action) per recorded hash entry, in document order.
-    entries: "list[tuple[str, str, str | None]]" = field(default_factory=list)
+    # The <path> element's optional date attributes, as recorded.
+    creation_date: "str | None" = None
+    last_modification_date: "str | None" = None
+    # File hash entries in document order (empty for a <directoryhash>).
+    entries: "list[HashEntry]" = field(default_factory=list)
+    # A <directoryhash>'s <content>/<structure> hash entries (files have none).
+    dir_content: "list[HashEntry]" = field(default_factory=list)
+    dir_structure: "list[HashEntry]" = field(default_factory=list)
 
 
 @dataclass
@@ -182,14 +198,26 @@ def _free(element: "etree._Element") -> None:
         del parent[0]
 
 
+def _hash_entries(container: "etree._Element") -> "list[HashEntry]":
+    """The recognised hash-format children of `container`, in document order."""
+    entries: list[HashEntry] = []
+    for child in container:
+        name = _local(child.tag)
+        if name in ASC_FORMATS and child.text:
+            entries.append(HashEntry(name, child.text.strip(), child.get("action"), child.get("hashdate")))
+    return entries
+
+
 def _parse_media_element(element: "etree._Element", *, is_directory: bool) -> "MediaRecord | None":
     """
     Reduce one <hash> / <directoryhash> element to a MediaRecord (None without
-    a <path>). A <directoryhash>'s structure/content hash entries are not
-    verifiable file content, so only its path (for the recorded set) is kept.
+    a <path>). Only direct children are read — a <metadata> block may contain
+    arbitrary XML, including elements that happen to share hash-format names.
+    A <directoryhash>'s content/structure entries are not verifiable file
+    content; they are kept for record copying (rename, roothash reuse).
     """
     record = MediaRecord(path="", is_directory=is_directory)
-    for child in element.iter():
+    for child in element:
         name = _local(child.tag)
         if name == "path" and not record.path:
             if child.text:
@@ -197,10 +225,16 @@ def _parse_media_element(element: "etree._Element", *, is_directory: bool) -> "M
             size_text = (child.get("size") or "").strip()
             if size_text.isdecimal():
                 record.size = int(size_text)
+            record.creation_date = child.get("creationdate")
+            record.last_modification_date = child.get("lastmodificationdate")
         elif name == "previousPath" and child.text:
             record.previous_path = child.text.strip()
         elif not is_directory and name in ASC_FORMATS and child.text:
-            record.entries.append((name, child.text.strip(), child.get("action")))
+            record.entries.append(HashEntry(name, child.text.strip(), child.get("action"), child.get("hashdate")))
+        elif is_directory and name == "content":
+            record.dir_content = _hash_entries(child)
+        elif is_directory and name == "structure":
+            record.dir_structure = _hash_entries(child)
     return record if record.path else None
 
 
@@ -320,7 +354,7 @@ def load_history(root_path: "str | Path") -> History:
 # -----------------------------------------------------------------------------
 
 
-def _resolve_hashes(
+def resolve_hashes(
     history: History, rel_path: str
 ) -> "tuple[MediaRecord, tuple[str, str] | None, list[tuple[str, str]]] | None":
     """
@@ -358,18 +392,18 @@ def _resolve_hashes(
         if rec is None:
             continue
         seen = seen or rec
-        for hash_format, digest, action in rec.entries:
-            if hash_format not in ASC_FORMATS:
+        for entry in rec.entries:
+            if entry.fmt not in ASC_FORMATS:
                 continue
-            if action == "original":
+            if entry.action == "original":
                 if original is None:
-                    original = (rec, (hash_format, digest))
-                if not usable.get(hash_format, ("", False))[1]:
-                    usable[hash_format] = (digest, True)
-            elif action == "verified":
+                    original = (rec, (entry.fmt, entry.digest))
+                if not usable.get(entry.fmt, ("", False))[1]:
+                    usable[entry.fmt] = (entry.digest, True)
+            elif entry.action == "verified":
                 if verified is None:
-                    verified = (rec, (hash_format, digest))
-                usable.setdefault(hash_format, (digest, False))
+                    verified = (rec, (entry.fmt, entry.digest))
+                usable.setdefault(entry.fmt, (entry.digest, False))
 
     if seen is None:
         return None
@@ -378,7 +412,7 @@ def _resolve_hashes(
     return record, best, usable_list
 
 
-class _IgnoreMatcher:
+class IgnoreMatcher:
     """
     Package-wide ignore matching for a verify run. The root history's latest
     recorded patterns apply to the whole tree, and each nested history's
@@ -416,7 +450,7 @@ class _IgnoreMatcher:
         return False
 
 
-def _build_ignore_spec(history: History) -> _IgnoreMatcher:
+def build_ignore_spec(history: History) -> IgnoreMatcher:
     """
     The ignore matcher for a verify run: every history's latest-generation
     recorded patterns scoped to its subtree, with the mandatory defaults
@@ -424,11 +458,11 @@ def _build_ignore_spec(history: History) -> _IgnoreMatcher:
     the defaults must not make verify descend into ascmhl/ and flag the
     manifests as new files).
     """
-    return _IgnoreMatcher(history)
+    return IgnoreMatcher(history)
 
 
 @dataclass
-class _Recorded:
+class Recorded:
     """One recorded path reduced for verification, relative to the package root."""
 
     path: str  # posix, package-root-relative, post-rename
@@ -437,14 +471,14 @@ class _Recorded:
     usable: "list[tuple[str, str]]"  # every distinct usable format (original-preferred)
 
 
-def _collect_recorded(history: History, ignore: _IgnoreMatcher) -> list[_Recorded]:
+def collect_recorded(history: History, ignore: IgnoreMatcher) -> list[Recorded]:
     """
     Every recorded path across the history and its nested children, resolved
     to package-root-relative posix form with renames applied and ignored paths
     dropped, in sorted-path order. Each history resolves its own paths (a
     nested history owns its subtree), deduplicated on the final name.
     """
-    out: dict[str, _Recorded] = {}
+    out: dict[str, Recorded] = {}
     for prefix, sub in history.walk():
         # Renames within this history, one previous→new map per generation: a
         # record's final name is found by applying the maps of every *later*
@@ -467,11 +501,11 @@ def _collect_recorded(history: History, ignore: _IgnoreMatcher) -> list[_Recorde
             top_rel = f"{prefix}/{name}" if prefix else name
             if ignore.match_file(top_rel):
                 continue
-            resolved = _resolve_hashes(sub, name)
+            resolved = resolve_hashes(sub, name)
             if resolved is None:
                 continue
             record, original, usable = resolved
-            out.setdefault(top_rel, _Recorded(path=top_rel, record=record, original=original, usable=usable))
+            out.setdefault(top_rel, Recorded(path=top_rel, record=record, original=original, usable=usable))
     return [out[path] for path in sorted(out)]
 
 
@@ -481,10 +515,10 @@ def history_byte_total(history: History) -> int:
     verifiable files' original-generation sizes) — the package's progress-bar
     weight. Reads no media bytes itself.
     """
-    ignore = _build_ignore_spec(history)
+    ignore = build_ignore_spec(history)
     return sum(
         r.record.size or 0
-        for r in _collect_recorded(history, ignore)
+        for r in collect_recorded(history, ignore)
         if r.original is not None and not r.record.is_directory
     )
 
@@ -494,9 +528,9 @@ def history_byte_total(history: History) -> int:
 # -----------------------------------------------------------------------------
 
 
-def _walk_disk_files(
+def walk_disk_files(
     root: Path,
-    ignore: _IgnoreMatcher,
+    ignore: IgnoreMatcher,
     on_unreadable: "Callable[[str, OSError], None] | None" = None,
 ) -> "Iterator[str]":
     """
@@ -541,7 +575,7 @@ def _walk_disk_files(
 
 
 def _completeness_entries(
-    root: Path, recorded: "list[_Recorded]", verifiable_paths: set[str], ignore: _IgnoreMatcher
+    root: Path, recorded: "list[Recorded]", verifiable_paths: set[str], ignore: IgnoreMatcher
 ) -> list[VerifyEntry]:
     """
     The completeness pass over everything the hash phase didn't settle.
@@ -585,7 +619,7 @@ def _completeness_entries(
 
     entries.extend(
         VerifyEntry(path=rel, status=Status.NEW)
-        for rel in _walk_disk_files(root, ignore, on_unreadable)
+        for rel in walk_disk_files(root, ignore, on_unreadable)
         if rel not in recorded_paths
     )
     return entries
@@ -594,6 +628,24 @@ def _completeness_entries(
 # -----------------------------------------------------------------------------
 # verify_ascmhl — the dialect entry point
 # -----------------------------------------------------------------------------
+
+
+def ascmhl_exit_code(entries: "list[VerifyEntry]") -> ExitCode:
+    """
+    The ASC-MHL verification exit code for a set of per-file entries — a fixed
+    precedence, pinned for tool interop: hash mismatch / per-file failure 11
+    beats new-files 21, which beats nothing-verifiable-found 20 (no record
+    reached the hash comparison), which beats missing-files 10.
+    """
+    if any(e.status in (Status.MISMATCH, Status.ERROR) for e in entries):
+        return ExitCode.HASH_MISMATCH
+    if any(e.status == Status.NEW for e in entries):
+        return ExitCode.NEW_FILES
+    if not any(e.hashes for e in entries):
+        return ExitCode.SINGLE_FILE_NOT_FOUND
+    if any(e.status == Status.MISSING for e in entries):
+        return ExitCode.MISSING
+    return ExitCode.OK
 
 
 def verify_ascmhl(
@@ -640,8 +692,8 @@ def verify_ascmhl(
     except (etree.XMLSyntaxError, OSError):
         return VerifyReport(code=ExitCode.MALFORMED_XML, malformed=True, size_only_mode=size_only)
 
-    ignore = _build_ignore_spec(history)
-    recorded = _collect_recorded(history, ignore)
+    ignore = build_ignore_spec(history)
+    recorded = collect_recorded(history, ignore)
 
     # Records the engine can verify: files with at least one usable hash entry
     # (a usable set is non-empty exactly when an original-preferred hash exists,
@@ -676,19 +728,4 @@ def verify_ascmhl(
     verifiable_paths = {r.path for r in verifiable}
     entries.extend(_completeness_entries(root, recorded, verifiable_paths, ignore))
 
-    # Exit-code precedence, pinned for tool interop. "Nothing verifiable
-    # found" (20) means no record actually reached the hash comparison — every
-    # verifiable record was missing, or there were none.
-    n_fail = sum(1 for e in entries if e.status in (Status.MISMATCH, Status.ERROR))
-    hashed_any = any(e.hashes for e in entries)
-    if n_fail:
-        code = ExitCode.HASH_MISMATCH
-    elif any(e.status == Status.NEW for e in entries):
-        code = ExitCode.NEW_FILES
-    elif not hashed_any:
-        code = ExitCode.SINGLE_FILE_NOT_FOUND
-    elif any(e.status == Status.MISSING for e in entries):
-        code = ExitCode.MISSING
-    else:
-        code = ExitCode.OK
-    return VerifyReport(entries=entries, code=code)
+    return VerifyReport(entries=entries, code=ascmhl_exit_code(entries))
