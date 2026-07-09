@@ -64,6 +64,23 @@ class C4Hasher:
             digits = self._CHARSET[mod] + digits
         return "c4" + digits.rjust(self._LENGTH - 2, "1")
 
+    @classmethod
+    def decode(cls, c4_id: str) -> bytes:
+        """
+        The 64 raw SHA-512 digest bytes a C4 ID encodes — the byte
+        representation ASC-MHL's hash-of-hashes feeds to a parent hasher
+        (spec Appendix D/G). Raises ValueError on a malformed C4 ID.
+        """
+        if len(c4_id) != cls._LENGTH or not c4_id.startswith("c4"):
+            raise ValueError(f"not a C4 ID: {c4_id!r}")
+        value = 0
+        for char in c4_id[2:]:
+            try:
+                value = value * 58 + cls._CHARSET.index(char)
+            except ValueError:
+                raise ValueError(f"not a C4 ID: {c4_id!r}") from None
+        return value.to_bytes(64, "big")
+
 
 # -----------------------------------------------------------------------------
 # The registry
