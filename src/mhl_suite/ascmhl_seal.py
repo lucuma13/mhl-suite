@@ -604,7 +604,7 @@ def _completeness(level: _Level, entries: "list[VerifyEntry]") -> None:
         )
 
 
-def _latest_dir_entries(history: History, rel: str) -> "tuple[dict[str, str], dict[str, str]]":
+def latest_dir_entries(history: History, rel: str) -> "tuple[dict[str, str], dict[str, str]]":
     """The most recent recorded (content, structure) digests per format for a directory path."""
     content: dict[str, str] = {}
     structure: dict[str, str] = {}
@@ -663,7 +663,7 @@ def _directory_hashes(
                 )
                 pair[fmt] = (content, structure)
         if node.rel:  # the scope root is recorded as <roothash>, not a record
-            recorded_content, recorded_structure = _latest_dir_entries(level.history, node.rel)
+            recorded_content, recorded_structure = latest_dir_entries(level.history, node.rel)
             content_entries: list[HashEntryOut] = []
             structure_entries: list[HashEntryOut] = []
             for fmt, (content, structure) in pair.items():
