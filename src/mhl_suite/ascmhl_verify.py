@@ -261,7 +261,7 @@ def parse_generation_manifest(file_path: Path, number: int) -> Generation:
     return Generation(number=number, file_path=file_path, records=records, ignore_patterns=ignore_patterns)
 
 
-def _parse_chain(chain_path: Path) -> "list[tuple[str, str, str]]":
+def parse_chain(chain_path: Path) -> "list[tuple[str, str, str]]":
     """
     Parse ascmhl_chain.xml into (manifest filename, hash format, digest)
     triples in document order. A missing chain file yields no entries (the
@@ -297,7 +297,7 @@ def _validate_chain(ascmhl_dir: Path) -> None:
     chain_path = ascmhl_dir / CHAIN_FILENAME
     if ascmhl_dir.exists() and not chain_path.exists():
         raise NoChainError(chain_path)
-    for filename, hash_format, digest in _parse_chain(chain_path):
+    for filename, hash_format, digest in parse_chain(chain_path):
         manifest = ascmhl_dir / filename
         if not manifest.exists():
             raise MissingManifestError(manifest)
