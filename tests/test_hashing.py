@@ -2,9 +2,10 @@
 Tests for the adaptive hashing controller (mhl_suite.hashing).
 
 These pin the *decisions* (sequential vs parallel-N vs demotion) and the output
-invariant of _hash_files_auto / _probe_read_bw / _hash_batch, never the
-throughput numbers (which are hardware-bound). seal and verify drive this
-controller; their integration with it is covered in the seal/verify tests.
+invariant of run_hash_jobs / _probe_read_bw / _hash_batch, never the throughput
+numbers (which are hardware-bound). The controller is driven here through
+classic_seal's _hash_files wrapper (the digests+hashdate job shape seal uses);
+the verify engine's integration is covered in the verify tests.
 """
 
 import hashlib
@@ -15,6 +16,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from mhl_suite import hashing as core_hashing
+from mhl_suite.algorithms import ALGORITHMS, get_hash
+from mhl_suite.classic_seal import _hash_files as seal_hash_files
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -22,7 +25,8 @@ if TYPE_CHECKING:
 
 class TestAdaptiveHashing:
     """
-    Behaviour of _hash_files_auto / _probe_read_bw / _hash_batch.
+    Behaviour of run_hash_jobs / _probe_read_bw / _hash_batch, driven through
+    seal's _hash_files job shape.
 
     The disk/hash measurements are mocked so the tests are deterministic on any
     machine — including the all-important guarantee that concurrency never
@@ -37,7 +41,7 @@ class TestAdaptiveHashing:
             p.write_bytes(bytes([i % 256]) * (1000 + i))  # distinct content & size
             paths.append(str(p))
             sizes.append(p.stat().st_size)
-        ref = [core_hashing.get_hash(p, algo) for p in paths]  # pure-sequential reference
+        ref = [get_hash(p, algo) for p in paths]  # pure-sequential reference
         return paths, sizes, ref
 
     def _force(self, monkeypatch, *, seq_bw, hash_bw, read_bw_multi, cpu=8, min_bytes=0, recheck=8 * 1024**3):
@@ -50,9 +54,7 @@ class TestAdaptiveHashing:
         monkeypatch.setattr(core_hashing, "_AUTO_RECHECK_BYTES", recheck)
         monkeypatch.setattr(core_hashing, "_AUTO_WARMUP_SECONDS", 0.0)
         monkeypatch.setattr(core_hashing, "_AUTO_PROBE_MIN_BYTES", 0)
-        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw", lambda algo: hash_bw)
-        # seal calibrates all formats combined via _calibrate_hash_bw_multi.
-        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw_multi", lambda factories: hash_bw)
+        monkeypatch.setattr(core_hashing, "calibrate_hash_bandwidth", lambda factories: hash_bw)
         monkeypatch.setattr(core_hashing, "_warmup_seq_bw", lambda nbytes, elapsed: seq_bw)
         monkeypatch.setattr(core_hashing, "_probe_read_bw_multi", lambda slots, n: read_bw_multi)
         monkeypatch.setattr(core_hashing.os, "cpu_count", lambda: cpu)
@@ -73,20 +75,20 @@ class TestAdaptiveHashing:
     def test_output_identical_parallel_branch(self, tmp_path, monkeypatch):
         paths, sizes, ref = self._make_files(tmp_path, 30)
         self._force(monkeypatch, seq_bw=800, hash_bw=1000, read_bw_multi=4000)
-        assert [d for d, _hashdate in core_hashing._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
+        assert [d for d, _hashdate in seal_hash_files(paths, sizes, ["md5"])] == [[r] for r in ref]
 
     def test_output_identical_demotion_branch(self, tmp_path, monkeypatch):
         paths, sizes, ref = self._make_files(tmp_path, 30)
         # seq_bw huge => every window's measured rate < seq_bw => demote; a tiny recheck window makes demotion leave a
         # real sequential remainder.
         self._force(monkeypatch, seq_bw=1e18, hash_bw=1e18, read_bw_multi=1e30, recheck=1)
-        assert [d for d, _hashdate in core_hashing._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
+        assert [d for d, _hashdate in seal_hash_files(paths, sizes, ["md5"])] == [[r] for r in ref]
 
     def test_output_identical_sequential_gate(self, tmp_path, monkeypatch):
         paths, sizes, ref = self._make_files(tmp_path, 30)
         # disk-bound and concurrency doesn't scale: parallel can't clear the margin
         self._force(monkeypatch, seq_bw=95, hash_bw=1000, read_bw_multi=100)
-        assert [d for d, _hashdate in core_hashing._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
+        assert [d for d, _hashdate in seal_hash_files(paths, sizes, ["md5"])] == [[r] for r in ref]
 
     # --- decisions -----------------------------------------------------------
 
@@ -99,7 +101,7 @@ class TestAdaptiveHashing:
         paths, sizes, _ = self._make_files(tmp_path, 10)
         self._force(monkeypatch, seq_bw=110, hash_bw=1000, read_bw_multi=60)
         calls = self._spy_batch(monkeypatch)
-        list(core_hashing._hash_files_auto(paths, sizes, ["md5"]))
+        list(seal_hash_files(paths, sizes, ["md5"]))
         assert all(w <= 1 for w in calls), f"seek-bound must not issue a concurrent batch, saw {calls}"
 
     def test_two_large_files_on_seek_bound_disk_stay_sequential(self, tmp_path, monkeypatch):
@@ -112,7 +114,7 @@ class TestAdaptiveHashing:
         paths, sizes, _ = self._make_files(tmp_path, 2)
         self._force(monkeypatch, seq_bw=140, hash_bw=1000, read_bw_multi=60)
         calls = self._spy_batch(monkeypatch)
-        list(core_hashing._hash_files_auto(paths, sizes, ["md5"]))
+        list(seal_hash_files(paths, sizes, ["md5"]))
         assert all(w <= 1 for w in calls), f"2-file seek-bound job must not issue a concurrent batch, saw {calls}"
 
     def test_hash_far_outruns_disk_stays_sequential(self, tmp_path, monkeypatch):
@@ -124,7 +126,7 @@ class TestAdaptiveHashing:
         paths, sizes, _ = self._make_files(tmp_path, 10)
         self._force(monkeypatch, seq_bw=99, hash_bw=13_000, read_bw_multi=100)
         calls = self._spy_batch(monkeypatch)
-        list(core_hashing._hash_files_auto(paths, sizes, ["md5"]))
+        list(seal_hash_files(paths, sizes, ["md5"]))
         assert all(w <= 1 for w in calls), f"hash-dominated volume must stay sequential, saw {calls}"
 
     def test_nas_scaling_parallelises(self, tmp_path, monkeypatch):
@@ -136,7 +138,7 @@ class TestAdaptiveHashing:
         paths, sizes, _ = self._make_files(tmp_path, 10)
         self._force(monkeypatch, seq_bw=535, hash_bw=846, read_bw_multi=1500, cpu=8)
         calls = self._spy_batch(monkeypatch)
-        list(core_hashing._hash_files_auto(paths, sizes, ["md5"]))
+        list(seal_hash_files(paths, sizes, ["md5"]))
         assert calls, "expected a concurrent batch on concurrency-scaling storage"
         assert max(calls) == 4, f"expected 4 workers (probed stream floor), saw {calls}"
 
@@ -150,7 +152,7 @@ class TestAdaptiveHashing:
         paths, sizes, _ = self._make_files(tmp_path, 10)
         self._force(monkeypatch, seq_bw=535, hash_bw=950, read_bw_multi=950, cpu=8)
         calls = self._spy_batch(monkeypatch)
-        list(core_hashing._hash_files_auto(paths, sizes, ["md5"]))
+        list(seal_hash_files(paths, sizes, ["md5"]))
         assert calls, "expected a concurrent batch when overlap alone wins"
         assert max(calls) == 4, f"expected 4 workers (probed stream floor), saw {calls}"
 
@@ -162,7 +164,7 @@ class TestAdaptiveHashing:
         paths, sizes, _ = self._make_files(tmp_path, 10)
         self._force(monkeypatch, seq_bw=800, hash_bw=1000, read_bw_multi=6000, cpu=8)
         calls = self._spy_batch(monkeypatch)
-        list(core_hashing._hash_files_auto(paths, sizes, ["md5"]))
+        list(seal_hash_files(paths, sizes, ["md5"]))
         assert calls, "expected a concurrent batch to run"
         assert max(calls) == 6, f"expected 6 workers, saw {calls}"
 
@@ -170,7 +172,7 @@ class TestAdaptiveHashing:
         paths, sizes, _ = self._make_files(tmp_path, 10)
         self._force(monkeypatch, seq_bw=800, hash_bw=1000, read_bw_multi=100_000, cpu=4)  # wants 100, capped to cores
         calls = self._spy_batch(monkeypatch)
-        list(core_hashing._hash_files_auto(paths, sizes, ["md5"]))
+        list(seal_hash_files(paths, sizes, ["md5"]))
         assert calls, "expected a concurrent batch to run"
         assert max(calls) == 4
 
@@ -179,7 +181,7 @@ class TestAdaptiveHashing:
         monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", 10 * 1024**3)  # larger than the job
         probed: list[int] = []
         monkeypatch.setattr(core_hashing, "_probe_read_bw_multi", lambda slots, n: probed.append(1) or 1.0)
-        assert [d for d, _hashdate in core_hashing._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
+        assert [d for d, _hashdate in seal_hash_files(paths, sizes, ["md5"])] == [[r] for r in ref]
         assert probed == [], "a sub-threshold job must not probe the disk"
 
     def test_single_file_skips_probe(self, tmp_path, monkeypatch):
@@ -187,7 +189,7 @@ class TestAdaptiveHashing:
         monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", 0)
         probed: list[int] = []
         monkeypatch.setattr(core_hashing, "_probe_read_bw_multi", lambda slots, n: probed.append(1) or 9e9)
-        assert [d for d, _hashdate in core_hashing._hash_files_auto(paths, sizes, ["md5"])] == [[r] for r in ref]
+        assert [d for d, _hashdate in seal_hash_files(paths, sizes, ["md5"])] == [[r] for r in ref]
         assert probed == [], "nothing to parallelise across a single file"
 
     # --- helpers -------------------------------------------------------------
@@ -198,24 +200,21 @@ class TestAdaptiveHashing:
         paths, sizes, ref = self._make_files(tmp_path, 20)
 
         def jobs() -> "list[Callable[[Callable[[int], None]], str]]":
-            return [(lambda mon, p=p: core_hashing.get_hash(p, "md5", on_progress=mon)) for p in paths]
+            return [(lambda mon, p=p: get_hash(p, "md5", on_progress=mon)) for p in paths]
 
         sink = core_hashing._Progress()
         assert core_hashing._hash_batch(jobs(), 4, sink.add) == ref
         assert core_hashing._hash_batch(jobs(), 1, sink.add) == ref
         assert sink.bytes == 2 * sum(sizes)  # every chunk reported, both passes
 
-    def test_hash_batch_runs_jobs_concurrently_in_order(self, tmp_path, monkeypatch):
+    def test_hash_batch_runs_jobs_concurrently_in_order(self, tmp_path):
         """
-        _hash_batch runs each job callable and returns results in input order;
-        jobs resolve get_hash via the module global so monkeypatches intercept.
+        _hash_batch runs each job callable — whatever it is, hashing or not —
+        and returns results in input order.
         """
         paths, _, _ = self._make_files(tmp_path, 6)
-        monkeypatch.setattr(core_hashing, "get_hash", lambda p, a: "STUB")
-        jobs: list[Callable[[Callable[[int], None]], str]] = [
-            (lambda mon, p=p: core_hashing.get_hash(p, "md5")) for p in paths
-        ]
-        assert core_hashing._hash_batch(jobs, 3, lambda n: None) == ["STUB"] * 6
+        jobs: list[Callable[[Callable[[int], None]], str]] = [(lambda mon, p=p: f"STUB:{p}") for p in paths]
+        assert core_hashing._hash_batch(jobs, 3, lambda n: None) == [f"STUB:{p}" for p in paths]
 
     def test_probe_read_bw_skips_unreadable(self, tmp_path, monkeypatch):
         good = tmp_path / "g.bin"
@@ -231,7 +230,7 @@ class TestAdaptiveHashing:
         hashing worker (precise even in parallel windows), not stamped at emit.
         """
         paths, sizes, ref = self._make_files(tmp_path, 3)
-        out = list(core_hashing._hash_files_auto(paths, sizes, ["md5"]))
+        out = list(seal_hash_files(paths, sizes, ["md5"]))
         assert [d for d, _ in out] == [[r] for r in ref]
         for _digests, hashdate in out:
             datetime.strptime(hashdate, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
@@ -321,12 +320,12 @@ class TestAdaptiveHashing:
         """
         seen: list[int] = []
         counter = core_hashing._Progress()
-        both = core_hashing._chain_progress(seen.append, counter.add)
+        both = core_hashing.chain_progress(seen.append, counter.add)
         both(3)
         both(4)
         assert seen == [3, 4]
         assert counter.bytes == 7
-        unchained = core_hashing._chain_progress(None, counter.add)
+        unchained = core_hashing.chain_progress(None, counter.add)
         unchained(5)
         assert counter.bytes == 12  # None caller-side callback collapses to the counter alone
 
@@ -345,16 +344,15 @@ class TestAdaptiveHashing:
             list(ex.map(bump, range(8)))
         assert counter.bytes == 8000
 
-    def test_calibrate_hash_bw_is_positive_and_finite(self):
+    def test_calibrate_hash_bandwidth_is_positive_and_finite(self):
         """
-        The real in-RAM calibrations (mocked everywhere else) return a usable
-        bytes/sec figure — both the single-algorithm and the combined-format
-        (seal's read-once multi-hash) variants.
+        The real in-RAM calibration (mocked everywhere else) returns a usable
+        bytes/sec figure — for a single format and for seal's combined
+        read-once multi-hash.
         """
-        for algo in ("md5", "xxhash"):
-            assert 0 < core_hashing._calibrate_hash_bw(algo) < float("inf")
-        factories = [core_hashing.ALGO_MAP[a][0] for a in ("md5", "xxhash")]
-        assert 0 < core_hashing._calibrate_hash_bw_multi(factories) < float("inf")
+        for names in (["md5"], ["md5", "xxh64"]):
+            factories = [ALGORITHMS[n].factory for n in names]
+            assert 0 < core_hashing.calibrate_hash_bandwidth(factories) < float("inf")
 
     def test_probe_read_bw_falls_through_when_files_smaller_than_floor(self, tmp_path):
         """
@@ -383,16 +381,9 @@ class TestGetHashes:
         f = tmp_path / "big.bin"
         f.write_bytes(b"y" * 4096)
         chunks: list[int] = []
-        core_hashing.get_hashes(str(f), [core_hashing.ALGO_MAP["md5"][0]], on_progress=chunks.append)
+        core_hashing.get_hashes(str(f), [ALGORITHMS["md5"].factory], on_progress=chunks.append)
         assert sum(chunks) == 4096
         assert len(chunks) == 4  # 4096 / 1024
-
-    def test_get_hash_rejects_unsupported_algorithm(self, tmp_path):
-        """get_hash raises ValueError for an algorithm key absent from ALGO_MAP."""
-        f = tmp_path / "a.bin"
-        f.write_bytes(b"data")
-        with pytest.raises(ValueError, match="Unsupported hash algorithm"):
-            core_hashing.get_hash(str(f), "blake2")
 
 
 class _ByteSum:
@@ -417,7 +408,7 @@ class TestHashFilesPublicAPI:
     (e.g. triplecheck) build on. These tests lock in that contract:
 
       * factories are arbitrary Hasher constructors — hashlib, xxhash, blake3
-        or home-grown — NOT ALGO_MAP keys, so a consumer's algorithms need no
+        or home-grown — NOT registry names, so a consumer's algorithms need no
         registration in this suite;
       * digests come back aligned to `factories`, one list per path, in input
         order, whether the controller runs sequentially or in parallel;
@@ -436,9 +427,9 @@ class TestHashFilesPublicAPI:
             blobs.append(blob)
         return paths, sizes, blobs
 
-    def test_arbitrary_factories_outside_algo_map(self, tmp_path):
+    def test_arbitrary_factories_outside_registry(self, tmp_path):
         """
-        sha256 has no ALGO_MAP entry and _ByteSum isn't even a real hash, yet
+        sha256 has no registry entry and _ByteSum isn't even a real hash, yet
         both work as factories; each yielded list is aligned to `factories`.
         """
         paths, sizes, blobs = self._make_files(tmp_path, 4)
@@ -458,7 +449,7 @@ class TestHashFilesPublicAPI:
         monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", 0)
         monkeypatch.setattr(core_hashing, "_AUTO_WARMUP_SECONDS", 0.0)
         monkeypatch.setattr(core_hashing, "_AUTO_PROBE_MIN_BYTES", 0)
-        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw_multi", lambda factories: 1000)
+        monkeypatch.setattr(core_hashing, "calibrate_hash_bandwidth", lambda factories: 1000)
         monkeypatch.setattr(core_hashing, "_warmup_seq_bw", lambda nbytes, elapsed: 800)
         monkeypatch.setattr(core_hashing, "_probe_read_bw_multi", lambda slots, n: 4000)
         monkeypatch.setattr(core_hashing.os, "cpu_count", lambda: 8)

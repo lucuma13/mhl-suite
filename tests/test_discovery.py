@@ -1,12 +1,12 @@
 """
-The cross-dialect orchestrator (mhl_suite.verifyall).
+Discovery and the cross-dialect orchestrator (mhl_suite.discovery).
 
-This is where "both dialects verify in-process" actually happens: discover every
-manifest under a tree, dedup ASC-MHL generations, route each to the right
-backend, and render its per-file lines. The mhlver CLI owns aggregation and is
-tested separately; here we pin the orchestrator's own seams — discovery
-filtering, generation dedup, backend dispatch, render fidelity, and progress
-weighting.
+This is where "both dialects verify in-process" actually happens: discover
+every manifest under a tree once into typed items (ASC-MHL generations
+deduplicated to one package item) and route each to the right dialect engine.
+The mhlver CLI owns aggregation and is tested separately; the shared renderer
+lives in test_verify. Here we pin discovery filtering, generation dedup,
+dispatch, and progress weighting.
 """
 
 import tempfile
@@ -16,8 +16,9 @@ from pathlib import Path
 
 from hypothesis import HealthCheck, assume, given, settings, strategies
 
-from mhl_suite import verifyall
-from mhl_suite.verify_results import VerifyEntry, VerifyReport
+from mhl_suite import discovery
+from mhl_suite.discovery import AscmhlPackage, ClassicManifest
+from mhl_suite.verify import VerifyReport
 
 from .helpers import make_mhl_with_size, make_package, make_tree
 
@@ -54,29 +55,34 @@ def _fs_name_key(name: str) -> str:
     return unicodedata.normalize("NFC", name.casefold())
 
 
+def _selected_paths(root: Path) -> list[Path]:
+    """Each discovered item's representative manifest file (a package is represented by its latest generation)."""
+    return [item.latest if isinstance(item, AscmhlPackage) else item.path for item in discovery.discover(root)]
+
+
 class TestFindMhlFiles:
-    """find_mhl_files walks case-insensitively and skips macOS resource forks."""
+    """Discovery walks case-insensitively and skips macOS resource forks."""
 
     def test_case_insensitive_recursive(self, tmp_path):
         make_tree(tmp_path, {"a.mhl": b"", "sub/B.MHL": b"", "sub/deep/c.MhL": b""})
-        found = {p.name for p in verifyall.find_mhl_files(tmp_path)}
+        found = {p.name for p in discovery._find_mhl_files(tmp_path)}
         assert found == {"a.mhl", "B.MHL", "c.MhL"}
 
     def test_skips_resource_forks(self, tmp_path):
         make_tree(tmp_path, {"real.mhl": b"", "._real.mhl": b""})
-        found = [p.name for p in verifyall.find_mhl_files(tmp_path)]
+        found = [p.name for p in discovery._find_mhl_files(tmp_path)]
         assert found == ["real.mhl"]
 
     def test_ignores_non_mhl(self, tmp_path):
         make_tree(tmp_path, {"keep.mhl": b"", "notes.txt": b"", "data.xml": b""})
-        found = {p.name for p in verifyall.find_mhl_files(tmp_path)}
+        found = {p.name for p in discovery._find_mhl_files(tmp_path)}
         assert found == {"keep.mhl"}
 
 
-class TestSelectMhlFiles:
+class TestDiscover:
     """
-    _select_mhl_files keeps one manifest per ASC package and passes classic
-    through.
+    discover() keeps one item per ASC package and passes classic manifests
+    through as their own items.
     """
 
     def test_ascmhl_package_dedups_to_latest_generation(self, tmp_path):
@@ -88,13 +94,16 @@ class TestSelectMhlFiles:
                 "pkg/ascmhl/0003.mhl": _V2_MHL,
             },
         )
-        selected = verifyall._select_mhl_files(tmp_path)
-        assert [p.name for p in selected] == ["0003.mhl"]
+        (item,) = discovery.discover(tmp_path)
+        assert isinstance(item, AscmhlPackage)
+        assert item.latest.name == "0003.mhl"
+        assert [p.name for p in item.manifests] == ["0001.mhl", "0002.mhl", "0003.mhl"]
 
     def test_classic_files_pass_through(self, tmp_path):
         make_tree(tmp_path, {"one.mhl": b"", "sub/two.mhl": b""})
-        selected = {p.name for p in verifyall._select_mhl_files(tmp_path)}
-        assert selected == {"one.mhl", "two.mhl"}
+        items = discovery.discover(tmp_path)
+        assert all(isinstance(i, ClassicManifest) for i in items)
+        assert {p.name for p in _selected_paths(tmp_path)} == {"one.mhl", "two.mhl"}
 
     def test_mixed_tree_keeps_classic_and_latest_asc(self, tmp_path):
         make_tree(
@@ -106,13 +115,12 @@ class TestSelectMhlFiles:
                 "._fork.mhl": b"",
             },
         )
-        selected = {p.name for p in verifyall._select_mhl_files(tmp_path)}
-        assert selected == {"data.mhl", "0002.mhl"}
+        assert {p.name for p in _selected_paths(tmp_path)} == {"data.mhl", "0002.mhl"}
 
     def test_ascmhl_folder_directly_under_scan_root_yields_latest(self, tmp_path):
         """
         An ascmhl/ immediately under the scan root (no package dir) still dedups
-        to exactly one manifest — the latest generation.
+        to exactly one item — represented by the latest generation.
         """
         make_tree(
             tmp_path,
@@ -122,14 +130,14 @@ class TestSelectMhlFiles:
                 "ascmhl/0003.mhl": _V2_MHL,
             },
         )
-        selected = verifyall._select_mhl_files(tmp_path)
+        selected = _selected_paths(tmp_path)
         assert len(selected) == 1
         assert selected[0].name == "0003.mhl"
 
     def test_top_level_and_nested_ascmhl_dedup_independently(self, tmp_path):
         """
         A top-level ascmhl/ and a nested package's ascmhl/ each contribute one
-        manifest — they must not share a dedup key despite both being 'ascmhl'.
+        item — they must not share a dedup key despite both being 'ascmhl'.
         """
         make_tree(
             tmp_path,
@@ -139,15 +147,14 @@ class TestSelectMhlFiles:
                 "pkg/ascmhl/0002.mhl": _V2_MHL,
             },
         )
-        selected = {p.name for p in verifyall._select_mhl_files(tmp_path)}
-        assert selected == {"0001.mhl", "0002.mhl"}
+        assert {p.name for p in _selected_paths(tmp_path)} == {"0001.mhl", "0002.mhl"}
 
     def test_classic_v1_inside_ascmhl_folder_is_not_grouped_as_package(self, tmp_path):
         """
         Dialect is decided by the header, not the folder name: a classic v1
         manifest that happens to sit inside an `ascmhl/` folder passes through
-        as its own classic manifest instead of being folded into — and
-        distorting — the real v2 package's generation dedup.
+        as its own classic item instead of being folded into — and distorting —
+        the real v2 package's generation dedup.
         """
         make_tree(
             tmp_path,
@@ -157,12 +164,20 @@ class TestSelectMhlFiles:
                 "pkg/ascmhl/legacy.mhl": b'<hashlist version="1.1"/>',
             },
         )
-        selected = {p.name for p in verifyall._select_mhl_files(tmp_path)}
-        # The v2 package dedups to its latest generation (0002); the v1 file stands on its own key.
-        assert selected == {"0002.mhl", "legacy.mhl"}
+        # The v2 package dedups to its latest generation (0002); the v1 file
+        # stands on its own key.
+        assert {p.name for p in _selected_paths(tmp_path)} == {"0002.mhl", "legacy.mhl"}
+
+    def test_single_file_src_classifies_directly(self, tmp_path):
+        make_tree(tmp_path, {"pkg/ascmhl/0001.mhl": _V2_MHL, "loose.mhl": b""})
+        (pkg_item,) = discovery.discover(tmp_path / "pkg" / "ascmhl" / "0001.mhl")
+        assert isinstance(pkg_item, AscmhlPackage)
+        assert pkg_item.root == tmp_path / "pkg"
+        (classic_item,) = discovery.discover(tmp_path / "loose.mhl")
+        assert isinstance(classic_item, ClassicManifest)
 
 
-class TestSelectMhlFilesInvariants:
+class TestDiscoverInvariants:
     """
     Property-based invariants over generated layouts, complementing the unit
     cases above. @given tests manage their own TemporaryDirectory rather than
@@ -175,8 +190,8 @@ class TestSelectMhlFilesInvariants:
     )
     @settings(max_examples=80, suppress_health_check=[HealthCheck.too_slow])
     def test_each_ascmhl_package_selected_at_most_once(self, pkg_names, gen_counts):
-        """No matter how many generation files a package has, _select_mhl_files
-        must return at most one manifest per ascmhl/ directory."""
+        """No matter how many generation files a package has, discover() must
+        return at most one item per ascmhl/ directory."""
         counts = (gen_counts + [1] * len(pkg_names))[: len(pkg_names)]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -189,7 +204,7 @@ class TestSelectMhlFilesInvariants:
                 for i in range(1, n_gens + 1):
                     (ascdir / f"{i:04d}.mhl").write_bytes(_V2_MHL)
 
-            selected = verifyall._select_mhl_files(root)
+            selected = _selected_paths(root)
 
             dir_counts = Counter(f.parent for f in selected if f.parent in package_dirs)
             for ascdir, count in dir_counts.items():
@@ -201,8 +216,8 @@ class TestSelectMhlFilesInvariants:
     )
     @settings(max_examples=80, suppress_health_check=[HealthCheck.too_slow])
     def test_latest_generation_is_always_selected(self, pkg_names, gen_counts):
-        """_select_mhl_files must pick the lexicographically largest filename
-        (i.e. the latest generation) for each ASC-MHL package."""
+        """discover() must represent each ASC-MHL package by its
+        lexicographically largest filename (i.e. the latest generation)."""
         counts = (gen_counts + [1] * len(pkg_names))[: len(pkg_names)]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -215,8 +230,7 @@ class TestSelectMhlFilesInvariants:
                     (ascdir / f"{i:04d}.mhl").write_bytes(_V2_MHL)
                 expected[ascdir] = ascdir / f"{n_gens:04d}.mhl"
 
-            selected = verifyall._select_mhl_files(root)
-            selected_set = set(selected)
+            selected_set = set(_selected_paths(root))
 
             for ascdir, latest in expected.items():
                 assert latest in selected_set, (
@@ -233,10 +247,10 @@ class TestSelectMhlFilesInvariants:
             for name in mhl_names:
                 (root / f"{name}.mhl").write_text("")
 
-            # Distinct names can still collide on a case-insensitive filesystem (e.g. APFS),
-            # so compare against the files on disk.
+            # Distinct names can still collide on a case-insensitive filesystem
+            # (e.g. APFS), so compare against the files on disk.
             on_disk = list(root.glob("*.mhl"))
-            selected = verifyall._select_mhl_files(root)
+            selected = _selected_paths(root)
             assert len(selected) == len(on_disk), (
                 f"Expected {len(on_disk)} loose files, got {len(selected)}: {[p.name for p in selected]}"
             )
@@ -248,8 +262,8 @@ class TestSelectMhlFilesInvariants:
     )
     @settings(max_examples=60, suppress_health_check=[HealthCheck.too_slow])
     def test_output_count_never_exceeds_input_count(self, pkg_names, mhl_names, gen_counts):
-        """Total selected files ≤ total .mhl files on disk: dedup can only reduce
-        the count, never invent or duplicate files."""
+        """Total discovered items ≤ total .mhl files on disk: dedup can only
+        reduce the count, never invent or duplicate items."""
         assume(not (set(pkg_names) & set(mhl_names)))
         counts = (gen_counts + [1] * len(pkg_names))[: len(pkg_names)]
 
@@ -268,7 +282,7 @@ class TestSelectMhlFilesInvariants:
                 (root / f"{name}.mhl").write_text("")
                 total_files += 1
 
-            selected = verifyall._select_mhl_files(root)
+            selected = _selected_paths(root)
             assert len(selected) <= total_files
 
     @given(
@@ -277,7 +291,7 @@ class TestSelectMhlFilesInvariants:
     )
     @settings(max_examples=60, suppress_health_check=[HealthCheck.too_slow])
     def test_output_is_always_sorted(self, n_pkgs, n_loose):
-        """_select_mhl_files must return paths in sorted order regardless of how
+        """discover() must return items in sorted key order regardless of how
         many packages or loose files are present."""
         assume(n_pkgs + n_loose > 0)
 
@@ -292,35 +306,35 @@ class TestSelectMhlFilesInvariants:
             for i in range(n_loose):
                 (root / f"loose{i}.mhl").write_text("")
 
-            selected = verifyall._select_mhl_files(root)
-            assert selected == sorted(selected)
+            keys = [i.root if isinstance(i, AscmhlPackage) else i.path for i in discovery.discover(root)]
+            assert keys == sorted(keys)
 
 
 class TestVerifyItemDispatch:
-    """verify_item routes by the 'ascmhl' path component, both backends in-process."""
+    """verify_item routes by item type, both dialects in-process."""
 
-    def test_classic_manifest_routes_to_classic_backend(self, tmp_path):
+    def test_classic_manifest_routes_to_classic_engine(self, tmp_path):
         manifest = make_mhl_with_size(tmp_path, "clip.mov", b"hello world")
-        code, _mr = verifyall.verify_item(manifest, verbose=False, schema=False)
+        code, _mr = discovery.verify_item(discovery.classify(manifest), verbose=False, schema=False)
         assert code == 0
 
     def test_classic_mismatch_surfaces_nonzero(self, tmp_path):
         manifest = make_mhl_with_size(tmp_path, "clip.mov", b"hello world")
         (tmp_path / "clip.mov").write_bytes(b"tampered")
-        code, _mr = verifyall.verify_item(manifest, verbose=False, schema=False)
+        code, _mr = discovery.verify_item(discovery.classify(manifest), verbose=False, schema=False)
         assert code != 0
 
-    def test_ascmhl_manifest_routes_to_asc_backend(self, tmp_path):
+    def test_ascmhl_manifest_routes_to_asc_engine(self, tmp_path):
         pkg = make_package(tmp_path / "pkg", {"top.txt": b"hello\n"})
         manifest = next((pkg / "ascmhl").glob("*.mhl"))
-        code, _mr = verifyall.verify_item(manifest, verbose=False, schema=False)
+        code, _mr = discovery.verify_item(discovery.classify(manifest), verbose=False, schema=False)
         assert code == 0
 
     def test_ascmhl_tamper_surfaces_mismatch(self, tmp_path):
         pkg = make_package(tmp_path / "pkg", {"top.txt": b"hello\n"})
         (pkg / "top.txt").write_bytes(b"CORRUPT\n")
         manifest = next((pkg / "ascmhl").glob("*.mhl"))
-        code, _mr = verifyall.verify_item(manifest, verbose=False, schema=False)
+        code, _mr = discovery.verify_item(discovery.classify(manifest), verbose=False, schema=False)
         assert code == 11
 
     def test_classic_nonzero_with_no_file_results_is_manifest_error(self, tmp_path, monkeypatch):
@@ -328,55 +342,27 @@ class TestVerifyItemDispatch:
         case) is classified as a manifest-level 'error', not 'failed'."""
         manifest = make_mhl_with_size(tmp_path, "clip.mov", b"hello world")
         monkeypatch.setattr(
-            verifyall, "verify_classic", lambda *a, **kw: VerifyReport(entries=[], code=11, malformed=False)
+            discovery, "verify_classic", lambda *a, **kw: VerifyReport(entries=[], code=11, malformed=False)
         )
-        code, mr = verifyall.verify_item(manifest, verbose=False, schema=False)
+        code, mr = discovery.verify_item(discovery.classify(manifest), verbose=False, schema=False)
         assert code == 11
         assert mr is not None
         assert mr.manifest_status == "error"
 
 
-class TestRenderAscmhlLines:
-    """_render_ascmhl_lines reproduces the terminal text from a VerifyReport."""
-
-    def _report(self):
-        return VerifyReport(
-            notices=["Verified with size-only checks"],
-            entries=[
-                VerifyEntry(path="ok.txt", status="ok", line="[OK] ok.txt"),
-                VerifyEntry(
-                    path="bad.txt",
-                    status="mismatch",
-                    line="[ERROR] size mismatch: bad.txt",
-                    detail_line="        (calc size: 9 | stored size: 4)",
-                ),
-            ],
-        )
-
-    def test_quiet_shows_notices_and_failures_only(self):
-        lines = verifyall._render_ascmhl_lines(self._report(), verbose=False)
-        assert lines == ["Verified with size-only checks", "[ERROR] size mismatch: bad.txt"]
-
-    def test_verbose_adds_ok_lines_and_detail_continuation(self):
-        lines = verifyall._render_ascmhl_lines(self._report(), verbose=True)
-        assert lines == [
-            "Verified with size-only checks",
-            "[OK] ok.txt",
-            "[ERROR] size mismatch: bad.txt",
-            "        (calc size: 9 | stored size: 4)",
-        ]
-
-
-class TestManifestWeights:
-    """_manifest_weights weights by byte volume, but by count under size-only."""
+class TestItemWeights:
+    """Items weight themselves by byte volume, but by count under size-only."""
 
     def test_size_only_weights_every_manifest_equally(self, tmp_path):
-        manifest = make_mhl_with_size(tmp_path, "clip.mov", b"x" * 50)
-        weights = verifyall._manifest_weights([manifest], size_only=True)
-        assert weights == {manifest: 1}
+        item = discovery.classify(make_mhl_with_size(tmp_path, "clip.mov", b"x" * 50))
+        assert item.weight(size_only=True) == 1
 
     def test_byte_weight_counts_recomputable_entry_size(self, tmp_path):
         content = b"x" * 50
-        manifest = make_mhl_with_size(tmp_path, "clip.mov", content)
-        weights = verifyall._manifest_weights([manifest], size_only=False)
-        assert weights[manifest] == len(content)
+        item = discovery.classify(make_mhl_with_size(tmp_path, "clip.mov", content))
+        assert item.weight(size_only=False) == len(content)
+
+    def test_ascmhl_weight_counts_recorded_original_sizes(self, tmp_path):
+        pkg = make_package(tmp_path / "pkg", {"a.bin": b"x" * 30, "sub/b.bin": b"y" * 20})
+        item = discovery.classify(next((pkg / "ascmhl").glob("*.mhl")))
+        assert item.weight(size_only=False) == 50

@@ -1,35 +1,30 @@
 """
-Hashing engine and algorithm registry.
+Hashing engine: the read-once multi-hash loop and the adaptive
+parallel-hashing controller that both seal and verify drive. This is the leaf
+of the suite — it imports nothing else from mhl_suite (the algorithm registry
+lives in mhl_suite.algorithms, one layer up).
 
-The read-once multi-hash loop, the algorithm registry (ALGO_MAP), and the
-adaptive parallel-hashing controller that both seal and verify drive. This is
-the leaf of the suite — it imports nothing else from mhl_suite.
+`get_hashes` (read-once multi-hash of one file), `hash_files`
+(adaptive-parallel hashing of many files), `run_hash_jobs` (the controller
+itself, for callers whose per-file work varies) and the `Hasher` protocol are
+public API for external consumers as well as the rest of the suite.
 
-`get_hashes` (read-once multi-hash of one file), `hash_files` (adaptive-
-parallel hashing of many files) and the `Hasher` protocol are public API for
-external consumers as well as the rest of the suite.
-
-Cross-module callers (classic_verify, classic_seal) reach these functions
-through the module object (e.g. `from mhl_suite import hashing;
-hashing.get_hashes`) so a test monkeypatching `mhl_suite.hashing.get_hashes` /
-`_probe_read_bw_multi` / `_warmup_seq_bw` / the calibration helpers still
-intercepts the call.
+Cross-module callers reach these functions through the module object (e.g.
+`from mhl_suite import hashing; hashing.get_hashes`) so a test monkeypatching
+`mhl_suite.hashing.get_hashes` / `_probe_read_bw_multi` / `_warmup_seq_bw` /
+`calibrate_hash_bandwidth` still intercepts the call.
 """
 
-import hashlib
 import math
 import os
 import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
-from typing import Protocol, TypeVar, cast, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
 
-import xxhash
-
-# Generic result type for the shared hashing controller (str digests for seal,
-# (kind, line) tuples for verify).
+# Generic result type for the shared hashing controller (str digest lists for
+# seal and hash_files, richer per-entry results for the verify engine).
 _T = TypeVar("_T")
 
 
@@ -38,7 +33,8 @@ _T = TypeVar("_T")
 # -----------------------------------------------------------------------------
 # Both xxhash and hashlib hashers expose .update() and .hexdigest() but share no
 # common ABC. We define a structural Protocol so the type checker understands
-# what ALGO_MAP factories return without depending on private hashlib internals.
+# what algorithm factories return without depending on private hashlib
+# internals.
 # Public: it is also the contract external consumers' factories must satisfy
 # (hash_files accepts any constructor of an update/hexdigest object).
 
@@ -64,47 +60,6 @@ class Hasher(Protocol):
 # loop, sets the pace.
 HASH_CHUNK_SIZE = 1024 * 1024
 
-# Registry of the hash algorithms simple-mhl handles, keyed by every CLI /
-# manifest spelling we accept. Each value is a (factory, manifest_tag,
-# verify_rank) triple, so this one map drives all three jobs at once:
-#   * factory      — constructs the hasher used to compute a digest (seal and
-#                    verify)
-#   * manifest_tag — the element name seal writes; aliases collapse, so every
-#                    xxhash spelling is recorded as "xxhash64be" for consistency
-#   * verify_rank  — preference when an entry records several hashes, fastest
-#                    preferred (xxhash > md5 > sha1). It is also the recognition
-#                    set for verify: a hash element whose name isn't a key here
-#                    (and isn't <null>) is ignored exactly as if absent — an
-#                    entry whose only hash is uncomputable falls through to "no
-#                    supported hash found".
-ALGO_MAP: dict[str, tuple[Callable[[], Hasher], str, int]] = cast(
-    "dict[str, tuple[Callable[[], Hasher], str, int]]",
-    {
-        "xxhash": (xxhash.xxh64, "xxhash64be", 0),
-        "xxh64": (xxhash.xxh64, "xxhash64be", 0),
-        "xxhash64": (xxhash.xxh64, "xxhash64be", 0),
-        "xxhash64be": (xxhash.xxh64, "xxhash64be", 0),
-        "md5": (hashlib.md5, "md5", 1),
-        "sha1": (hashlib.sha1, "sha1", 2),
-    },
-)
-
-# <null> is not a real algorithm — it records no digest, so it ranks after every
-# computable algorithm.
-_NULL_TAG = "null"
-_NULL_RANK = max(rank for *_, rank in ALGO_MAP.values()) + 1
-
-
-def _seal_tag(key: str) -> str:
-    """
-    Manifest element name for a seal algorithm key.
-
-    `null` is a valid seal selection but has no ALGO_MAP entry (it records no
-    digest), so it can't go through the normal ALGO_MAP[key][1] lookup.
-    """
-    return _NULL_TAG if key == _NULL_TAG else ALGO_MAP[key][1]
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # Hashing
 # ---------------------------------------------------------------------------------------------------------------------
@@ -118,8 +73,9 @@ def get_hashes(
     """
     Compute several digests of `filepath` in a single read pass.
 
-    `factories` is a list of hasher constructors (the first element of each
-    ALGO_MAP entry). Every chunk read from disk is fed to all hashers, so an
+    `factories` is a list of hasher constructors (see the Hasher protocol;
+    e.g. an Algorithm.factory). Every chunk read from disk is fed to all
+    hashers, so an
     N-format seal costs one disk read instead of N — the read-once paradigm.
     Returns the hex digests as lowercase strings, aligned to `factories`.
 
@@ -153,19 +109,6 @@ def get_hashes(
             if on_progress is not None:
                 on_progress(n)
     return [hasher.hexdigest() for hasher in hashers]
-
-
-def get_hash(filepath: str, algo_key: str, on_progress: "Callable[[int], None] | None" = None) -> str:
-    """
-    Compute the digest of `filepath` using algorithm `algo_key`.
-
-    Returns the hex digest as a lowercase string. Thin single-format wrapper
-    over get_hashes; used by verify (which hashes one format per entry).
-    `on_progress` is forwarded to get_hashes (per-chunk byte counts).
-    """
-    if algo_key not in ALGO_MAP:
-        raise ValueError(f"Unsupported hash algorithm: {algo_key}")
-    return get_hashes(filepath, [ALGO_MAP[algo_key][0]], on_progress=on_progress)[0]
 
 
 # -----------------------------------------------------------------------------
@@ -309,12 +252,13 @@ class _Progress:
 
 
 # A job takes the controller's per-chunk progress callback (chained after the
-# caller's own, see _chain_progress) and returns its result: hashing one file
-# (seal) or hashing-and-comparing one entry (verify).
-_Job = Callable[[Callable[[int], None]], _T]
+# caller's own, see chain_progress) and returns its result: hashing one file
+# (seal) or hashing-and-comparing one entry (verify). Public alias so callers
+# building job lists for run_hash_jobs can type them.
+HashJob = Callable[[Callable[[int], None]], _T]
 
 
-def _chain_progress(first: "Callable[[int], None] | None", second: "Callable[[int], None]") -> "Callable[[int], None]":
+def chain_progress(first: "Callable[[int], None] | None", second: "Callable[[int], None]") -> "Callable[[int], None]":
     """
     Compose a caller's optional per-chunk progress callback with the
     controller's byte counter.
@@ -343,7 +287,7 @@ def _warmup_seq_bw(nbytes: int, elapsed: float) -> float:
     return nbytes / elapsed if elapsed > 0 else float("inf")
 
 
-def _hash_batch(jobs: "list[_Job[_T]]", workers: int, on_progress: "Callable[[int], None]") -> "list[_T]":
+def _hash_batch(jobs: "list[HashJob[_T]]", workers: int, on_progress: "Callable[[int], None]") -> "list[_T]":
     """
     Run `jobs` and return their results in input order, up to `workers` at once.
 
@@ -357,35 +301,18 @@ def _hash_batch(jobs: "list[_Job[_T]]", workers: int, on_progress: "Callable[[in
         return list(ex.map(lambda job: job(on_progress), jobs))
 
 
-def _calibrate_hash_bw(algo_key: str) -> float:
+def calibrate_hash_bandwidth(factories: "list[Callable[[], Hasher]]") -> float:
     """
-    Pure in-RAM hashing throughput (bytes/sec) for `algo_key`, no disk involved.
-
-    Lets us tell whether a measured read rate is limited by the hash (CPU) or by
-    the disk. Runs for a brief fixed time using HASH_CHUNK_SIZE updates so the
-    figure reflects get_hash's real per-chunk cost; ~50 ms is long enough to
-    average out scheduler jitter and invisible beside a multi-GB seal.
-    """
-    buf = bytes(HASH_CHUNK_SIZE)
-    hasher = ALGO_MAP[algo_key][0]()
-    done = 0
-    start = time.perf_counter()
-    while time.perf_counter() - start < _AUTO_CALIBRATION_SECONDS:
-        hasher.update(buf)
-        done += HASH_CHUNK_SIZE
-    elapsed = time.perf_counter() - start
-    return done / elapsed if elapsed > 0 else float("inf")
-
-
-def _calibrate_hash_bw_multi(factories: "list[Callable[[], Hasher]]") -> float:
-    """
-    Combined in-RAM throughput (bytes/sec) of updating every hasher per chunk.
+    Combined in-RAM throughput (bytes/sec) of updating every hasher per chunk —
+    no disk involved. Lets the controller tell whether a measured read rate is
+    limited by the hash (CPU) or by the disk.
 
     With read-once multi-hashing each chunk is fed to all hashers, so the
     effective hash bandwidth is 1/Σ(1/bw_i) — slower than any single algorithm
     alone. Running the real multi-update loop captures that directly, so the
-    storage probe in _hash_jobs_auto compares against the true per-byte cost
-    rather than one algo's.
+    storage probe in run_hash_jobs compares against the true per-byte cost
+    rather than one algo's. ~50 ms is long enough to average out scheduler
+    jitter and invisible beside a multi-GB seal.
     """
     buf = bytes(HASH_CHUNK_SIZE)
     hashers = [factory() for factory in factories]
@@ -502,7 +429,7 @@ def _probe_read_bw_multi(slots: "list[tuple[str, int]]", stream_count: int) -> f
     return total / elapsed if elapsed > 0 else float("inf")
 
 
-def _warmup(jobs: "list[_Job[_T]]", warm_ex: ThreadPoolExecutor, progress: _Progress) -> "tuple[list, int, float]":
+def _warmup(jobs: "list[HashJob[_T]]", warm_ex: ThreadPoolExecutor, progress: _Progress) -> "tuple[list, int, float]":
     """
     Run the sequential warm-up: real hashing, one job at a time on `warm_ex`'s
     single worker, until the measurement window closes (byte AND time floors
@@ -528,21 +455,25 @@ def _warmup(jobs: "list[_Job[_T]]", warm_ex: ThreadPoolExecutor, progress: _Prog
     return futs, submitted, _warmup_seq_bw(progress.bytes, time.perf_counter() - start)
 
 
-def _hash_jobs_auto(
-    paths: list[str], sizes: list[int], jobs: "list[_Job[_T]]", calibrate: "Callable[[], float]"
+def run_hash_jobs(
+    paths: list[str], sizes: list[int], jobs: "list[HashJob[_T]]", calibrate: "Callable[[], float]"
 ) -> "Iterator[_T]":
     """
-    Yield each job's result in input order, auto-tuning concurrency to the
-    storage (see section comment).
+    The adaptive controller itself, public API: yield each job's result in
+    input order, auto-tuning concurrency to the storage (see section comment).
 
     `paths[i]`/`sizes[i]` describe the file job `i` will read — they drive the
     aggregate probe and carve the recheck windows — and `jobs[i]` does the
-    hashing, reporting per-chunk bytes to the progress callback it is handed
-    (that feed is both the sequential warm-up measurement and each window's
-    re-check). `calibrate` is a zero-arg callable returning the in-RAM hash
-    bandwidth (bytes/sec) the job loop sustains; it is invoked lazily, only past
-    the small-job early-returns. Shared by seal (which measures all its formats
-    combined) and verify (one format).
+    hashing (typically via get_hashes), reporting per-chunk bytes to the
+    progress callback it is handed (that feed is both the sequential warm-up
+    measurement and each window's re-check). `calibrate` is a zero-arg callable
+    returning the in-RAM hash bandwidth (bytes/sec) the job loop sustains —
+    usually calibrate_hash_bandwidth(factories) — invoked lazily, only past the
+    small-job early-returns. Jobs may run on worker threads; a job that raises
+    tears down the run, so per-file failures a caller wants to survive must be
+    caught inside the job and returned as part of its result. Shared by seal
+    (which measures all its formats combined) and the verify engine (per-entry
+    formats); hash_files is the simpler per-file-digests wrapper.
     """
     n = len(jobs)
     progress = _Progress()
@@ -652,48 +583,25 @@ def hash_files(
     `factories` are hasher constructors satisfying the Hasher protocol
     (update/hexdigest) — hashlib constructors, xxhash constructors, or any
     third-party hasher such as blake3.blake3 — so callers are NOT limited to
-    the algorithms registered in ALGO_MAP. `sizes[i]` is the byte size of
+    the suite's algorithm registry. `sizes[i]` is the byte size of
     `paths[i]` (callers usually already have it from their own walk); the
     sizes drive the storage probe and the recheck windows. `on_progress`, if
     given, receives per-chunk byte counts and may be called from worker
     threads, so it must be thread-safe.
 
     An OSError from an unreadable file propagates to whoever consumes the
-    iterator; files after the failed one are not hashed.
+    iterator; files after the failed one are not hashed. To hash the good files
+    and collect the bad ones as errors instead of aborting, don't use this
+    wrapper — build your own jobs for run_hash_jobs that catch OSError inside
+    the job and return an error sentinel in place of digests (the verify engine
+    does exactly this; seal deliberately does not, so an unreadable file aborts
+    the whole seal rather than emitting a manifest that silently omits it).
 
     get_hashes is resolved at call time (module global) so test monkeypatches
     still intercept it; the combined hash bandwidth of all `factories` drives
     the parallelism decision.
     """
-    jobs: list[_Job[list[str]]] = [
-        (lambda mon, p=p: get_hashes(p, factories, on_progress=_chain_progress(on_progress, mon))) for p in paths
+    jobs: list[HashJob[list[str]]] = [
+        (lambda mon, p=p: get_hashes(p, factories, on_progress=chain_progress(on_progress, mon))) for p in paths
     ]
-    return _hash_jobs_auto(paths, sizes, jobs, lambda: _calibrate_hash_bw_multi(factories))
-
-
-def _hash_files_auto(paths: list[str], sizes: list[int], algorithms: "list[str]") -> "Iterator[tuple[list[str], str]]":
-    """
-    Seal helper: yield (digests, hashdate) per path — one digest per algorithm
-    in order, plus the ISO-8601 UTC instant hashing finished — auto-tuning
-    concurrency.
-
-    The hashdate is captured inside the worker the moment get_hashes returns, so
-    it reflects when that file's read-once pass actually completed even when
-    files are hashed concurrently in windows (rather than the later emit-loop
-    time).
-
-    get_hashes is resolved at call time (module global) so test monkeypatches
-    still intercept it; the combined hash bandwidth of all `algorithms` drives
-    the parallelism decision.
-    """
-    factories = [ALGO_MAP[a][0] for a in algorithms]
-    jobs: list[_Job[tuple[list[str], str]]] = [
-        (
-            lambda mon, p=p: (
-                get_hashes(p, factories, on_progress=mon),
-                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            )
-        )
-        for p in paths
-    ]
-    return _hash_jobs_auto(paths, sizes, jobs, lambda: _calibrate_hash_bw_multi(factories))
+    return run_hash_jobs(paths, sizes, jobs, lambda: calibrate_hash_bandwidth(factories))

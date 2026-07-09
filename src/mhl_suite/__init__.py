@@ -11,7 +11,7 @@ from mhl_suite.ascmhl_verify import verify_ascmhl
 from mhl_suite.classic_seal import seal_classic
 from mhl_suite.classic_verify import verify_classic
 from mhl_suite.hashing import Hasher, get_hashes, hash_files
-from mhl_suite.verify_results import VerifyEntry, VerifyReport
+from mhl_suite.verify import VerifyEntry, VerifyReport
 
 __all__ = [
     "Hasher",

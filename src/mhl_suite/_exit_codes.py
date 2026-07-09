@@ -1,6 +1,8 @@
 """
-One IntEnum that both verify engines, the verifyall dispatch tables, and the
-CLIs share.
+One IntEnum that the verify engines, the discovery dispatch tables, and the
+CLIs share — kept as its own module so the whole exit-code vocabulary is
+readable in one place, and because it belongs to the suite as a whole (seal's
+usage errors exit in the same numbering space), not to verify alone.
 
 IntEnum (not Enum) so a member IS its int: `sys.exit(ExitCode.HASH_MISMATCH)`
 and `report.code == ExitCode.MISSING` both work without `.value`.

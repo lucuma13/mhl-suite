@@ -2,7 +2,7 @@
 mhlver's report model and renderer (mhl_suite.report).
 
 _render_report and _format_file_result are pure functions writing to a buffer,
-and ManifestResult/FileResult are the model they render. The mhlver CLI run
+and ManifestResult over the engines' VerifyEntries is the model they render. The mhlver CLI run
 tests only feed the renderer empty/all-OK results, so the per-status summaries,
 the Details section, the Issues roll-up, and the size-only/existence-only
 verdict downgrades are exercised here against hand-built ManifestResults.
@@ -12,6 +12,7 @@ import io
 from pathlib import Path
 
 from mhl_suite import report
+from mhl_suite.verify import ErrorKind, HashComparison, Status, VerifyEntry
 
 
 class TestManifestResultCounts:
@@ -25,12 +26,12 @@ class TestManifestResultCounts:
             manifest_path=Path("m.mhl"),
             manifest_status="failed",
             file_results=[
-                report.FileResult(path="a", status="ok"),
-                report.FileResult(path="b", status="ok"),
-                report.FileResult(path="c", status="missing"),
-                report.FileResult(path="d", status="mismatch"),
-                report.FileResult(path="e", status="new"),
-                report.FileResult(path="f", status="error"),
+                VerifyEntry(path="a", status=Status.OK),
+                VerifyEntry(path="b", status=Status.OK),
+                VerifyEntry(path="c", status=Status.MISSING),
+                VerifyEntry(path="d", status=Status.MISMATCH),
+                VerifyEntry(path="e", status=Status.NEW),
+                VerifyEntry(path="f", status=Status.ERROR),
             ],
         )
         assert mr.n_ok == 2
@@ -68,11 +69,11 @@ class TestRenderReportDetails:
             manifest_path=Path("m.mhl"),
             manifest_status="failed",
             file_results=[
-                report.FileResult(path="ok.mxf", status="ok"),
-                report.FileResult(path="gone.mxf", status="missing"),
-                report.FileResult(path="bad.mxf", status="mismatch"),
-                report.FileResult(path="boom.mxf", status="error", detail="boom"),
-                report.FileResult(path="extra.mxf", status="new"),
+                VerifyEntry(path="ok.mxf", status=Status.OK),
+                VerifyEntry(path="gone.mxf", status=Status.MISSING),
+                VerifyEntry(path="bad.mxf", status=Status.MISMATCH),
+                VerifyEntry(path="boom.mxf", status=Status.ERROR, detail="boom"),
+                VerifyEntry(path="extra.mxf", status=Status.NEW),
             ],
         )
         out = self._render([mr], exit_status=40)
@@ -99,8 +100,8 @@ class TestRenderReportDetails:
             manifest_path=Path("m.mhl"),
             manifest_status="ok",
             file_results=[
-                report.FileResult(path="a.mxf", status="ok", size_only=True),
-                report.FileResult(path="b.mxf", status="ok", size_only=True),
+                VerifyEntry(path="a.mxf", status=Status.OK, size_only=True),
+                VerifyEntry(path="b.mxf", status=Status.OK, size_only=True),
             ],
         )
         out = self._render([mr], exit_status=0)
@@ -117,8 +118,8 @@ class TestRenderReportDetails:
             manifest_path=Path("m.mhl"),
             manifest_status="ok",
             file_results=[
-                report.FileResult(path="a.mxf", status="ok"),
-                report.FileResult(path="b.mxf", status="ok", size_only=True),
+                VerifyEntry(path="a.mxf", status=Status.OK),
+                VerifyEntry(path="b.mxf", status=Status.OK, size_only=True),
             ],
         )
         out = self._render([mr], exit_status=0)
@@ -130,7 +131,7 @@ class TestRenderReportDetails:
         mr = report.ManifestResult(
             manifest_path=Path("m.mhl"),
             manifest_status="ok",
-            file_results=[report.FileResult(path="a.mxf", status="ok")],
+            file_results=[VerifyEntry(path="a.mxf", status=Status.OK)],
         )
         out = self._render([mr], exit_status=0)
         assert "✅ VERIFIED" in out
@@ -146,8 +147,8 @@ class TestRenderReportDetails:
             manifest_path=Path("m.mhl"),
             manifest_status="ok",
             file_results=[
-                report.FileResult(path="a.mxf", status="ok"),
-                report.FileResult(path="b.mxf", status="ok", existence_only=True),
+                VerifyEntry(path="a.mxf", status=Status.OK),
+                VerifyEntry(path="b.mxf", status=Status.OK, existence_only=True),
             ],
         )
         out = self._render([mr], exit_status=0)
@@ -164,8 +165,8 @@ class TestRenderReportDetails:
             manifest_path=Path("m.mhl"),
             manifest_status="ok",
             file_results=[
-                report.FileResult(path="a.mxf", status="ok", size_only=True),
-                report.FileResult(path="b.mxf", status="ok", existence_only=True),
+                VerifyEntry(path="a.mxf", status=Status.OK, size_only=True),
+                VerifyEntry(path="b.mxf", status=Status.OK, existence_only=True),
             ],
         )
         out = self._render([mr], exit_status=0)
@@ -224,14 +225,14 @@ class TestRenderReportDetails:
         good = report.ManifestResult(
             manifest_path=Path("good.mhl"),
             manifest_status="ok",
-            file_results=[report.FileResult(path="ok.mxf", status="ok")],
+            file_results=[VerifyEntry(path="ok.mxf", status=Status.OK)],
         )
         bad = report.ManifestResult(
             manifest_path=Path("bad.mhl"),
             manifest_status="failed",
             file_results=[
-                report.FileResult(path="bad.mxf", status="mismatch"),
-                report.FileResult(path="extra.mxf", status="new"),
+                VerifyEntry(path="bad.mxf", status=Status.MISMATCH),
+                VerifyEntry(path="extra.mxf", status=Status.NEW),
             ],
         )
         broken = report.ManifestResult(
@@ -251,7 +252,7 @@ class TestRenderReportDetails:
         mr = report.ManifestResult(
             manifest_path=Path("m.mhl"),
             manifest_status="ok",
-            file_results=[report.FileResult(path="ok.mxf", status="ok")],
+            file_results=[VerifyEntry(path="ok.mxf", status=Status.OK)],
         )
         out = self._render([mr], exit_status=0)
         assert "Issues" not in out
@@ -265,8 +266,8 @@ class TestRenderReportDetails:
             manifest_path=Path("m.mhl"),
             manifest_status="ok",
             file_results=[
-                report.FileResult(path="ok.mxf", status="ok"),
-                report.FileResult(path="extra.mxf", status="new"),
+                VerifyEntry(path="ok.mxf", status=Status.OK),
+                VerifyEntry(path="extra.mxf", status=Status.NEW),
             ],
         )
         details = self._render([mr], exit_status=0).split("Manifest\n", 1)[1]
@@ -278,41 +279,59 @@ class TestFormatFileResult:
     """_format_file_result is a pure status→string mapper; cover every arm."""
 
     def test_ok(self):
-        out = report._format_file_result(report.FileResult(path="f.mxf", status="ok"))
+        out = report._format_file_result(VerifyEntry(path="f.mxf", status=Status.OK))
         assert "✓" in out
         assert "f.mxf" in out
 
     def test_missing(self):
-        out = report._format_file_result(report.FileResult(path="f.mxf", status="missing"))
+        out = report._format_file_result(VerifyEntry(path="f.mxf", status=Status.MISSING))
         assert "missing" in out
         assert "f.mxf" in out
 
-    def test_mismatch_with_verbose_detail_splits_label_and_parenthetical(self):
-        fr = report.FileResult(path="f.mxf", status="mismatch", detail="hash mismatch: calc a | stored b")
+    def test_hash_mismatch_splits_label_and_parenthetical(self):
+        fr = VerifyEntry(
+            path="f.mxf",
+            status=Status.MISMATCH,
+            hashes=[HashComparison(tag="md5", expected="b", computed="a", ok=False)],
+        )
         out = report._format_file_result(fr)
         assert "hash mismatch: f.mxf" in out
-        assert "(calc a | stored b)" in out
+        assert "(calc md5: a | stored md5: b)" in out
 
-    def test_mismatch_without_detail_uses_fallback(self):
-        fr = report.FileResult(path="f.mxf", status="mismatch", detail="size mismatch")
+    def test_size_mismatch_renders_size_parenthetical(self):
+        fr = VerifyEntry(path="f.mxf", status=Status.MISMATCH, recorded_size=4170, actual_size=122)
         out = report._format_file_result(fr)
         assert "size mismatch: f.mxf" in out
-        assert "\n" not in out  # no parenthetical second line
+        assert "(calc size: 122 | stored size: 4170)" in out
+
+    def test_multi_hash_mismatch_has_no_single_parenthetical(self):
+        fr = VerifyEntry(
+            path="f.mxf",
+            status=Status.MISMATCH,
+            hashes=[
+                HashComparison(tag="md5", expected="b", computed="a", ok=False),
+                HashComparison(tag="sha1", expected="d", computed="c", ok=False),
+            ],
+        )
+        out = report._format_file_result(fr)
+        assert "hash mismatch: f.mxf" in out
+        assert "\n" not in out  # no single parenthetical second line
 
     def test_new(self):
-        out = report._format_file_result(report.FileResult(path="f.mxf", status="new"))
+        out = report._format_file_result(VerifyEntry(path="f.mxf", status=Status.NEW))
         assert "new (untracked)" in out
         assert "f.mxf" in out
 
-    def test_error_with_detail(self):
-        fr = report.FileResult(path="f.mxf", status="error", detail="boom")
+    def test_io_error_names_kind_and_os_text(self):
+        fr = VerifyEntry(path="f.mxf", status=Status.ERROR, error=ErrorKind.IO, detail="boom")
         out = report._format_file_result(fr)
         assert "error" in out
         assert "f.mxf" in out
-        assert "(boom)" in out
+        assert "(cannot verify: boom)" in out
 
-    def test_error_without_detail(self):
-        out = report._format_file_result(report.FileResult(path="f.mxf", status="error"))
+    def test_error_reason_comes_from_kind(self):
+        fr = VerifyEntry(path="f.mxf", status=Status.ERROR, error=ErrorKind.TRAVERSAL)
+        out = report._format_file_result(fr)
         assert "error" in out
         assert "f.mxf" in out
-        assert "\n" not in out  # no detail line
+        assert "(blocked traversal attempt)" in out

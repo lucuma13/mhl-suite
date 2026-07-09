@@ -16,7 +16,10 @@ from lxml import etree
 
 from mhl_suite import classic_seal as core_seal
 from mhl_suite import osutils
+from mhl_suite.algorithms import get_hash
+from mhl_suite.classic_seal import SealError
 from mhl_suite.cli import simple_mhl
+from mhl_suite.verify import VERIFY_ALL
 
 from .helpers import (
     _sensitive_fs,
@@ -231,7 +234,7 @@ class TestUnicodeNormalization:
         nfd_path = tmp_path / self._NFD_NAME
         nfd_path.write_bytes(b"data")
 
-        real_iter = simple_mhl._iter_files_for_seal
+        real_iter = core_seal._iter_files_for_seal
 
         def nfd_iter(root, mhl_path, on_skip=None):
             for p, stat_result in real_iter(root, mhl_path, on_skip=on_skip):
@@ -304,7 +307,7 @@ class TestUnicodeNormalization:
         # Create the file with an NFC name.
         nfc_path = tmp_path / self._NFC_NAME
         nfc_path.write_bytes(b"data")
-        digest = simple_mhl.get_hash(str(nfc_path), "md5")
+        digest = get_hash(str(nfc_path), "md5")
 
         # Write a manifest with the NFD form of the same name.
         root = etree.Element("hashlist", version="1.1")
@@ -331,7 +334,7 @@ class TestUnicodeNormalization:
         nfc_path = tmp_path / self._NFC_NAME
         content = b"accented content"
         nfc_path.write_bytes(content)
-        digest = simple_mhl.get_hash(str(nfc_path), "md5")
+        digest = get_hash(str(nfc_path), "md5")
 
         root = etree.Element("hashlist", version="1.1")
         h = etree.SubElement(root, "hash")
@@ -386,7 +389,7 @@ class TestUnicodeNormalization:
         nfd_path = tmp_path / self._NFD_NAME
         content = b"data"
         nfd_path.write_bytes(content)
-        digest = simple_mhl.get_hash(str(nfd_path), "md5")
+        digest = get_hash(str(nfd_path), "md5")
 
         root = etree.Element("hashlist", version="1.1")
         h = etree.SubElement(root, "hash")
@@ -496,12 +499,10 @@ class TestNormalizationVariantHint:
             dirs={os.sep, self._VOL, nfd_dir},
         )
         typed = os.path.join(self._VOL, self._NFC)  # NFC dir, not on disk
-        with pytest.raises(SystemExit) as exc:
+        with pytest.raises(SealError) as exc:
             simple_mhl.seal_classic(typed, ["md5"])
-        assert exc.value.code == 2
-        err = capsys.readouterr().err
-        assert "did you mean" in err
-        assert nfd_dir in err
+        assert "did you mean" in str(exc.value)
+        assert nfd_dir in str(exc.value)
 
 
 class TestVerifyAlgorithmSelection:
@@ -713,8 +714,9 @@ class TestVerifyAlgorithmSelection:
 class TestCombineAlgorithms:
     """Merging repeated -a occurrences (argparse action="append" shapes)."""
 
-    def test_seal_none_defaults_to_xxhash(self):
-        assert simple_mhl.combine_seal_algorithms(None) == ["xxhash"]
+    def test_seal_none_defaults_to_xxh64(self):
+        assert simple_mhl.combine_seal_algorithms(None) == ["xxh64"]
+        assert simple_mhl.classic_seal_tag("xxh64") == "xxhash64be"
 
     def test_seal_flattens_and_dedups_across_flags(self):
         assert simple_mhl.combine_seal_algorithms([["md5"], ["sha1"], ["md5"]]) == ["md5", "sha1"]
@@ -726,7 +728,7 @@ class TestCombineAlgorithms:
         assert simple_mhl.combine_verify_algorithms([["md5"], ["sha1"], ["md5"]]) == ["md5", "sha1"]
 
     def test_verify_all_supersedes(self):
-        assert simple_mhl.combine_verify_algorithms([["md5"], "all"]) == simple_mhl._VERIFY_ALL
+        assert simple_mhl.combine_verify_algorithms([["md5"], "all"]) == VERIFY_ALL
 
 
 class TestParseVerifyAlgorithms:
@@ -735,7 +737,7 @@ class TestParseVerifyAlgorithms:
     """
 
     def test_all_keyword_supersedes(self):
-        assert simple_mhl.parse_verify_algorithms("md5,all") is simple_mhl._VERIFY_ALL
+        assert simple_mhl.parse_verify_algorithms("md5,all") is VERIFY_ALL
 
     def test_dedup_by_tag_first_wins(self):
         # xxhash and xxh64 both canonicalise to xxhash64be; only the first survives.

@@ -1,10 +1,12 @@
 """
-The data model (FileResult / ManifestResult) and the writer for mhlver's
-`--report` log.
+The per-manifest aggregation model (ManifestResult) and the writer for
+mhlver's `--report` log.
 
 Kept separate from the terminal-output path so the streaming log behaviour isn't
-affected. Used only by mhlver today; it lives alongside hashing and
-verify_results as the cross-dialect layer that survives the ASC-MHL absorption.
+affected. Per-file outcomes are the engines' own semantic VerifyEntries —
+there is no parallel FileResult type to copy them into — and the failure
+labels/parentheticals come from the shared renderer (mhl_suite.verify), so the report file and the
+terminal cannot drift.
 """
 
 import getpass
@@ -17,37 +19,12 @@ from typing import TextIO
 
 from mhl_suite import __version__
 from mhl_suite.osutils import friendly_hostname
+from mhl_suite.verify import ErrorKind, Status, VerifyEntry, failure_label, failure_paren
 
-# -----------------------------------------------------------------------------
-# Report data model
-# -----------------------------------------------------------------------------
-# FileResult and ManifestResult are populated from each backend's structured
-# result when --report is requested. They are kept entirely separate from the
-# terminal output path so that the existing streaming log behaviour is not
-# affected.
-#
-# status values:
-#   * "ok"        — file verified successfully
-#   * "missing"   — file not found on disk
-#   * "mismatch"  — hash (or size) does not match the manifest
-#   * "new".      — file found on disk but not recorded in ASC-MHL history
-#   * "error"     — any other per-file problem (traversal block, bad algo, etc.)
-#
 # manifest_status values:
 #   * "ok"        — all files verified
 #   * "failed"    — one or more per-file failures
 #   * "error"     — manifest-level failure (malformed XML, etc.)
-
-
-@dataclass
-class FileResult:
-    """Outcome for a single file entry within a manifest."""
-
-    path: str  # relative path as recorded in the manifest
-    status: str  # "ok" | "missing" | "mismatch" | "new" | "error"
-    detail: str = ""  # extra info: mismatch hashes, error reason, etc.
-    size_only: bool = False  # size-only check (<null> tag), no hash checked
-    existence_only: bool = False  # existence-only check <null> tag with no recorded <size>
 
 
 @dataclass
@@ -57,36 +34,36 @@ class ManifestResult:
     manifest_path: Path
     manifest_status: str  # "ok" | "failed" | "error"
     manifest_error: str = ""  # set when manifest_status == "error"
-    file_results: list[FileResult] = field(default_factory=list)
+    file_results: list[VerifyEntry] = field(default_factory=list)
 
     # Convenience counts — computed once after collection is complete.
     @property
     def n_ok(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "ok")
+        return sum(1 for r in self.file_results if r.status == Status.OK)
 
     @property
     def n_missing(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "missing")
+        return sum(1 for r in self.file_results if r.status == Status.MISSING)
 
     @property
     def n_mismatch(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "mismatch")
+        return sum(1 for r in self.file_results if r.status == Status.MISMATCH)
 
     @property
     def n_new(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "new")
+        return sum(1 for r in self.file_results if r.status == Status.NEW)
 
     @property
     def n_error(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "error")
+        return sum(1 for r in self.file_results if r.status == Status.ERROR)
 
     @property
     def n_size_only(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "ok" and r.size_only)
+        return sum(1 for r in self.file_results if r.status == Status.OK and r.size_only)
 
     @property
     def n_existence_only(self) -> int:
-        return sum(1 for r in self.file_results if r.status == "ok" and r.existence_only)
+        return sum(1 for r in self.file_results if r.status == Status.OK and r.existence_only)
 
     @property
     def n_files(self) -> int:
@@ -252,7 +229,7 @@ def _render_report(
         if mr.manifest_status == "error":
             issue_lines.append(f"🚨 {mr.manifest_path}: {mr.manifest_error or 'manifest-level error'}")
             continue
-        issue_lines.extend(_format_file_result(fr, indent="") for fr in mr.file_results if fr.status != "ok")
+        issue_lines.extend(_format_file_result(fr, indent="") for fr in mr.file_results if fr.status != Status.OK)
 
     if issue_lines:
         line("Issues")
@@ -299,17 +276,17 @@ def _render_report(
     line(_SEP_HEAVY)
 
 
-def _format_file_result(fr: "FileResult", indent: str = "    ") -> str:
+def _format_file_result(fr: VerifyEntry, indent: str = "    ") -> str:
     """
-    Return the report line(s) for a single FileResult (without trailing
+    Return the report line(s) for a single VerifyEntry (without trailing
     newline).
 
     `indent` is the leading whitespace for the primary line; the Details section
     indents under its manifest header (4 spaces) while the Issues section sits
     at column 0. Continuation (detail) lines are indented `indent` + 3 spaces.
 
-    Mismatch entries with detail render across two lines, using the label
-    embedded in the detail string (e.g. "hash mismatch", "size mismatch"):
+    Mismatch entries render across two lines, labelled by the shared
+    failure_label/failure_paren renderer helpers:
 
         ❌ hash mismatch: path/to/file.mxf
            (calc xxh64: abc123 | stored xxh64: def456)
@@ -318,19 +295,20 @@ def _format_file_result(fr: "FileResult", indent: str = "    ") -> str:
            (calc size: 122 | stored size: 4170)
     """
     cont = indent + "   "  # continuation/detail line indent
-    if fr.status == "ok":
+    if fr.status == Status.OK:
         return f"{indent}✓ {fr.path}"
-    if fr.status == "missing":
+    if fr.status == Status.MISSING:
         return f"{indent}❌ missing: {fr.path}"
-    if fr.status == "mismatch":
-        if ": " in fr.detail:
-            label, paren_content = fr.detail.split(": ", 1)
-            return f"{indent}❌ {label}: {fr.path}\n{cont}({paren_content})"
-        # Non-verbose failsafe: detail is just "hash mismatch" or "size mismatch".
-        return f"{indent}❌ {fr.detail}: {fr.path}"
-    if fr.status == "new":
+    if fr.status == Status.MISMATCH:
+        paren = failure_paren(fr)
+        if paren:
+            return f"{indent}❌ {failure_label(fr)}: {fr.path}\n{cont}({paren})"
+        # A multi-hash (-a all) mismatch has no single parenthetical.
+        return f"{indent}❌ {failure_label(fr)}: {fr.path}"
+    if fr.status == Status.NEW:
         return f"{indent}⚠️ new (untracked): {fr.path}"
-    # "error"
-    if fr.detail:
-        return f"{indent}🚨 error: {fr.path}\n{cont}({fr.detail})"
-    return f"{indent}🚨 error: {fr.path}"
+    # Status.ERROR — the label carries the category; IO errors add the OS text.
+    reason = failure_label(fr)
+    if fr.error == ErrorKind.IO and fr.detail:
+        reason = f"{reason}: {fr.detail}"
+    return f"{indent}🚨 error: {fr.path}\n{cont}({reason})"

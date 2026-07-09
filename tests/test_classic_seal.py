@@ -11,6 +11,7 @@ import xxhash
 from lxml import etree
 
 from mhl_suite import hashing as core_hashing
+from mhl_suite.classic_seal import SealError
 from mhl_suite.cli import simple_mhl
 
 from .helpers import (
@@ -383,17 +384,16 @@ class TestSealMultiFormat:
 
 
 class TestSealUnsupportedAlgorithm:
-    """seal() exits 2 when called directly with an algorithm not in ALGO_MAP."""
+    """seal_classic raises SealError for an unregistered algorithm; the CLI maps it to exit 2."""
 
-    def test_unsupported_algorithm_exits_2_with_message(self, tmp_path, capsys):
-        """Calling seal() directly with an algorithm not in ALGO_MAP exits 2 and
-        names it on stderr (the internal guard, unreachable via the CLI parser)."""
+    def test_unsupported_algorithm_raises_seal_error(self, tmp_path):
+        """Calling seal_classic directly with an unknown algorithm raises a
+        SealError naming it (the internal guard, unreachable via the CLI
+        parser) — the library never exits the process itself."""
 
         (tmp_path / "a.bin").write_bytes(b"data")
-        with pytest.raises(SystemExit) as exc:
+        with pytest.raises(SealError, match="blake3"):
             simple_mhl.seal_classic(str(tmp_path), ["blake3"])
-        assert exc.value.code == 2
-        assert "blake3" in capsys.readouterr().err
 
 
 class TestSealAtomicCollision:
@@ -485,8 +485,7 @@ class TestSealConcurrency:
         monkeypatch.setattr(core_hashing, "_AUTO_WARMUP_SECONDS", 0.0)
         monkeypatch.setattr(core_hashing, "_AUTO_PROBE_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
-        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw", lambda a: 1000.0)
-        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw_multi", lambda f: 1000.0)
+        monkeypatch.setattr(core_hashing, "calibrate_hash_bandwidth", lambda f: 1000.0)
         monkeypatch.setattr(core_hashing, "_warmup_seq_bw", lambda nbytes, elapsed: 1000.0)
         # aggregate >> sequential baseline ⇒ parallel
         monkeypatch.setattr(core_hashing, "_probe_read_bw_multi", lambda slots, n: 8000.0)
@@ -505,8 +504,7 @@ class TestSealConcurrency:
         make_tree(tmp_path, {"a.bin": b"x", "b.bin": b"y"})
         monkeypatch.setattr(core_hashing, "_AUTO_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
-        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw", lambda a: 1000.0)
-        monkeypatch.setattr(core_hashing, "_calibrate_hash_bw_multi", lambda f: 1000.0)
+        monkeypatch.setattr(core_hashing, "calibrate_hash_bandwidth", lambda f: 1000.0)
         probed: list[int] = []
         monkeypatch.setattr(core_hashing, "_probe_read_bw_multi", lambda slots, n: probed.append(1) or 100.0)
         simple_mhl.seal_classic(str(tmp_path), ["md5"], verbose=False)

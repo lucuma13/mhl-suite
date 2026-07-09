@@ -42,9 +42,9 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-  "ascmhl>=1.2",
-  "click>=8.1.8",
   "lxml>=6.1.1",
+  "packaging>=26.2",
+  "pathspec>=0.12",
   "rich>=15",
   "xxhash>=3.8.1",
 ]
@@ -54,6 +54,9 @@ scripts.simple-mhl = "mhl_suite.cli.simple_mhl:main"
 
 [dependency-groups]
 dev = [
+  # The reference implementation stays as a dev dependency: the test suite
+  # seals its ASC-MHL parity fixtures with it.
+  "ascmhl>=1.2",
   "hypothesis",
   "lxml-stubs",
   "pre-commit",
@@ -124,5 +127,5 @@ default.extend-words.Nd = "Nd"  # "Number, decimal digit" Unicode category in Hy
 [tool.pytest]
 ini_options.addopts = "--strict-markers --cov=src --cov-branch --cov-report=term-missing --cov-report=xml"
 ini_options.filterwarnings = [
-  "ignore:GitWildMatchPattern.*:DeprecationWarning", # pathspec 'gitwildmatch' deprecation (ascmhl dependency)
+  "ignore:GitWildMatchPattern.*:DeprecationWarning", # the ascmhl dev dependency still uses pathspec's deprecated 'gitwildmatch' when sealing test fixtures; first-party code uses GitIgnoreSpecPattern
 ]

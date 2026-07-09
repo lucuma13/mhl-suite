@@ -84,6 +84,56 @@ def make_mhl_with_size(dest_dir: Path, filename: str, content: bytes, size_overr
     return mhl
 
 
+def asc_hash_record(
+    path: str,
+    digest: str,
+    action: str | None,
+    size: int | None = None,
+    previous_path: str | None = None,
+    fmt: str = "xxh64",
+) -> str:
+    """One ASC-MHL <hash> block as XML text; action=None omits the attribute."""
+    size_attr = f' size="{size}"' if size is not None else ""
+    action_attr = f' action="{action}"' if action is not None else ""
+    previous = f"\n   <previousPath>{previous_path}</previousPath>" if previous_path is not None else ""
+    return f"""  <hash>
+   <path{size_attr}>{path}</path>{previous}
+   <{fmt}{action_attr}>{digest}</{fmt}>
+  </hash>"""
+
+
+def make_asc_package(root: Path, generations: list[list[str]], ignore_patterns: list[str] | None = None) -> Path:
+    """
+    Hand-write an ASC-MHL history (oldest generation first, each a list of
+    asc_hash_record blocks) with a valid chain file — for spec-conformance
+    cases no sealer here can produce (e.g. rename records labeled `verified`
+    per spec 5.6.4, or entries missing the action attribute). Data files must
+    already exist under `root`.
+    """
+    ascmhl_dir = Path(root) / "ascmhl"
+    ascmhl_dir.mkdir(parents=True, exist_ok=True)
+    ignore = ""
+    if ignore_patterns:
+        patterns = "".join(f"<pattern>{p}</pattern>" for p in ignore_patterns)
+        ignore = f"  <ignore>{patterns}</ignore>\n"
+    chain_entries = []
+    for number, records in enumerate(generations, start=1):
+        name = f"{number:04d}_pkg_2026-01-01_00000{number}.mhl"
+        body = "\n".join(records)
+        data = (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n<hashlist version="2.0">\n'
+            f" <hashes>\n{body}\n </hashes>\n{ignore}</hashlist>\n"
+        ).encode()
+        (ascmhl_dir / name).write_bytes(data)
+        chain_entries.append(
+            f' <hashlist sequencenr="{number}"><path>{name}</path>'
+            f"<xxh64>{xxhash.xxh64(data).hexdigest()}</xxh64></hashlist>"
+        )
+    chain = '<?xml version="1.0" encoding="UTF-8"?>\n<ascmhlchain>\n' + "\n".join(chain_entries) + "\n</ascmhlchain>\n"
+    (ascmhl_dir / "ascmhl_chain.xml").write_text(chain)
+    return Path(root)
+
+
 def make_mhl(dest_dir: Path, entries: list[dict]) -> Path:
     """
     Write a minimal MHL referencing the given entries.

@@ -1,20 +1,22 @@
 """
-Tests for classic_verify: structured verify_classic outcomes, schema validation / bundled-XSD path resolution, plus
-CLI-level verify behaviour.
+Tests for classic_verify: structured verify_classic outcomes plus CLI-level
+verify behaviour. Schema validation lives in test_xsd_check, the shared
+result model and renderer in test_verify.
 """
 
 import hashlib
 import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 import xxhash
 from lxml import etree
 
-from mhl_suite import classic_verify, hashing, ignorelist
+from mhl_suite import classic_seal as core_seal
+from mhl_suite import classic_verify, hashing
 from mhl_suite.cli import simple_mhl
+from mhl_suite.verify import ErrorKind
 
 from .helpers import make_mhl_with_size, make_multi_hash_mhl, make_tree, seal_helper
 
@@ -165,53 +167,8 @@ class TestVerify:
         user file IS yielded."""
         make_tree(tmp_path, {"visible.bin": b"x", ".hidden.bin": b"y", ".DS_Store": b"junk"})
         mhl_path = str(tmp_path / "out.mhl")
-        yielded = sorted(os.path.basename(p) for p, _ in simple_mhl._iter_files_for_seal(str(tmp_path), mhl_path))
+        yielded = sorted(os.path.basename(p) for p, _ in core_seal._iter_files_for_seal(str(tmp_path), mhl_path))
         assert yielded == [".hidden.bin", "visible.bin"]
-
-    @pytest.mark.parametrize(
-        ("name", "is_junk"),
-        [
-            # Exact names (case-insensitive)
-            (".DS_Store", True),
-            (".ds_store", False),  # case-sensitive: only the OS's exact casing matches
-            (".Spotlight-V100", True),
-            (".Trashes", True),
-            (".fseventsd", True),
-            ("Thumbs.db", True),
-            (".localized", True),
-            (".AppleDouble", True),
-            (".LSOverride", True),
-            (".DocumentRevisions-V100", True),
-            (".TemporaryItems", True),
-            (".VolumeIcon.icns", True),
-            (".com.apple.timemachine.donotpresent", True),
-            (".com.apple.timemachine.supported", True),
-            (".PKInstallSandboxManager", True),
-            (".PKInstallSandboxManager-SystemSoftware", True),
-            (".hotfiles.btree", True),
-            (".vol", True),
-            (".file", True),
-            ("lost+found", True),
-            # Trailing-carriage-return names (real bytes in the on-disk name)
-            ("Icon\r", True),
-            (".HFS+ Private Directory Data\r", True),
-            # Prefix matches
-            ("._MyClip.mov", True),  # macOS AppleDouble resource fork
-            ("._", True),  # bare '._' still matches the fork prefix
-            (".disk_label", True),
-            (".disk_label_2x", True),
-            # NOT junk — hidden user content is sealed
-            (".hidden.bin", False),
-            (".git", False),  # hidden user dir — descended
-            (".env", False),
-            ("clip.mxf", False),
-            ("Icon", False),  # plain 'Icon' (no CR) is a real file, not the marker
-            ("lost+found2", False),  # exact match only
-        ],
-    )
-    def test_is_os_junk(self, name, is_junk):
-        """Only OS-generated metadata is junk; hidden user files/dirs are not."""
-        assert ignorelist.is_os_junk(name) is is_junk
 
     @pytest.mark.skipif(sys.platform == "win32", reason="os.mkfifo is POSIX-only")
     def test_iter_files_without_on_skip_skips_non_regular(self, tmp_path):
@@ -219,7 +176,7 @@ class TestVerify:
         make_tree(tmp_path, {"visible.bin": b"x"})
         os.mkfifo(tmp_path / "pipe")
         mhl_path = str(tmp_path / "out.mhl")
-        yielded = [os.path.basename(p) for p, _ in simple_mhl._iter_files_for_seal(str(tmp_path), mhl_path)]
+        yielded = [os.path.basename(p) for p, _ in core_seal._iter_files_for_seal(str(tmp_path), mhl_path)]
         assert yielded == ["visible.bin"]
 
     def test_verify_directory_argument(self, mhl_cli, tmp_path):
@@ -336,39 +293,6 @@ class TestVerifyClassicBadAlgorithm:
         to its manifest tag, verifying cleanly when the digest matches."""
         report = classic_verify.verify_classic(str(self._mhl(tmp_path)), algorithm="md5")
         assert report.code == 0
-
-
-class TestRenderMissingVerboseDetail:
-    """render_verify_lines emits a missing entry's verbose continuation when one
-    is present (symmetry with the mismatch detail path)."""
-
-    def test_missing_entry_detail_line_shown_when_verbose(self):
-        report = classic_verify.VerifyReport(
-            entries=[
-                classic_verify.VerifyEntry(
-                    path="a.bin",
-                    status="missing",
-                    line="[ERROR] missing file: a.bin",
-                    detail_line="        (looked in: /vol/a.bin)",
-                )
-            ],
-            code=10,
-        )
-        verbose = classic_verify.render_verify_lines(report, verbose=True)
-        assert "[ERROR] missing file: a.bin" in verbose
-        assert "        (looked in: /vol/a.bin)" in verbose
-        # Without -v the continuation is suppressed.
-        plain = classic_verify.render_verify_lines(report, verbose=False)
-        assert "(looked in" not in "\n".join(plain)
-
-
-class TestMatchesDecimal:
-    """_matches_decimal compares a decimal string against an int digest: equal
-    values match, and a non-numeric string is rejected rather than raising."""
-
-    def test_compares_decimal_string_to_int(self):
-        assert classic_verify._matches_decimal("42", 42) is True
-        assert classic_verify._matches_decimal("not-a-number", 5) is False
 
 
 def _le_hex(value: int, nbytes: int) -> str:
@@ -499,7 +423,7 @@ class TestSizePreCheck:
         to confirm hashing is never reached.
         """
         get_hashes_calls: list[str] = []
-        real_get_hashes = simple_mhl.get_hashes
+        real_get_hashes = hashing.get_hashes
 
         def spy_get_hashes(filepath, factories, on_progress=None):
             get_hashes_calls.append(filepath)
@@ -608,7 +532,7 @@ class TestVerifyConcurrency:
         monkeypatch.setattr(hashing, "_AUTO_WARMUP_SECONDS", 0.0)
         monkeypatch.setattr(hashing, "_AUTO_PROBE_MIN_BYTES", 0)
         monkeypatch.setattr(simple_mhl.os, "cpu_count", lambda: 8)
-        monkeypatch.setattr(hashing, "_calibrate_hash_bw", lambda a: 1000.0)
+        monkeypatch.setattr(hashing, "calibrate_hash_bandwidth", lambda f: 1000.0)
         monkeypatch.setattr(hashing, "_warmup_seq_bw", lambda nbytes, elapsed: 1000.0)
         monkeypatch.setattr(hashing, "_probe_read_bw_multi", lambda slots, n: 8000.0)  # aggregate >> seq ⇒ parallel
         monkeypatch.setattr(hashing, "_AUTO_RECHECK_BYTES", 4096)  # several windows over tiny files
@@ -655,15 +579,19 @@ class TestVerifyManifestOutcomes:
         etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
         return mhl
 
-    def test_hash_mismatch_detail_is_full_fidelity(self, tmp_path):
+    def test_hash_mismatch_carries_full_comparison(self, tmp_path):
         (tmp_path / "f.bin").write_bytes(b"actual content")  # 14 bytes
         mhl = self._write(tmp_path, [("f.bin", {"size": "14", "md5": "0" * 32})])
         report = classic_verify.verify_classic(str(mhl))
         assert report.code == 11
         (e,) = report.entries
         assert e.status == "mismatch"
-        assert e.detail.startswith("hash mismatch: calc md5: ")
-        assert "stored md5: " + "0" * 32 in e.detail
+        assert e.hash_mismatch
+        (cmp_,) = e.hashes
+        assert cmp_.tag == "md5"
+        assert cmp_.expected == "0" * 32
+        assert cmp_.computed == hashlib.md5(b"actual content").hexdigest()
+        assert cmp_.ok is False
 
     def test_missing_file(self, tmp_path):
         mhl = self._write(tmp_path, [("ghost.bin", {"size": "3", "md5": "0" * 32})])
@@ -676,21 +604,22 @@ class TestVerifyManifestOutcomes:
         mhl = self._write(tmp_path, [("../escape.bin", {"size": "3", "md5": "0" * 32})])
         (e,) = classic_verify.verify_classic(str(mhl)).entries
         assert e.status == "error"
-        assert e.detail == "blocked traversal attempt"
+        assert e.error == ErrorKind.TRAVERSAL
 
     def test_size_only_without_recorded_size_is_error(self, tmp_path):
         (tmp_path / "f.bin").write_bytes(b"xx")
         mhl = self._write(tmp_path, [("f.bin", {"md5": "0" * 32})])  # no <size>
         (e,) = classic_verify.verify_classic(str(mhl), size_only=True).entries
         assert e.status == "error"
-        assert e.detail == "no size recorded"
+        assert e.error == ErrorKind.NO_SIZE
 
     def test_requested_hash_not_stored_is_error(self, tmp_path):
         (tmp_path / "f.bin").write_bytes(b"xx")
         mhl = self._write(tmp_path, [("f.bin", {"size": "2", "md5": hashlib.md5(b"xx").hexdigest()})])
         (e,) = classic_verify.verify_classic(str(mhl), algorithm=["sha1"]).entries
         assert e.status == "error"
-        assert e.detail == "requested hash sha1 not stored"
+        assert e.error == ErrorKind.HASH_NOT_STORED
+        assert e.detail == "sha1"
 
     def test_null_entries_set_size_only_and_existence_only(self, tmp_path):
         (tmp_path / "s.bin").write_bytes(b"abcd")
@@ -970,115 +899,3 @@ class TestVerifyNullAndHashEdgeCases:
         etree.ElementTree(root).write(str(mhl), xml_declaration=True, encoding="UTF-8")
 
         assert mhl_cli(["verify", str(mhl)])[0] == 0
-
-
-class TestSchemaCheck:
-    """Tests for xsd-schema-check."""
-
-    def test_schema_check_no_xsd(self, mhl_cli, tmp_path):
-        """Malformed XML is rejected before schema validation (exit 40)."""
-        bad = tmp_path / "bad.mhl"
-        bad.write_text("<not valid xml")
-        rc, _, _ = mhl_cli(["xsd-schema-check", str(bad)])
-        assert rc == 40
-
-    def test_schema_check_valid_manifest(self, mhl_cli, tmp_path):
-        """A properly sealed manifest should pass schema validation (exit 0)."""
-        make_tree(tmp_path, {"a.bin": b"hello"})
-        mhl = seal_helper(mhl_cli, tmp_path)
-        rc, _, _ = mhl_cli(["xsd-schema-check", str(mhl)])
-        assert rc == 0
-
-    def test_schema_check_invalid_structure(self, mhl_cli, tmp_path):
-        """A manifest with unrecognised tags should fail schema validation (exit 41)."""
-        bad_mhl = tmp_path / "invalid.mhl"
-        bad_mhl.write_text(
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<hashlist version="1.1">\n'
-            "  <fake_tag>This breaks the schema</fake_tag>\n"
-            "</hashlist>\n"
-        )
-        rc, _, err = mhl_cli(["xsd-schema-check", str(bad_mhl)])
-        assert rc == 41
-        assert "XSD validation failed" in err
-
-
-class TestValidateSchemaXsdNotFound:
-    """validate_schema() must exit 1 (broken install) when get_xsd_path() raises."""
-
-    def test_xsd_not_found_exits_1_with_stderr(self, mhl_cli, tmp_path, monkeypatch):
-        """When get_xsd_path raises FileNotFoundError, xsd-schema-check must
-        exit 1 and write an error message to stderr."""
-
-        mhl_file = tmp_path / "dummy.mhl"
-        mhl_file.write_text('<?xml version="1.0" encoding="UTF-8"?>\n<hashlist version="1.1"/>\n')
-
-        def _raise():
-            raise FileNotFoundError("Could not locate MediaHashList_v1_1.xsd (tried /fake/path)")
-
-        monkeypatch.setattr(classic_verify, "get_xsd_path", _raise)
-
-        rc, _, err = mhl_cli(["xsd-schema-check", str(mhl_file)])
-        assert rc == 1
-        assert "could not locate" in err.lower() or "mediahashlist" in err.lower()
-
-    def test_validate_schema_oserror_exits_40(self, mhl_cli, tmp_path):
-        """An OSError reading the MHL file (e.g. file disappears after the
-        existence check) must produce exit 40 and a 'File Error' on stderr."""
-        # We create the file, call xsd-schema-check with a path that will cause lxml to raise OSError by giving it a
-        # directory path (lxml can't parse a directory as XML).
-        bogus = tmp_path / "not_a_file"
-        bogus.mkdir()
-        # Rename it to have a .mhl extension so verify's extension check passes.
-        mhl_path = tmp_path / "broken.mhl"
-        mhl_path.mkdir()  # a directory masquerading as a .mhl file
-        rc, _, _err = mhl_cli(["xsd-schema-check", str(mhl_path)])
-        # lxml raises OSError trying to open a directory; validate_schema → exit 40.
-        assert rc in (40, 1)  # 1 if the dir check fires first
-
-
-class TestGetXsdPathFallbackPaths:
-    """get_xsd_path fallback: importlib.resources raises → local xsd/ sibling."""
-
-    def test_fallback_resolves_against_real_module_layout(self):
-        """The checkout fallback must find the bundled XSD at the module's *real*
-        location, not a patched one. The other tests fake __file__ to exercise the path arithmetic, which means they
-        pass regardless of how deep the module actually sits — so they can't catch a restructure that moves the module
-        between directory depths (e.g. the parent.parent → parent flatten). This one forces the importlib path to fail
-        and asserts the fallback lands on a file that exists, with no __file__ patching, so it breaks if the relative
-        offset stops matching the real tree.
-        """
-        with patch.object(classic_verify.importlib.resources, "files", side_effect=ImportError("no package")):
-            result = classic_verify.get_xsd_path()
-        assert Path(result).is_file()
-        assert Path(result).name == "MediaHashList_v1_1.xsd"
-
-    def test_resource_present_but_not_a_file_falls_through(self):
-        """When files() succeeds but is_file() returns False (e.g. a namespace
-        package without the XSD installed), get_xsd_path falls through to the checkout fallback rather than returning
-        the non-file resource. Resolved against the real layout (no __file__ patch) so it also stays correct across
-        restructures."""
-        fake_resource = MagicMock()
-        fake_resource.is_file.return_value = False
-        fake_pkg = MagicMock()
-        fake_pkg.joinpath.return_value = fake_resource
-
-        with patch.object(classic_verify.importlib.resources, "files", return_value=fake_pkg):
-            result = classic_verify.get_xsd_path()
-        assert Path(result).is_file()
-        assert Path(result).name == "MediaHashList_v1_1.xsd"
-
-    def test_raises_file_not_found_when_both_paths_absent(self, tmp_path):
-        """FileNotFoundError is raised when neither the package resource nor the
-        local xsd/ folder exists (tmp_path has no xsd/ subdirectory)."""
-
-        with (
-            patch.object(
-                classic_verify.importlib.resources,
-                "files",
-                side_effect=ImportError("no package"),
-            ),
-            patch.object(classic_verify, "__file__", str(tmp_path / "classic_verify.py")),
-            pytest.raises(FileNotFoundError, match=r"MediaHashList_v1_1\.xsd"),
-        ):
-            classic_verify.get_xsd_path()

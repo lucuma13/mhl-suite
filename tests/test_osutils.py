@@ -9,11 +9,8 @@ normalization-sensitive filesystem.
 import os
 import unicodedata
 
-from lxml import etree
-
 from mhl_suite import classic_seal as core_seal
 from mhl_suite import osutils
-from mhl_suite.cli import simple_mhl
 
 from .helpers import _sensitive_fs
 
@@ -85,8 +82,7 @@ class TestFriendlyHostname:
         not the bare network hostname.
         """
         monkeypatch.setattr(core_seal, "friendly_hostname", lambda: "Luis's MacBook Pro")
-        doc = etree.Element("hashlist", version="1.1")
-        info = simple_mhl._build_creatorinfo(doc, "simple-mhl test", "2026-01-01T00:00:00Z")
+        info = core_seal._creatorinfo_element("simple-mhl test", "2026-01-01T00:00:00Z")
         assert info.findtext("hostname") == "Luis's MacBook Pro"
 
 

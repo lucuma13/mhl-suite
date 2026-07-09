@@ -533,7 +533,7 @@ class TestTOCTOURaceCondition:
         target = tmp_path / "vanishing.bin"
         target.write_bytes(b"data")
 
-        real_get_hashes = simple_mhl.get_hashes
+        real_get_hashes = core_hashing.get_hashes
 
         def _get_hashes_after_delete(filepath, factories, on_progress=None):
             target.unlink(missing_ok=True)
@@ -648,8 +648,10 @@ class TestRobustness:
             iterparse_calls.append(str(path))
             return real_iterparse(path, *args, **kwargs)
 
-        monkeypatch.setattr(simple_mhl.etree, "parse", spy_parse)
-        monkeypatch.setattr(simple_mhl.etree, "iterparse", spy_iterparse)
+        # lxml.etree is a shared module singleton, so patching it here is seen
+        # by classic_verify's parser too.
+        monkeypatch.setattr(etree, "parse", spy_parse)
+        monkeypatch.setattr(etree, "iterparse", spy_iterparse)
 
         # Minimal manifest — just enough to exercise the parse path.
         root = etree.Element("hashlist", version="1.1")

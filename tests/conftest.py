@@ -17,6 +17,14 @@ from mhl_suite.cli import mhlver, simple_mhl
 from .helpers import make_package
 
 
+@pytest.fixture(autouse=True)
+def _no_update_check(monkeypatch):
+    """Keep the CLIs' PyPI update check inert for every test (no network, no
+    real cache-dir writes). test_update_checker's enabled_env fixture deletes
+    the variable again for the tests that exercise the checker itself."""
+    monkeypatch.setenv("NO_UPDATE_CHECK", "1")
+
+
 @pytest.fixture
 def mhl_cli():
     """Execute simple_mhl in-process and capture (exit_code, stdout, stderr)."""

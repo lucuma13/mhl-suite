@@ -62,7 +62,7 @@ Seal a directory:
 
 ```bash
 simple-mhl seal path/to/directory/
-simple-mhl seal -a md5 -a xxhash path/to/directory/        # use both MD5 and xxhash algorithms
+simple-mhl seal -a md5 -a xxh64 path/to/directory/        # use both MD5 and xxh64 algorithms
 simple-mhl seal -o path/to/output/mhl path/to/directory/   # write the MHL into a parent directory
 ```
 

@@ -1,567 +1,694 @@
 """
-ASC-MHL verification engine.
+ASC-MHL verification: a native history loader and the dialect policy.
 
-The in-process entry point mhlver drives. It mirrors classic_verify's contract:
-never prints, never sys.exit()s, returns a structured report whose VerifyEntries
-mhlver maps straight onto its own report model — no stdout round-trip, no regex
-parsing.
+The suite owns the parsing end-to-end: load_history() reads an ASC-MHL
+package's `ascmhl/` folder — validating the chain file (each generation
+manifest's recorded hash is recomputed — the history integrity gate of spec
+5.4), parsing every generation manifest, and descending into nested child
+histories — and verify_ascmhl() reduces the loaded history to the shared
+engine's FileRecords (original-generation hash and size per file,
+`previousPath` renames resolved, ignore patterns applied) plus the ASC-only
+policy the engine doesn't know about: new-file detection and the exit-code
+precedence.
 
-Hashing/parsing uses the reference `mhllib` for ASC-MHL, while the verify loop
-itself lives here so we can drive the suite's adaptive parallel hasher
-(mhl_suite.hashing) and emit truthful per-file progress — neither of which the
-library's own verify exposes.
+The ASC MHL specification (v1.0) is the authority for what verifying means
+here, notably:
+  * previousPath chains are resolved across any number of generations —
+    files renamed "throughout the lifecycle" stay verifiable (5.3.3).
+  * A hash entry labeled `original` or `verified` can vouch for a file;
+    `failed` and unlabeled entries cannot (5.6.4).
+  * A recorded file whose entries are all unusable is an unsuccessful
+    verification, never a "new file" — unknown means *not recorded* (5.6.3).
+  * Every history's recorded ignore patterns govern its own subtree, and the
+    mandatory default set always applies (5.6.1.2).
+
+Where the spec is silent, behaviour stays interoperable with the reference
+`ascmhl` tool: generation-file discovery, traversal/report order, and the
+10/11/20/21/30-33 exit codes. The test suite pins both — spec conformance on
+hand-written histories, interop on packages sealed by the reference library
+(a dev dependency only). Never prints, never exits.
 """
 
 import os
-import time
-from dataclasses import dataclass
-from importlib.resources import files
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import click
-from ascmhl import errors
-from ascmhl.commands import test_for_missing_files
-from ascmhl.hasher import new_hasher_for_hash_type
-from ascmhl.history import MHLHistory
-from ascmhl.ignore import MHLIgnoreSpec, default_ignore_list
-from ascmhl.traverse import post_order_lexicographic
+import pathspec
 from lxml import etree
+from pathspec.patterns.gitignore.spec import GitIgnoreSpecPattern
 
 from mhl_suite import hashing
+from mhl_suite import verify as verify_core
 from mhl_suite._exit_codes import ExitCode
+from mhl_suite.algorithms import ASC_FORMATS, asc_check
 from mhl_suite.osutils import resolve_on_disk
-from mhl_suite.verify_results import VerifyEntry, VerifyReport
+from mhl_suite.verify import ErrorKind, FileRecord, Status, VerifyEntry, VerifyReport
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
-    from ascmhl.hashlist import MHLMediaHash
+ASCMHL_FOLDER = "ascmhl"
+CHAIN_FILENAME = "ascmhl_chain.xml"
 
-# NOTE: we check only the first `original` hash entry per file
-# (find_original_hash_entry_for_path), so a file recorded with several formats
-# (the XSD allows one of each: c4/md5/sha1/xxh128/xxh3/xxh64) is verified on
-# just one — there is no ASC equivalent of classic's `-a all` yet. A future
-# multi-hash mode should arrive as verify_ascmhl(..., algorithm=...) mirroring
-# classic_verify.verify_classic's shape (None / list of tags / "all").
+# Generation manifest naming convention: 0001_name_date.mhl (the leading
+# sequence number is what matters; ._ AppleDouble copies are skipped). Public:
+# discovery applies the same rule when collecting a package's generations.
+GENERATION_RE = re.compile(r"^(\d{4,})(?:_(.+))?$")
+
+# The ASC-MHL default ignore set is mandated by the specification to always
+# apply — .DS_Store files and the ascmhl folders themselves mutate as a
+# history is appended, so no records for them can exist and they must never be
+# flagged as new.
+DEFAULT_IGNORE_PATTERNS = (".DS_Store", "ascmhl", "ascmhl/")
+
+
+# -----------------------------------------------------------------------------
+# History-integrity errors (the 3x exit codes)
+# -----------------------------------------------------------------------------
+
+
+class HistoryError(Exception):
+    """A structural problem with the ASC-MHL history itself; `code` is the pinned 3x exit code."""
+
+    code: ExitCode = ExitCode.ERROR
+
+
+class NoHistoryError(HistoryError):
+    code = ExitCode.NO_HISTORY
+
+    def __init__(self, path: "str | Path") -> None:
+        super().__init__(f"Missing ASC MHL history at path {path}")
+
+
+class NoChainError(HistoryError):
+    code = ExitCode.NO_CHAIN
+
+    def __init__(self, path: "str | Path") -> None:
+        super().__init__(f"Missing ASC MHL chain file for path {path}")
+
+
+class ModifiedManifestError(HistoryError):
+    code = ExitCode.MODIFIED_MANIFEST
+
+    def __init__(self, path: "str | Path") -> None:
+        super().__init__(f"Modified ASC MHL manifest in history at path {path}")
+
+
+class MissingManifestError(HistoryError):
+    code = ExitCode.MISSING_MANIFEST
+
+    def __init__(self, path: "str | Path") -> None:
+        super().__init__(f"Missing ASC MHL manifest in history at path {path}")
+
+
+# -----------------------------------------------------------------------------
+# History model
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class MediaRecord:
+    """One <hash> / <directoryhash> element of a generation manifest."""
+
+    path: str  # posix, relative to the owning history's root
+    size: "int | None" = None
+    previous_path: "str | None" = None
+    is_directory: bool = False
+    # (format, digest, action) per recorded hash entry, in document order.
+    entries: "list[tuple[str, str, str | None]]" = field(default_factory=list)
+
+
+@dataclass
+class Generation:
+    """One parsed generation manifest (a NNNN_*.mhl file)."""
+
+    number: int
+    file_path: Path
+    records: list[MediaRecord]
+    ignore_patterns: list[str]  # recorded <ignore> patterns (may be empty)
+    # Lookup by current name only, and by current-or-previous name — the two
+    # queries rename resolution needs (first record in document order wins).
+    by_path: dict[str, MediaRecord] = field(default_factory=dict)
+    by_any_path: dict[str, MediaRecord] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for rec in self.records:
+            self.by_path.setdefault(rec.path, rec)
+            if rec.previous_path is not None:
+                self.by_any_path.setdefault(rec.previous_path, rec)
+            self.by_any_path.setdefault(rec.path, rec)
+
+
+@dataclass
+class History:
+    """A loaded ASC-MHL history: the package's generations plus nested child histories."""
+
+    root: Path
+    generations: list[Generation]
+    children: "list[History]" = field(default_factory=list)
+
+    def walk(self) -> "Iterator[tuple[str, History]]":
+        """Yield (posix path prefix relative to this root, history) for self and every descendant."""
+        yield "", self
+        for child in self.children:
+            prefix = child.root.relative_to(self.root).as_posix()
+            for sub_prefix, sub in child.walk():
+                yield (f"{prefix}/{sub_prefix}" if sub_prefix else prefix), sub
+
+    def latest_ignore_patterns(self) -> list[str]:
+        """The ignore patterns of the latest generation (empty when none were recorded)."""
+        return self.generations[-1].ignore_patterns if self.generations else []
+
+
+# -----------------------------------------------------------------------------
+# Parsing
+# -----------------------------------------------------------------------------
+
+
+def _local(tag: object) -> str:
+    """Local name of a possibly-namespaced lxml tag ('' for comments/PIs)."""
+    if not isinstance(tag, str):
+        return ""
+    return tag.rpartition("}")[2] if "}" in tag else tag
+
+
+def _free(element: "etree._Element") -> None:
+    """Release a processed iterparse element and its preceding siblings."""
+    element.clear()
+    parent = element.getparent()
+    while parent is not None and element.getprevious() is not None:
+        del parent[0]
+
+
+def _parse_media_element(element: "etree._Element", *, is_directory: bool) -> "MediaRecord | None":
+    """
+    Reduce one <hash> / <directoryhash> element to a MediaRecord (None without
+    a <path>). A <directoryhash>'s structure/content hash entries are not
+    verifiable file content, so only its path (for the recorded set) is kept.
+    """
+    record = MediaRecord(path="", is_directory=is_directory)
+    for child in element.iter():
+        name = _local(child.tag)
+        if name == "path" and not record.path:
+            if child.text:
+                record.path = child.text.strip()
+            size_text = (child.get("size") or "").strip()
+            if size_text.isdecimal():
+                record.size = int(size_text)
+        elif name == "previousPath" and child.text:
+            record.previous_path = child.text.strip()
+        elif not is_directory and name in ASC_FORMATS and child.text:
+            record.entries.append((name, child.text.strip(), child.get("action")))
+    return record if record.path else None
+
+
+def parse_generation_manifest(file_path: Path, number: int) -> Generation:
+    """
+    Parse one generation manifest (streaming iterparse) into a Generation:
+    file and directory records with sizes/renames/hash entries, plus the
+    recorded ignore patterns. The <roothash> block inside <processinfo>
+    describes the root directory, not a file, and carries no <path> — it never
+    becomes a record.
+    """
+    records: list[MediaRecord] = []
+    ignore_patterns: list[str] = []
+    with open(file_path, "rb") as fh:
+        for _, element in etree.iterparse(fh, events=("end",), tag=("{*}hash", "{*}directoryhash", "{*}ignore")):
+            name = _local(element.tag)
+            if name == "ignore":
+                ignore_patterns.extend(p.text.strip() for p in element.iterfind("{*}pattern") if p.text)
+            else:
+                record = _parse_media_element(element, is_directory=(name == "directoryhash"))
+                if record is not None:
+                    records.append(record)
+            _free(element)
+    return Generation(number=number, file_path=file_path, records=records, ignore_patterns=ignore_patterns)
+
+
+def _parse_chain(chain_path: Path) -> "list[tuple[str, str, str]]":
+    """
+    Parse ascmhl_chain.xml into (manifest filename, hash format, digest)
+    triples in document order. A missing chain file yields no entries (the
+    caller decides whether that is an error).
+    """
+    if not chain_path.exists():
+        return []
+    entries: list[tuple[str, str, str]] = []
+    with open(chain_path, "rb") as fh:
+        for _, element in etree.iterparse(fh, events=("end",), tag="{*}hashlist"):
+            filename = ""
+            hash_format = ""
+            digest = ""
+            for child in element:
+                name = _local(child.tag)
+                if name == "path" and child.text:
+                    filename = child.text.strip()
+                elif name in ASC_FORMATS and child.text:
+                    hash_format = name
+                    digest = child.text.strip()
+            if filename and hash_format:
+                entries.append((filename, hash_format, digest))
+            _free(element)
+    return entries
+
+
+def _validate_chain(ascmhl_dir: Path) -> None:
+    """
+    The history integrity gate (spec 5.4): the chain file must exist alongside
+    the generation manifests, and every generation it references must be
+    present with its recorded hash unchanged.
+    """
+    chain_path = ascmhl_dir / CHAIN_FILENAME
+    if ascmhl_dir.exists() and not chain_path.exists():
+        raise NoChainError(chain_path)
+    for filename, hash_format, digest in _parse_chain(chain_path):
+        manifest = ascmhl_dir / filename
+        if not manifest.exists():
+            raise MissingManifestError(manifest)
+        check = asc_check(hash_format, digest)
+        if check is None:  # unverifiable chain entry: treat as tampering
+            raise ModifiedManifestError(manifest)
+        computed = hashing.get_hashes(str(manifest), [check.algorithm.factory])[0]
+        if not check.matches(computed):
+            raise ModifiedManifestError(manifest)
+
+
+def load_history(root_path: "str | Path") -> History:
+    """
+    Load the ASC-MHL history rooted at `root_path` (the folder the manifests
+    describe, parent of `ascmhl/`), including nested child histories.
+
+    Raises a HistoryError subclass for the history-integrity failures
+    (missing history 30 / modified manifest 31 / missing chain 32 / missing
+    manifest 33); malformed XML raises lxml's XMLSyntaxError for the caller to
+    map. No media files are read — only the chain gate re-hashes the (small)
+    manifest files themselves.
+    """
+    root = Path(os.path.abspath(os.fspath(root_path)))
+    ascmhl_dir = root / ASCMHL_FOLDER
+
+    _validate_chain(ascmhl_dir)
+
+    numbered: list[tuple[int, Path]] = []
+    if ascmhl_dir.is_dir():
+        for entry in ascmhl_dir.iterdir():
+            if entry.name.startswith("._") or entry.suffix != ".mhl":
+                continue
+            match = GENERATION_RE.match(entry.stem)
+            if match:  # non-conforming names are skipped
+                numbered.append((int(match.group(1)), entry))
+    if not numbered:
+        raise NoHistoryError(root)
+
+    generations = [parse_generation_manifest(path, number) for number, path in sorted(numbered)]
+
+    history = History(root=root, generations=generations)
+    # Find nested child histories: any subdirectory with its own ascmhl/
+    # folder owns everything beneath it, so the walk does not descend further
+    # there.
+    for dirpath, dirnames, _filenames in os.walk(root):
+        if dirpath != str(root) and ASCMHL_FOLDER in dirnames:
+            history.children.append(load_history(dirpath))
+            dirnames.clear()
+    return history
+
+
+# -----------------------------------------------------------------------------
+# Reducing a history to engine records
+# -----------------------------------------------------------------------------
+
+
+def _resolve_hashes(
+    history: History, rel_path: str
+) -> "tuple[MediaRecord, tuple[str, str] | None, list[tuple[str, str]]] | None":
+    """
+    Resolve a file's current path to its usable hash records within one history.
+
+    The current name is hopped back through recorded previousPath elements
+    newest generation first — each generation records at most one rename per
+    file, so one hop per generation walks any A→B→C chain (and a back-and-
+    forth rename) to the earliest name, as spec 5.3.3 requires ("renamed
+    throughout the lifecycle"). The generations are then searched oldest-first,
+    gathering every usable hash entry: only action="original" or "verified"
+    entries count (spec 5.6.4; `failed` and unlabeled entries may not vouch).
+
+    Returns (record, original, usable) — the record supplies the recorded size;
+    `original` is the first action="original" entry (else the earliest
+    "verified"), the single hash a default verify checks (interop with the
+    reference tool); `usable` is one (format, digest) per distinct usable
+    format, original-preferred, the full set an `all`/selection verify checks.
+    Both are empty-ish (original None, usable []) when the path is recorded but
+    has no usable entry; None when the path is unknown entirely.
+    """
+    name = rel_path
+    for gen in reversed(history.generations):
+        rec = gen.by_path.get(name)
+        if rec is not None and rec.previous_path:
+            name = rec.previous_path
+
+    seen: MediaRecord | None = None
+    original: tuple[MediaRecord, tuple[str, str]] | None = None
+    verified: tuple[MediaRecord, tuple[str, str]] | None = None
+    # format → (digest, is_original): an original entry supersedes a verified.
+    usable: dict[str, tuple[str, bool]] = {}
+    for gen in history.generations:
+        rec = gen.by_any_path.get(name)
+        if rec is None:
+            continue
+        seen = seen or rec
+        for hash_format, digest, action in rec.entries:
+            if hash_format not in ASC_FORMATS:
+                continue
+            if action == "original":
+                if original is None:
+                    original = (rec, (hash_format, digest))
+                if not usable.get(hash_format, ("", False))[1]:
+                    usable[hash_format] = (digest, True)
+            elif action == "verified":
+                if verified is None:
+                    verified = (rec, (hash_format, digest))
+                usable.setdefault(hash_format, (digest, False))
+
+    if seen is None:
+        return None
+    record, best = original or verified or (seen, None)
+    usable_list = [(fmt, digest) for fmt, (digest, _is_original) in usable.items()]
+    return record, best, usable_list
+
+
+class _IgnoreMatcher:
+    """
+    Package-wide ignore matching for a verify run. The root history's latest
+    recorded patterns apply to the whole tree, and each nested history's
+    recorded patterns apply within its own subtree, matched against paths
+    relative to that history's root — spec 5.6.1.2: a manifest's patterns
+    govern operations on the data set *it* manages. Paths are package-root-
+    relative posix; directories carry a trailing slash, as gitignore matching
+    expects.
+    """
+
+    def __init__(self, history: History) -> None:
+        # (subtree prefix, spec); the root spec (prefix "") is always present,
+        # child specs only when that history recorded patterns of its own —
+        # the mandatory defaults (.DS_Store, ascmhl) already match at every
+        # depth through the root spec.
+        self._specs: list[tuple[str, pathspec.PathSpec]] = []
+        for prefix, sub in history.walk():
+            recorded = sub.latest_ignore_patterns()
+            if prefix and not recorded:
+                continue
+            merged = list(dict.fromkeys([*(recorded or DEFAULT_IGNORE_PATTERNS), *DEFAULT_IGNORE_PATTERNS]))
+            # GitIgnoreSpecPattern, not the registered 'gitignore' (basic)
+            # factory: it implements the gitignore dialect the spec's Appendix
+            # C patterns are written in (and matches the reference tool's
+            # 'gitwildmatch' behaviour).
+            self._specs.append((prefix, pathspec.PathSpec.from_lines(GitIgnoreSpecPattern, merged)))
+
+    def match_file(self, path: str) -> bool:
+        for prefix, spec in self._specs:
+            if not prefix:
+                if spec.match_file(path):
+                    return True
+            elif path.startswith(prefix + "/") and spec.match_file(path[len(prefix) + 1 :]):
+                return True
+        return False
+
+
+def _build_ignore_spec(history: History) -> _IgnoreMatcher:
+    """
+    The ignore matcher for a verify run: every history's latest-generation
+    recorded patterns scoped to its subtree, with the mandatory defaults
+    always appended (a foreign manifest that recorded custom patterns without
+    the defaults must not make verify descend into ascmhl/ and flag the
+    manifests as new files).
+    """
+    return _IgnoreMatcher(history)
+
+
+@dataclass
+class _Recorded:
+    """One recorded path reduced for verification, relative to the package root."""
+
+    path: str  # posix, package-root-relative, post-rename
+    record: MediaRecord
+    original: "tuple[str, str] | None"  # (format, digest) checked by a default verify
+    usable: "list[tuple[str, str]]"  # every distinct usable format (original-preferred)
+
+
+def _collect_recorded(history: History, ignore: _IgnoreMatcher) -> list[_Recorded]:
+    """
+    Every recorded path across the history and its nested children, resolved
+    to package-root-relative posix form with renames applied and ignored paths
+    dropped, in sorted-path order. Each history resolves its own paths (a
+    nested history owns its subtree), deduplicated on the final name.
+    """
+    out: dict[str, _Recorded] = {}
+    for prefix, sub in history.walk():
+        # Renames within this history, one previous→new map per generation: a
+        # record's final name is found by applying the maps of every *later*
+        # generation in order, so multi-step chains (A→B in gen 2, B→C in gen
+        # 3) and back-and-forth renames both land on the last recorded name.
+        rename_steps = [
+            {rec.previous_path: rec.path for rec in gen.records if rec.previous_path is not None}
+            for gen in sub.generations
+        ]
+
+        names: dict[str, None] = {}  # ordered de-dup, final names only
+        for gen_index, gen in enumerate(sub.generations):
+            for rec in gen.records:
+                name = rec.path
+                for step in rename_steps[gen_index + 1 :]:
+                    name = step.get(name, name)
+                names.setdefault(name, None)
+
+        for name in names:
+            top_rel = f"{prefix}/{name}" if prefix else name
+            if ignore.match_file(top_rel):
+                continue
+            resolved = _resolve_hashes(sub, name)
+            if resolved is None:
+                continue
+            record, original, usable = resolved
+            out.setdefault(top_rel, _Recorded(path=top_rel, record=record, original=original, usable=usable))
+    return [out[path] for path in sorted(out)]
+
+
+def history_byte_total(history: History) -> int:
+    """
+    The recorded byte volume a full verify of `history` will hash-read (its
+    verifiable files' original-generation sizes) — the package's progress-bar
+    weight. Reads no media bytes itself.
+    """
+    ignore = _build_ignore_spec(history)
+    return sum(
+        r.record.size or 0
+        for r in _collect_recorded(history, ignore)
+        if r.original is not None and not r.record.is_directory
+    )
+
+
+# -----------------------------------------------------------------------------
+# Disk traversal (new-file detection)
+# -----------------------------------------------------------------------------
+
+
+def _walk_disk_files(
+    root: Path,
+    ignore: _IgnoreMatcher,
+    on_unreadable: "Callable[[str, OSError], None] | None" = None,
+) -> "Iterator[str]":
+    """
+    Yield package-root-relative posix paths of every non-ignored file under
+    `root`, post-order lexicographic (a stable report order, shared with the
+    reference tool). Ignore patterns see directories
+    with a trailing slash, as gitignore matching expects; symlinked
+    directories are not followed.
+
+    `on_unreadable`, if given, is called as on_unreadable(rel_dir, exc) for a
+    directory that cannot be scanned ('.' for the root itself) — a silently
+    dropped directory would leave any new files inside it undetected, so the
+    caller must be able to surface it.
+    """
+
+    def walk(dir_path: str, rel_prefix: str) -> "Iterator[str]":
+        try:
+            entries = sorted(os.scandir(dir_path), key=lambda e: e.name)
+        except OSError as exc:
+            if on_unreadable is not None:
+                on_unreadable(rel_prefix.rstrip("/") or ".", exc)
+            return
+        files: list[str] = []
+        subdirs: list[tuple[str, str]] = []
+        for entry in entries:
+            rel = f"{rel_prefix}{entry.name}"
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if ignore.match_file(rel + "/" if is_dir else rel):
+                continue
+            if is_dir:
+                subdirs.append((entry.path, rel))
+            elif entry.is_file(follow_symlinks=False):
+                files.append(rel)
+        for sub_path, sub_rel in subdirs:
+            yield from walk(sub_path, sub_rel + "/")
+        yield from files
+
+    yield from walk(str(root), "")
+
+
+def _completeness_entries(
+    root: Path, recorded: "list[_Recorded]", verifiable_paths: set[str], ignore: _IgnoreMatcher
+) -> list[VerifyEntry]:
+    """
+    The completeness pass over everything the hash phase didn't settle.
+
+    Recorded paths outside the verifiable set must still exist (absent →
+    missing); a recorded *file* among them has no usable hash entry (nothing
+    labeled original or verified — spec 5.6.4), which is an unsuccessful
+    verification, never a "new file" — spec 5.6.3 defines unknown files as
+    those *not* recorded in the history. The disk traversal then reports
+    everything the history has no record for as new; a directory it cannot
+    scan is surfaced as an error, because new files inside it would otherwise
+    go undetected without a trace.
+    """
+    entries: list[VerifyEntry] = []
+    recorded_paths = {r.path for r in recorded}
+    dir_index: dict[str, dict[str, str]] = {}
+    for r in recorded:
+        if r.path in verifiable_paths:
+            continue
+        if resolve_on_disk(str(root), r.path.replace("/", os.sep), dir_index) is None:
+            entries.append(VerifyEntry(path=r.path, status=Status.MISSING))
+        elif not r.record.is_directory:
+            entries.append(
+                VerifyEntry(
+                    path=r.path,
+                    status=Status.ERROR,
+                    error=ErrorKind.UNUSABLE_HASH,
+                    detail="no hash entry labeled original or verified",
+                )
+            )
+
+    def on_unreadable(rel_dir: str, exc: OSError) -> None:
+        entries.append(
+            VerifyEntry(
+                path=rel_dir,
+                status=Status.ERROR,
+                error=ErrorKind.IO,
+                detail=f"cannot scan directory: {exc.strerror or exc}",
+            )
+        )
+
+    entries.extend(
+        VerifyEntry(path=rel, status=Status.NEW)
+        for rel in _walk_disk_files(root, ignore, on_unreadable)
+        if rel not in recorded_paths
+    )
+    return entries
+
+
+# -----------------------------------------------------------------------------
+# verify_ascmhl — the dialect entry point
+# -----------------------------------------------------------------------------
 
 
 def verify_ascmhl(
     root_path: "str | Path",
     *,
     size_only: bool = False,
+    selection: "str | list[str] | None" = None,
     on_progress: "Callable[[int], None] | None" = None,
+    history: "History | None" = None,
 ) -> VerifyReport:
     """
-    Verify the ASC-MHL package rooted at `root_path` in-process.
+    Verify the ASC-MHL package rooted at `root_path` (the directory the
+    manifests describe, parent of the `ascmhl/` folder) and return a
+    structured VerifyReport. Never prints and never exits.
 
-    `root_path` is the directory the manifest describes (the parent of the
-    `ascmhl/` folder). `size_only` checks recorded sizes against disk without
-    hashing media (see _verify_sizes); `on_progress`, given, is called with each
-    chunk's byte size as files are hashed, so a caller can drive a progress bar
-    — the ASC-MHL counterpart to classic_verify.verify_classic(size_only=,
-    on_progress=).
+    Loading the history is the integrity gate: a broken chain or modified
+    manifest surfaces as its pinned 3x code (with the reason as a notice) and
+    unparsable XML as MALFORMED_XML, before any media is read. `selection`
+    picks which recorded hash(es) to check: None checks a single hash per file
+    (the original entry, matching the reference tool — spec 5.6.4's "one of the
+    algorithms recorded"), VERIFY_ALL checks every recorded format, and a list
+    of format names checks exactly those (an unrecorded one is a hash-not-stored
+    error). `size_only` compares recorded sizes without hashing (ASC-MHL's size
+    attribute is optional, so a record without one is existence-checked, never
+    failed); it ignores `selection`.
+    `on_progress` receives per-chunk byte counts from the engine's adaptive
+    hasher and may fire from worker threads.
 
-    Returns a verify_results.VerifyReport (same type as classic verify). `code`
-    is the ASC-MHL exit code (see ascmhl.errors): 0 clean, 10 missing files, 11
-    hash mismatch, 20 single-file-not-found, 21 new files, 30/31/32/33
-    history/chain/manifest problems — plus 13 for a size mismatch on the
-    size-only path (a suite extension; ascmhl has no size check). Failure is
-    signalled by `code`, never by an exception or process exit; `report.ok`
-    (clean vs failed) and `report.code` (the precise category) give the result.
+    Report codes follow a fixed precedence (pinned for tool interop): hash
+    mismatch / per-file failure 11 beats new-files 21, which beats
+    nothing-verifiable-found 20, which beats missing-files 10; size-only
+    failures report 13.
+
+    `history` lets a caller that already loaded the package (mhl_suite.
+    discovery, for progress weights) hand it over instead of paying the load —
+    and the chain gate — twice.
     """
-    if size_only:
-        return _verify_sizes(root_path)
-
-    entries: list[VerifyEntry] = []
+    root = Path(os.path.abspath(os.fspath(root_path)))
     try:
-        _verify_entire_folder(str(root_path), entries, on_progress=on_progress)
-        code = 0
-    except click.ClickException as exc:
-        # Every ascmhl failure mode is a click.ClickException subclass carrying
-        # an `exit_code` (see ascmhl.errors). Anything else is a genuine bug and
-        # propagates.
-        code = getattr(exc, "exit_code", 1)
-    return VerifyReport(entries=entries, code=code)
-
-
-def _verify_entire_folder(
-    root_path: str,
-    report: list[VerifyEntry],
-    *,
-    on_progress: "Callable[[int], None] | None" = None,
-) -> None:
-    """
-    Hash every file recorded in the ASC-MHL history and compare to disk.
-
-    A faithful reimplementation of ascmhl.commands.verify_entire_folder (file
-    verify, no directory-hash / single-file / packing-list modes), split into
-    two passes so the hashing runs through mhl_suite.hashing's adaptive parallel
-    controller and fills `report` with structured VerifyEntries. Raises the same
-    ascmhl.errors exceptions on failure (their exit_code drives verify_ascmhl's
-    `code`); the library's logger is never touched, so the caller owns all
-    output.
-    """
-    if not Path(root_path).is_absolute():
-        root_path = str(Path.cwd() / root_path)
-
-    existing_history = MHLHistory.load_from_path(root_path)
-    if len(existing_history.hash_lists) == 0:
-        raise errors.NoMHLHistoryException(root_path)
-
-    # Collect everything we expect to find; discard each as we meet it on disk
-    # so what remains is the set of missing files.
-    not_found_paths = existing_history.set_of_file_paths()
-    renamed_files = existing_history.renamed_path_with_previous_path()
-    not_found_paths = {p if renamed_files.get(p, None) is None else renamed_files[p] for p in not_found_paths}
-
-    # The ASC-MHL default ignore set (.DS_Store, ascmhl) is mandated by the
-    # specification to always apply — those files and directories mutate as a
-    # history is appended, so no records for them can exist and they must never
-    # be flagged as new. MHLIgnoreSpec drops the defaults whenever the recorded
-    # pattern list is non-empty, so a foreign manifest that recorded custom
-    # patterns without the defaults would make verify descend into ascmhl/ and
-    # report the manifests and chain as new files. Passing default_ignore_list()
-    # as the on-top list guarantees the defaults are always present (a no-op
-    # de-dup for the reference tool, which already records them).
-    ignore_spec = MHLIgnoreSpec(existing_history.latest_ignore_patterns(), default_ignore_list())
-
-    deferred = _collect_deferred(existing_history, root_path, ignore_spec, not_found_paths, report)
-    num_failed_verifications = _hash_and_compare(deferred, report, on_progress)
-
-    # Record still-missing files (mirroring test_for_missing_files' ignore
-    # filter), then let it raise the completeness-check exception (exit 10) if
-    # any remain.
-    ignore_path_spec = ignore_spec.get_path_spec()
-    for path in not_found_paths:
-        if ignore_path_spec.match_file(path):
-            continue
-        rel = Path(path).relative_to(root_path).as_posix()
-        report.append(VerifyEntry(path=rel, status="missing", line=f"[ERROR] missing file: {rel}"))
-
-    # Exception precedence mirrors ascmhl.commands.verify_entire_folder exactly:
-    # a hash mismatch (11) trumps new files (21), which trump "no file found at
-    # all" (20), which trumps a missing-file completeness failure (10).
-    exception = test_for_missing_files(not_found_paths, root_path, ignore_spec)
-    if not deferred:
-        exception = errors.SingleFileNotFoundException()
-    if any(e.status == "new" for e in report):
-        exception = errors.NewFilesFoundException()
-    if num_failed_verifications > 0:
-        exception = errors.VerificationFailedException()
-    if exception:
-        raise exception
-
-
-def _collect_deferred(
-    existing_history: MHLHistory,
-    root_path: str,
-    ignore_spec: MHLIgnoreSpec,
-    not_found_paths: set,
-    report: list[VerifyEntry],
-) -> list[tuple[str, str, object, int]]:
-    """
-    PASS 1 — traverse the tree, resolve each file against the history.
-
-    New files (no recorded hash) read no bytes and are reported inline; files
-    needing a hash are returned as `(file_path, rel_path, original_hash_entry,
-    size)` tuples in post-order-lexicographic traversal order so PASS 2's emit
-    order matches the library's inline order. `not_found_paths` is discarded in
-    place as files are met on disk, leaving the still-missing set.
-    """
-    deferred: list[tuple[str, str, object, int]] = []
-    for folder_path, children in post_order_lexicographic(root_path, ignore_spec.get_path_spec()):
-        for item_name, is_dir in children:
-            file_path = str(Path(folder_path) / item_name)
-            not_found_paths.discard(file_path)
-            if is_dir:
-                continue
-            rel_path, original_hash_entry = _find_original_hash_entry(existing_history, file_path)
-            if original_hash_entry is None:
-                # No `action="original"` hash exists for this on-disk file, so
-                # we report it as a new/unknown file. This also swallows a
-                # degenerate-but-XSD-compliant case: a file whose only recorded
-                # hash across all generations is `action="failed"`. Such a file
-                # is recorded in the manifest — so "new file" is arguably
-                # inaccurate — but it has no usable hash either, and the spec
-                # defines no outcome for a recorded-yet-unverifiable file. We
-                # follow the reference implementation here, which treats a
-                # missing original as "new file", rather than inventing a
-                # distinct "unverifiable" or "already-failed".
-                #
-                # The library's rel_path uses the native separator
-                # (os.path.relpath); the report keeps the canonical
-                # forward-slash form, so normalise here.
-                rel = Path(rel_path).as_posix()
-                report.append(VerifyEntry(path=rel, status="new", line=f"[ERROR] new file found: {rel}"))
-                continue
-
-            try:
-                size = Path(file_path).stat().st_size
-            except OSError:
-                size = 0
-            deferred.append((file_path, rel_path, original_hash_entry, size))
-    return deferred
-
-
-def _find_original_hash_entry(existing_history: MHLHistory, file_path: str) -> "tuple[str, object]":
-    """
-    Resolve an absolute file path to its ORIGINAL hash entry.
-
-    Routes the path to its owning history, follows a recorded ``previousPath``
-    back to the pre-rename name, then returns the first-generation entry for it.
-    Returns ``(rel_path, original_hash_entry | None)`` where ``rel_path`` is
-    native-separator and relative to the top history root (the report normalises
-    it to forward slashes); ``None`` means the path has no original record (a
-    new file).
-
-    Shared by the hash path (``_collect_deferred``) and the size path
-    (``verify_ascmhl_sizes``) so both group files across generations
-    identically.
-    """
-    rel_path = existing_history.get_relative_file_path(file_path)
-    history, history_rel_path = existing_history.find_history_for_path(rel_path)
-
-    for hash_list in existing_history.hash_lists:
-        for media_hash in hash_list.media_hashes:
-            if media_hash.path != history_rel_path:
-                continue
-            history_rel_path = media_hash.previous_path or history_rel_path
-            break
-
-    return rel_path, history.find_original_hash_entry_for_path(history_rel_path)
-
-
-def _hash_and_compare(
-    deferred: list,
-    report: list[VerifyEntry],
-    on_progress: "Callable[[int], None] | None",
-) -> int:
-    """
-    PASS 2 — hash the deferred files in parallel, compare, fill `report`.
-
-    Returns the number of hash mismatches. Hashing is driven through
-    mhl_suite.hashing's adaptive controller so ASC-MHL verify gets the same
-    auto-tuned concurrency as classic MHL.
-    """
-    if not deferred:
-        return 0
-
-    paths = [d[0] for d in deferred]
-    sizes = [d[3] for d in deferred]
-    calib_format = deferred[0][2].hash_format
-
-    jobs: list[Callable[[Callable[[int], None]], str]] = [
-        (lambda mon, fp=fp, fmt=entry.hash_format: _hash_file(fp, fmt, hashing._chain_progress(on_progress, mon)))
-        for fp, _r, entry, _s in deferred
-    ]
-    hashed = hashing._hash_jobs_auto(paths, sizes, jobs, lambda: _calibrate_hash_bw(calib_format))
-
-    num_failed = 0
-    for (_fp, rel_path, original_hash_entry, _size), current_hash in zip(deferred, hashed, strict=True):
-        fmt = original_hash_entry.hash_format
-        # rel_path comes from the library as a native-separator path; the report keeps the canonical forward-slash
-        # form (matching the .mhl).
-        rel = Path(rel_path).as_posix()
-        if original_hash_entry.hash_string == current_hash:
-            report.append(VerifyEntry(path=rel, status="ok", line=f"[OK] {rel}  {fmt}: {current_hash}"))
-        else:
-            num_failed += 1
-            stored = original_hash_entry.hash_string
-            report.append(
-                VerifyEntry(
-                    path=rel,
-                    status="mismatch",
-                    detail=f"hash mismatch: calc {fmt}: {current_hash} | stored {fmt}: {stored}",
-                    line=f"[ERROR] hash mismatch: {rel}",
-                    detail_line=f"        (calc {fmt}: {current_hash} | stored {fmt}: {stored})",
-                )
-            )
-    return num_failed
-
-
-def _hash_file(filepath: str, hash_format: str, on_progress: "Callable[[int], None] | None") -> str:
-    """
-    Hash `filepath` with the library's incremental hasher, reporting progress.
-
-    The library's own ascmhl.hasher.hash_file reads in chunks but exposes no
-    progress hook, so we own the read loop here (using its hasher classes) to
-    advance a progress bar within large files — `on_progress(nbytes)` fires per
-    chunk and may run on a worker thread.
-    """
-    hasher = new_hasher_for_hash_type(hash_format)
-    with open(filepath, "rb") as f:
-        while chunk := f.read(hashing.HASH_CHUNK_SIZE):
-            hasher.update(chunk)
-            if on_progress is not None:
-                on_progress(len(chunk))
-    return hasher.string_digest()
-
-
-def _calibrate_hash_bw(hash_format: str) -> float:
-    """
-    In-RAM hashing throughput (bytes/sec) for an ASC-MHL hash format.
-
-    mhl_suite.hashing's adaptive controller needs the pure-CPU hash bandwidth to
-    decide whether the disk can outrun a single hash thread. mhl_suite.hashing
-    only knows md5/sha1/xxh64; ASC-MHL also uses xxh128/xxh3/c4, so this
-    calibrates against the library's own incremental hasher. Mirrors
-    mhl_suite.hashing._calibrate_hash_bw.
-    """
-    buf = bytes(hashing.HASH_CHUNK_SIZE)
-    hasher = new_hasher_for_hash_type(hash_format)
-    done = 0
-    start = time.perf_counter()
-    while time.perf_counter() - start < hashing._AUTO_CALIBRATION_SECONDS:
-        hasher.update(buf)
-        done += len(buf)
-    elapsed = time.perf_counter() - start
-    return done / elapsed if elapsed > 0 else float("inf")
-
-
-# -----------------------------------------------------------------------------
-# Size-only verification.
-#
-# The ASC-MHL library's `verify` always re-hashes the whole package; there is no
-# size-only mode. So we drive our own check off the same loaded MHLHistory the
-# hash path uses (mhl_suite.ascmhl_verify._verify_entire_folder and the
-# reference's verify_entire_folder): for every recorded file — across the top
-# history and every nested child history — we compare the original generation's
-# recorded size to the file on disk, reading no file bytes (one stat() per
-# entry). Grouping across generations, rename (previousPath) resolution and
-# child-history descent are therefore consistent with ASC-MHL reference
-# implementation. ASC-MHL's <path size> is defined as an optional attribute on
-# the specification, whose absence has no defined meaning, so such a file is
-# existence-checked only, not failed. Driven by _verify_sizes below.
-# -----------------------------------------------------------------------------
-
-
-@dataclass
-class SizeCheckResult:
-    """
-    Outcome of a single size-only check for one recorded ASC-MHL entry.
-
-    `status` is one of "ok" | "missing" | "mismatch". For "ok", `detail` holds
-    the human-readable size ("size: 4170", or "size: not recorded" when the file
-    exists but the optional <path size> was omitted); for a mismatch it carries
-    the reason in the same shape the report formatter expects ("size mismatch:
-    calc size: … | stored size: …", "blocked traversal attempt").
-    """
-
-    path: str
-    status: str
-    detail: str = ""
-
-
-def verify_ascmhl_sizes(existing_history: MHLHistory, root_path: "str | Path") -> list[SizeCheckResult]:
-    """
-    Size-only verify a loaded ASC-MHL history, returning one result per recorded
-    file.
-
-    ``existing_history`` is the ``MHLHistory`` loaded by ``_verify_sizes`` (its
-    load doubles as the integrity gate); ``root_path`` is the package root
-    (parent of the top ``ascmhl/`` folder). The recorded file set comes from
-    ``existing_history.set_of_file_paths()``, which spans the top history AND
-    every nested child history, and a recorded rename contributes only its
-    post-rename path (via ``renamed_path_with_previous_path``) — exactly as the
-    hash path builds its set. For each file we take the first generation's
-    recorded size (``_find_original_hash_entry(...).media_hash.file_size``), so
-    generation grouping and rename resolution match the reference by
-    construction rather than being re-derived from XML.
-
-    Each entry compares that recorded size to the file on disk — no bytes are
-    read. Results, in sorted-path order:
-      * ok        — the file exists and its size matches, or the file exists but
-                    the record stored no size (the ``<path size>`` attribute is
-                    optional in ASC-MHL)
-      * missing   — the file is not on disk
-      * mismatch  — the size differs, or the path escapes the root
-
-    Path matching reuses ``resolve_on_disk`` so NFC/NFD filename forms reconcile
-    exactly as simple-mhl's verify does.
-    """
-    root_path = os.path.abspath(str(root_path))
-    # Trailing separator avoids prefix-collision: '/foo' matches '/foo/bar' but
-    # not '/foobar' — the same jail check simple_mhl.verify applies.
-    root_path_with_sep = root_path + os.sep
-
-    # The full recorded set across the top history and all nested child
-    # histories; a rename contributes its post-rename path only, mirroring
-    # _verify_entire_folder's not_found_paths construction.
-    recorded_paths = existing_history.set_of_file_paths()
-    renamed_files = existing_history.renamed_path_with_previous_path()
-    recorded_paths = {p if renamed_files.get(p, None) is None else renamed_files[p] for p in recorded_paths}
-
-    results: list[SizeCheckResult] = []
-    # Per-call cache of directory listings used by resolve_on_disk; a fresh view
-    # per verify run (never module-global) so a stale listing can't leak across
-    # runs.
-    dir_index: dict[str, dict[str, str]] = {}
-
-    for abs_path in sorted(recorded_paths):
-        rel_native = os.path.relpath(abs_path, root_path)
-        rel_posix = Path(rel_native).as_posix()
-
-        # Path traversal guard: collapse '..'/'.' then require the result inside
-        # root, blocking a malicious manifest pointing at "../../etc/passwd".
-        jailed = os.path.normpath(abs_path)
-        if jailed != root_path and not jailed.startswith(root_path_with_sep):
-            results.append(SizeCheckResult(rel_posix, "mismatch", "blocked traversal attempt"))
-            continue
-
-        # A recorded path with no original file entry is a directory hash or a
-        # nested child-history reference, not a file to size-check.
-        _rel, original_hash_entry = _find_original_hash_entry(existing_history, abs_path)
-        if original_hash_entry is None:
-            continue
-
-        resolved_path = resolve_on_disk(root_path, rel_native, dir_index)
-        if resolved_path is None:
-            results.append(SizeCheckResult(rel_posix, "missing"))
-            continue
-
-        # The ASC-MHL <path size> attribute is optional and the specification
-        # assigns no meaning to its absence, so a record without it simply has
-        # no size to compare. We confirm the file exists (above) and leave its
-        # size unchecked. This deliberately differs from classic MHL, whose
-        # schema makes <size> a required positiveInteger, so there a missing
-        # size is a genuine malformation worth failing. media_hash is a runtime
-        # backref the library attaches in MHLMediaHash.append_hash but never
-        # declares on MHLHashEntry, so pull it through getattr with an explicit
-        # type rather than tripping the type checker.
-        owning_media_hash: MHLMediaHash | None = getattr(original_hash_entry, "media_hash", None)
-        recorded_size = owning_media_hash.file_size if owning_media_hash is not None else None
-        if recorded_size is None:
-            results.append(SizeCheckResult(rel_posix, "ok", "size: not recorded"))
-            continue
-
-        try:
-            actual_size = os.path.getsize(resolved_path)
-        except OSError:
-            # Vanished between resolution and getsize() — report missing.
-            results.append(SizeCheckResult(rel_posix, "missing"))
-            continue
-
-        if actual_size != recorded_size:
-            results.append(
-                SizeCheckResult(
-                    rel_posix, "mismatch", f"size mismatch: calc size: {actual_size} | stored size: {recorded_size}"
-                )
-            )
-        else:
-            results.append(SizeCheckResult(rel_posix, "ok", f"size: {actual_size}"))
-
-    return results
-
-
-def _verify_sizes(root_path: "str | Path") -> VerifyReport:
-    """
-    Size-only verify: load the history (integrity gate + source), then compare
-    recorded sizes to disk.
-
-    A single ``MHLHistory.load_from_path`` does double duty, reading no media
-    bytes: loading validates the chain file and each generation manifest's own
-    hash (the integrity gate), and the loaded history is also the source of
-    recorded sizes and nested child histories that ``verify_ascmhl_sizes`` walks
-    — so the size check groups files exactly as the hash path (and the
-    reference) does. A malformed manifest/chain surfaces as MALFORMED_XML; a
-    modified manifest or missing history surfaces its own ascmhl exit code
-    (30/31/32/33) via the raised ClickException.
-
-    Codes: 0 all match (a record with no stored size is not a failure —
-    ASC-MHL's <path size> is optional); 10 a referenced file is missing; 13 a
-    size mismatch (or a blocked-traversal size failure) — `13` is distinct from
-    `11` so size failures don't masquerade as hash failures.
-    """
-    try:
-        existing_history = MHLHistory.load_from_path(str(root_path))
-        if len(existing_history.hash_lists) == 0:
-            raise errors.NoMHLHistoryException(str(root_path))
-    except click.ClickException as exc:
-        # Every ascmhl integrity failure is a click.ClickException carrying an exit_code (see ascmhl.errors).
-        return VerifyReport(code=getattr(exc, "exit_code", 1), notices=[exc.format_message()])
+        if history is None:
+            history = load_history(root)
+    except HistoryError as err:
+        return VerifyReport(code=err.code, notices=[str(err)], size_only_mode=size_only)
     except (etree.XMLSyntaxError, OSError):
-        return VerifyReport(
-            code=ExitCode.MALFORMED_XML, malformed=True, notices=[f"🚨 Malformed XML: {root_path} cannot be parsed."]
-        )
+        return VerifyReport(code=ExitCode.MALFORMED_XML, malformed=True, size_only_mode=size_only)
 
-    size_results = verify_ascmhl_sizes(existing_history, root_path)
+    ignore = _build_ignore_spec(history)
+    recorded = _collect_recorded(history, ignore)
 
-    entries: list[VerifyEntry] = []
-    for r in size_results:
-        if r.status == "ok":
-            # path stays the bare recorded path; the size shows only on the terminal [OK] line.
-            entries.append(VerifyEntry(path=r.path, status="ok", size_only=True, line=f"[OK] {r.path}  {r.detail}"))
-        elif r.status == "missing":
-            entries.append(VerifyEntry(path=r.path, status="missing", line=f"[ERROR] missing file: {r.path}"))
-        elif ": " in r.detail:  # mismatch: "size mismatch: calc … | stored …" -> label + parenthetical
-            label, paren = r.detail.split(": ", 1)
-            entries.append(
-                VerifyEntry(
-                    path=r.path,
-                    status="mismatch",
-                    detail=r.detail,
-                    line=f"[ERROR] {label}: {r.path}",
-                    detail_line=f"        ({paren})",
-                )
-            )
-        else:  # mismatch with a bare reason (e.g. "blocked traversal attempt")
-            entries.append(
-                VerifyEntry(path=r.path, status="mismatch", detail=r.detail, line=f"[ERROR] {r.detail}: {r.path}")
-            )
+    # Records the engine can verify: files with at least one usable hash entry
+    # (a usable set is non-empty exactly when an original-preferred hash exists,
+    # so this set is the same regardless of selection). With no selection only
+    # the original hash is checked (reference-tool interop); `all` or a format
+    # list feeds every usable format through and lets the engine pick.
+    verifiable = [r for r in recorded if r.usable and not r.record.is_directory]
+    file_records: list[FileRecord] = []
+    for r in verifiable:
+        pairs = r.usable if selection is not None else ([r.original] if r.original is not None else [])
+        checks = [c for fmt, digest in pairs if (c := asc_check(fmt, digest)) is not None]
+        file_records.append(FileRecord(path=r.path, checks=checks, recorded_size=r.record.size))
 
-    statuses = {e.status for e in entries}
-    code = (
-        ExitCode.SIZE_MISMATCH
-        if "mismatch" in statuses
-        else (ExitCode.MISSING if "missing" in statuses else ExitCode.OK)
+    entries = verify_core.verify_records(
+        root,
+        file_records,
+        selection=selection,
+        size_only=size_only,
+        missing_size_is_error=False,
+        on_progress=on_progress,
     )
+
+    if size_only:
+        # Directories and unverifiable records are skipped in size-only mode
+        # (nothing recorded to compare); missing/mismatch already classified.
+        n_fail = sum(1 for e in entries if e.status in (Status.MISMATCH, Status.ERROR))
+        n_missing = sum(1 for e in entries if e.status == Status.MISSING)
+        code = ExitCode.SIZE_MISMATCH if n_fail else (ExitCode.MISSING if n_missing else ExitCode.OK)
+        return VerifyReport(entries=entries, code=code, size_only_mode=True)
+
+    # --- ASC-only policy: completeness of the rest of the recorded set -------
+    verifiable_paths = {r.path for r in verifiable}
+    entries.extend(_completeness_entries(root, recorded, verifiable_paths, ignore))
+
+    # Exit-code precedence, pinned for tool interop. "Nothing verifiable
+    # found" (20) means no record actually reached the hash comparison — every
+    # verifiable record was missing, or there were none.
+    n_fail = sum(1 for e in entries if e.status in (Status.MISMATCH, Status.ERROR))
+    hashed_any = any(e.hashes for e in entries)
+    if n_fail:
+        code = ExitCode.HASH_MISMATCH
+    elif any(e.status == Status.NEW for e in entries):
+        code = ExitCode.NEW_FILES
+    elif not hashed_any:
+        code = ExitCode.SINGLE_FILE_NOT_FOUND
+    elif any(e.status == Status.MISSING for e in entries):
+        code = ExitCode.MISSING
+    else:
+        code = ExitCode.OK
     return VerifyReport(entries=entries, code=code)
-
-
-def _bundled_xsd_path(schema_name: str) -> str:
-    """
-    Absolute path to a bundled XSD shipped in the mhl_suite.xsd package.
-
-    The pip-installed `ascmhl` wheel does NOT ship the XSD files (upstream loads
-    them from a CWD-relative `xsd/` path that only resolves inside a repo
-    checkout), so schema validation uses our own bundled copy regardless of the
-    library. Raises FileNotFoundError if the schema is missing.
-    """
-    path = files("mhl_suite.xsd") / schema_name
-    if not path.is_file():
-        raise FileNotFoundError(f"bundled XSD not found: {schema_name}")
-    return str(path)
-
-
-def schema_check(file_path: "str | Path", *, directory_file: bool = False) -> "tuple[int, list[str]]":
-    """
-    Validate an ASC-MHL file against its bundled XSD, returning (code, lines).
-
-    `directory_file=True` validates an ascmhl_chain.xml against the directory
-    schema; otherwise a manifest is validated against ASCMHL.xsd. Mirrors
-    classic_verify.schema_report: code is 0 (valid), 41 (schema non-compliant)
-    or 40 (malformed/unreadable XML). Schema non-compliance has its own code,
-    deliberately NOT the 11 ascmhl reuses for hash-mismatch (see _exit_codes). A
-    missing bundled XSD is a broken install, surfaced as the generic error code
-    (1). Never prints.
-    """
-    schema_name = "ASCMHLDirectory__combined.xsd" if directory_file else "ASCMHL.xsd"
-    try:
-        xsd_path = _bundled_xsd_path(schema_name)
-    except FileNotFoundError as exc:
-        return ExitCode.ERROR, [f"Error: {exc}"]
-
-    try:
-        tree = etree.parse(str(file_path))
-        xsd = etree.XMLSchema(etree.parse(xsd_path))
-    except etree.XMLSyntaxError as exc:
-        return ExitCode.MALFORMED_XML, [f"Error: XML parsing failed - {exc}"]
-    except OSError as exc:
-        return ExitCode.MALFORMED_XML, [f"Error: file read failed - {exc}"]
-
-    if not xsd.validate(tree):
-        return ExitCode.SCHEMA_NONCOMPLIANT, [
-            f"Error: XSD validation failed - {err.message} (line {err.line})" for err in xsd.error_log
-        ]
-    return ExitCode.OK, []

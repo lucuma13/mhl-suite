@@ -4,9 +4,9 @@ mhlver — one MHL tool to verify them all (CLI).
 
 The mhlver command-line interface: walk a path, verify every MHL manifest under
 it (classic and ASC-MHL alike), and report. The cross-dialect verification
-engine lives in mhl_suite.verifyall (the print-free orchestrator); this module
+engine lives in mhl_suite.discovery (the print-free orchestrator); this module
 is the terminal front end — argument parsing, the rich progress bar, colour
-output, and the report file. It drives verifyall.verify_item per manifest and
+output, and the report file. It drives discovery.verify_item per manifest and
 renders each returned StatusLine to the terminal via _report_via_table.
 
 Exit code policy: the first non-zero backend exit code becomes mhlver's exit
@@ -27,14 +27,14 @@ from rich.progress import BarColumn, Progress, TextColumn
 from rich.text import Text
 
 from mhl_suite import __version__
+from mhl_suite.discovery import AscmhlPackage, DiscoveredItem, StatusLine, discover, verify_item
 from mhl_suite.osutils import normalization_variant_on_disk, to_terminal_sep
 from mhl_suite.report import (
-    FileResult,  # noqa: F401 — re-exported for tests
     ManifestResult,
     _open_report,
     _render_report,
 )
-from mhl_suite.verifyall import StatusLine, _manifest_weights, _select_mhl_files, verify_item
+from mhl_suite.update_checker import run_with_update_check
 
 # -----------------------------------------------------------------------------
 # Terminal colours
@@ -119,8 +119,8 @@ def log_error(
     _log(msg, colour=RED, stream=sys.stderr, console=console)
 
 
-# Report data model (FileResult / ManifestResult) and the report renderer live
-# in mhl_suite.report; the names this module uses are imported up top.
+# The report model (ManifestResult over VerifyEntries) and the report renderer
+# live in mhl_suite.report; the names this module uses are imported up top.
 
 
 def _emit_step_output(
@@ -167,15 +167,11 @@ def _emit_step_output(
 # Templates use {target} which we .format() with the manifest's name or its
 # package directory depending on the action.
 #
-# Wording note: the per-file detail (which files, what kind of failure) comes
-# from simple-mhl and ascm-mhl themselves, which prints lines that are
-# self-explanatory standalone. mhlver therefore only needs to say "this manifest
-# failed" — the lines below explain why. The exit code itself still encodes the
-# precise failure category for tooling.
-#
+
+
 # mhlver gives a single short status line per manifest; the per-file detail
 # (which file mismatched, which manifest is missing) comes from the structured
-# VerifyReport, rendered by _render_ascmhl_lines. The exit code preserves the
+# VerifyReport, rendered by mhl_suite.verify's renderer. The exit code preserves the
 # precise failure category.
 def _log_by_severity(
     severity: str,
@@ -238,7 +234,7 @@ def _report_via_table(
 def _render_status(sl: StatusLine, console: "_ConsoleLike | None" = None) -> None:
     """
     Render one orchestrator StatusLine to the terminal — the `emit` sink that
-    verifyall.verify_item calls per manifest, routed through _report_via_table
+    discovery.verify_item calls per manifest, routed through _report_via_table
     so the message colour and backend output match the rest of mhlver's output.
     """
     _report_via_table(
@@ -295,6 +291,11 @@ def _build_live() -> "tuple[Live, Progress, Text, Console]":
 
 
 def main() -> None:
+    """Console-script entry point: the CLI body runs inside the PyPI update check."""
+    run_with_update_check("mhl-suite", __version__, _main)
+
+
+def _main() -> None:
     parser = argparse.ArgumentParser(
         prog="mhlver",
         description="One tool to verify them all: find and verify MHL files or directories.",
@@ -376,18 +377,23 @@ def main() -> None:
     sys.exit(exit_status)
 
 
+def _item_display_name(item: DiscoveredItem) -> str:
+    """The short name shown on the progress label: the manifest's filename."""
+    return item.latest.name if isinstance(item, AscmhlPackage) else item.path.name
+
+
 def _verify_with_progress(
-    mhl_files: "list[Path]",
-    weights: "dict[Path, int]",
+    items: "list[DiscoveredItem]",
+    weights: "dict[DiscoveredItem, int]",
     verbose: bool,
     schema: bool,
     size_only: bool,
 ) -> "tuple[int, list[ManifestResult], Console]":
     """
-    Verify each manifest in `mhl_files` with a live rich progress bar.
+    Verify each discovered item with a live rich progress bar.
 
     Used for both a single-manifest invocation and a directory scan: both
-    backends verify in-process and report byte progress via on_bytes, so even
+    dialects verify in-process and report byte progress via on_bytes, so even
     one manifest gets a moving bar.
 
     Returns (exit_status, manifest_results, console). exit_status follows the
@@ -400,15 +406,15 @@ def _verify_with_progress(
     live, progress, label, stdout_console = _build_live()
     total_bytes = sum(weights.values())
     bar_task = progress.add_task(" ", total=total_bytes)
-    # Both backends verify in-process and report byte progress via on_bytes, so
+    # Both dialects verify in-process and report byte progress via on_bytes, so
     # the rich Live display (auto-refreshing on its own timer, see _build_live)
     # animates the bar without any manual poll/refresh thread.
     with live:
         con = stdout_console
-        for f in mhl_files:
+        for f in items:
             label.plain = ""
             label.append("🔎 Verifying… ", style="bold")
-            label.append(f.name, style="cyan")
+            label.append(_item_display_name(f), style="cyan")
             # Both backends report bytes per chunk via on_bytes, so the bar
             # advances live within a manifest (and within a large file). We
             # track what was advanced and top up the remainder afterwards so the
@@ -481,33 +487,27 @@ def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tu
     manifest_results: list[ManifestResult] = []
     console = None
 
-    # A single manifest file verifies just itself; a directory is scanned for
-    # every MHL under it. Both feed the same verification path below — a lone
-    # manifest gets the same live progress bar as a directory scan now that both
-    # backends verify in-process and stream byte progress.
-    if src.is_file():
-        mhl_files = [src]
-    elif src.is_dir():
-        mhl_files = _select_mhl_files(src)
-        if not mhl_files:
-            log_warning(f"No MHL files found under '{src}'")
-    else:
-        mhl_files = []
+    # Discovery finds and classifies every manifest once (a single file
+    # verifies just itself); each item parses/loads itself lazily and caches
+    # the result, so the weights below and the verify pass share one parse.
+    items = discover(src)
+    if src.is_dir() and not items:
+        log_warning(f"No MHL files found under '{src}'")
 
-    found = bool(mhl_files)
+    found = bool(items)
 
-    if mhl_files and sys.stdout.isatty():
-        # Pre-read byte weights for accurate ETA (XML parse only, no hashing).
-        # Classic MHL requires a <size> on every entry (MediaHashList_v1_1.xsd),
-        # so a zero weight there means a genuinely malformed manifest. ASC-MHL's
-        # size is an optional path/@size attribute (ASCMHL.xsd) and is absent by
-        # design on <directoryhash> entries, so a low/zero weight can be
-        # legitimate — never an error, just a less precise ETA. Verify, not this
-        # pre-read, is the source of truth; the weight only paces the bar.
-        weights = _manifest_weights(mhl_files, size_only)
-        exit_status, manifest_results, console = _verify_with_progress(mhl_files, weights, verbose, schema, size_only)
+    if items and sys.stdout.isatty():
+        # Byte weights for an accurate ETA come from the items' own parsed
+        # manifests (XML parse only, no hashing). Classic MHL requires a <size>
+        # on every entry (MediaHashList_v1_1.xsd), so a zero weight there means
+        # a genuinely malformed manifest. ASC-MHL's size is an optional
+        # path/@size attribute (ASCMHL.xsd), so a low/zero weight can be
+        # legitimate — never an error, just a less precise ETA. Verify, not the
+        # weight, is the source of truth; the weight only paces the bar.
+        weights = {item: item.weight(size_only) for item in items}
+        exit_status, manifest_results, console = _verify_with_progress(items, weights, verbose, schema, size_only)
     else:
-        for f in mhl_files:
+        for f in items:
             code, mr = verify_item(f, verbose, schema, size_only, emit=_render_status)
             if mr is not None:
                 manifest_results.append(mr)
