@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-from mhl_suite.cli import mhlver, simple_mhl
+from mhl_suite.cli import mhlver, simple_ascmhl, simple_mhl
 
 from .helpers import make_package
 
@@ -39,6 +39,29 @@ def mhl_cli():
             exit_code = 0
             try:
                 simple_mhl.main()
+            except SystemExit as e:
+                exit_code = e.code if e.code is not None else 0
+            return exit_code, out.getvalue(), err.getvalue()
+        finally:
+            sys.argv, sys.stdout, sys.stderr = old_argv, old_stdout, old_stderr
+
+    return _run
+
+
+@pytest.fixture
+def ascmhl_cli():
+    """Execute simple_ascmhl in-process and capture (exit_code, stdout, stderr)."""
+
+    def _run(argv):
+        str_argv = [str(arg) for arg in argv]
+        old_argv, old_stdout, old_stderr = sys.argv, sys.stdout, sys.stderr
+        sys.argv = ["simple-ascmhl", *str_argv]
+        out, err = io.StringIO(), io.StringIO()
+        sys.stdout, sys.stderr = out, err
+        try:
+            exit_code = 0
+            try:
+                simple_ascmhl.main()
             except SystemExit as e:
                 exit_code = e.code if e.code is not None else 0
             return exit_code, out.getvalue(), err.getvalue()
