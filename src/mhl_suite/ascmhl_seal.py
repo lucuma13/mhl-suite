@@ -667,15 +667,17 @@ def _directory_hashes(
             content_entries: list[HashEntryOut] = []
             structure_entries: list[HashEntryOut] = []
             for fmt, (content, structure) in pair.items():
-                for digest, recorded, target in (
-                    (content, recorded_content, content_entries),
-                    (structure, recorded_structure, structure_entries),
+                for digest, recorded, target, label in (
+                    (content, recorded_content, content_entries, "content"),
+                    (structure, recorded_structure, structure_entries, "structure"),
                 ):
                     action, failed = _dir_action(fmt, digest, recorded)
                     target.append(HashEntryOut(fmt, digest, action))
                     if failed:
                         failed_any = True
-                        notices.append(f"[ERROR] directory hash mismatch: {_pkg_path(level.prefix, node.rel)} ({fmt})")
+                        notices.append(
+                            f"[ERROR] directory hash mismatch: {_pkg_path(level.prefix, node.rel)} ({fmt} {label})"
+                        )
             created, modified = (None, None) if node.stat is None else _file_dates(node.stat)
             records.append(
                 DirEntryOut(
