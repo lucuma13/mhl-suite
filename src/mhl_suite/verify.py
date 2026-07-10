@@ -277,6 +277,7 @@ def verify_records(  # noqa: C901 — flat per-record classification ladder, not
     size_only: bool = False,
     missing_size_is_error: bool = True,
     on_progress: "Callable[[int], None] | None" = None,
+    resolved: "Callable[[str], tuple[str, int] | None] | None" = None,
 ) -> list[VerifyEntry]:
     """
     Verify `records` against the tree rooted at `base_dir` and return one
@@ -293,6 +294,12 @@ def verify_records(  # noqa: C901 — flat per-record classification ladder, not
     `on_progress`, if given, is called with each chunk's byte count as files
     are hashed (per-chunk, not per-file); it may fire from a worker thread
     under the adaptive controller, so it must be thread-safe.
+
+    `resolved`, if given, maps a record's path to its already-known real
+    on-disk path and size (a caller that walked the tree, e.g. ASC-MHL's disk
+    scan) — a hit skips this function's per-record resolve and stat; a None
+    falls back to them, so lookups the walk can't answer (case-insensitive
+    spellings) still resolve.
 
     Every recorded size that is present is compared before hashing, for both
     dialects: a size difference already proves modification, reads zero bytes,
@@ -332,17 +339,22 @@ def verify_records(  # noqa: C901 — flat per-record classification ladder, not
             continue
 
         # --- Resolve to the real on-disk path ------------------------------
-        candidate = resolve_on_disk(base, os.path.relpath(jailed, base), dir_index)
-        if candidate is None:
-            results.append(VerifyEntry(path=record.path, status=Status.MISSING))
-            continue
+        actual_size: int | None
+        known = resolved(record.path) if resolved is not None else None
+        if known is not None:
+            candidate, actual_size = known
+        else:
+            candidate = resolve_on_disk(base, os.path.relpath(jailed, base), dir_index)
+            if candidate is None:
+                results.append(VerifyEntry(path=record.path, status=Status.MISSING))
+                continue
+
+            try:
+                actual_size = os.path.getsize(candidate)
+            except OSError:
+                actual_size = None
 
         # --- Size pre-check -------------------------------------------------
-        actual_size: int | None
-        try:
-            actual_size = os.path.getsize(candidate)
-        except OSError:
-            actual_size = None
         if record.recorded_size is not None:
             if actual_size is None:
                 # Vanished between resolution and getsize().

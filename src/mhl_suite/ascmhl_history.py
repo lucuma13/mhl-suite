@@ -34,6 +34,7 @@ hand-written histories, interop on histories sealed by the reference library
 
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -367,9 +368,11 @@ def resolve_hashes(
     newest generation first — each generation records at most one rename per
     file, so one hop per generation walks any A→B→C chain (and a back-and-
     forth rename) to the earliest name, as spec 5.3.3 requires ("renamed
-    throughout the lifecycle"). The generations are then searched oldest-first,
-    gathering every usable hash entry: only action="original" or "verified"
-    entries count (spec 5.6.4; `failed` and unlabeled entries may not vouch).
+    throughout the lifecycle"). The generations are then searched oldest-first
+    — tracking the name forward through recorded renames, so entries recorded
+    under a later name still count — gathering every usable hash entry: only
+    action="original" or "verified" entries count (spec 5.6.4; `failed` and
+    unlabeled entries may not vouch).
 
     Returns (record, original, usable) — the record supplies the recorded size;
     `original` is the first action="original" entry (else the earliest
@@ -394,6 +397,8 @@ def resolve_hashes(
         rec = gen.by_any_path.get(name)
         if rec is None:
             continue
+        if rec.previous_path == name:
+            name = rec.path  # the rename this generation recorded
         seen = seen or rec
         for entry in rec.entries:
             if entry.fmt not in ASC_FORMATS:
@@ -531,17 +536,19 @@ def history_byte_total(history: History) -> int:
 # -----------------------------------------------------------------------------
 
 
-def walk_disk_files(
+def scan_disk_files(
     root: Path,
     ignore: IgnoreMatcher,
     on_unreadable: "Callable[[str, OSError], None] | None" = None,
-) -> "Iterator[str]":
+) -> "Iterator[tuple[str, str, os.stat_result]]":
     """
-    Yield media-directory-relative posix paths of every non-ignored file under
-    `root`, post-order lexicographic (a stable report order, shared with the
-    reference tool). Ignore patterns see directories
-    with a trailing slash, as gitignore matching expects; symlinked
-    directories are not followed.
+    Yield (rel, abs_path, lstat) for every non-ignored file under `root` —
+    the media-directory-relative posix path, the real on-disk absolute path,
+    and the entry's stat — post-order lexicographic (a stable report order,
+    shared with the reference tool). The stat comes from the scandir entry's
+    cache (the type check already paid for it), so the scan costs no extra
+    syscalls. Ignore patterns see directories with a trailing slash, as
+    gitignore matching expects; symlinked directories are not followed.
 
     `on_unreadable`, if given, is called as on_unreadable(rel_dir, exc) for a
     directory that cannot be scanned ('.' for the root itself) — a silently
@@ -549,14 +556,14 @@ def walk_disk_files(
     caller must be able to surface it.
     """
 
-    def walk(dir_path: str, rel_prefix: str) -> "Iterator[str]":
+    def walk(dir_path: str, rel_prefix: str) -> "Iterator[tuple[str, str, os.stat_result]]":
         try:
             entries = sorted(os.scandir(dir_path), key=lambda e: e.name)
         except OSError as exc:
             if on_unreadable is not None:
                 on_unreadable(rel_prefix.rstrip("/") or ".", exc)
             return
-        files: list[str] = []
+        files: list[tuple[str, str, os.stat_result]] = []
         subdirs: list[tuple[str, str]] = []
         for entry in entries:
             rel = f"{rel_prefix}{entry.name}"
@@ -569,7 +576,7 @@ def walk_disk_files(
             if is_dir:
                 subdirs.append((entry.path, rel))
             elif entry.is_file(follow_symlinks=False):
-                files.append(rel)
+                files.append((rel, entry.path, entry.stat(follow_symlinks=False)))
         for sub_path, sub_rel in subdirs:
             yield from walk(sub_path, sub_rel + "/")
         yield from files
@@ -577,8 +584,52 @@ def walk_disk_files(
     yield from walk(str(root), "")
 
 
+def walk_disk_files(
+    root: Path,
+    ignore: IgnoreMatcher,
+    on_unreadable: "Callable[[str, OSError], None] | None" = None,
+) -> "Iterator[str]":
+    """The rel paths of scan_disk_files, for callers that need no stat data."""
+    yield from (rel for rel, _path, _stat in scan_disk_files(root, ignore, on_unreadable))
+
+
+class _DiskScan:
+    """
+    One scandir pass over the managed data set, shared by the hash and
+    completeness phases so a verify walks (and stats) the tree exactly once.
+    Lookups mirror resolve_on_disk: literal bytes first, then the NFC form —
+    and a miss here is not final, callers fall back to resolve_on_disk (which
+    also matches case-insensitive-filesystem spellings the walk can't know).
+    """
+
+    def __init__(self, root: Path, ignore: IgnoreMatcher) -> None:
+        self.files: dict[str, tuple[str, int]] = {}  # rel as on disk → (abs path, size)
+        self._nfc: dict[str, tuple[str, int]] = {}
+        self.unreadable: list[VerifyEntry] = []
+
+        def on_unreadable(rel_dir: str, exc: OSError) -> None:
+            self.unreadable.append(
+                VerifyEntry(
+                    path=rel_dir,
+                    status=Status.ERROR,
+                    error=ErrorKind.IO,
+                    detail=f"cannot scan directory: {exc.strerror or exc}",
+                )
+            )
+
+        for rel, abs_path, stat_result in scan_disk_files(root, ignore, on_unreadable):
+            info = (abs_path, stat_result.st_size)
+            self.files[rel] = info
+            self._nfc.setdefault(unicodedata.normalize("NFC", rel), info)
+
+    def resolve(self, rel: str) -> "tuple[str, int] | None":
+        """The real path and size recorded for `rel`, or None on a walk miss."""
+        hit = self.files.get(rel)
+        return hit if hit is not None else self._nfc.get(unicodedata.normalize("NFC", rel))
+
+
 def _completeness_entries(
-    root: Path, recorded: "list[Recorded]", verifiable_paths: set[str], ignore: IgnoreMatcher
+    root: Path, recorded: "list[Recorded]", verifiable_paths: set[str], disk: _DiskScan
 ) -> list[VerifyEntry]:
     """
     The completeness pass over everything the hash phase didn't settle.
@@ -587,10 +638,10 @@ def _completeness_entries(
     missing); a recorded *file* among them has no usable hash entry (nothing
     labeled original or verified — spec 5.6.4), which is an unsuccessful
     verification, never a "new file" — spec 5.6.3 defines unknown files as
-    those *not* recorded in the history. The disk traversal then reports
-    everything the history has no record for as new; a directory it cannot
-    scan is surfaced as an error, because new files inside it would otherwise
-    go undetected without a trace.
+    those *not* recorded in the history. The disk scan then reports everything
+    the history has no record for as new; a directory it could not scan is
+    surfaced as an error, because new files inside it would otherwise go
+    undetected without a trace.
     """
     entries: list[VerifyEntry] = []
     recorded_paths = {r.path for r in recorded}
@@ -598,7 +649,9 @@ def _completeness_entries(
     for r in recorded:
         if r.path in verifiable_paths:
             continue
-        if resolve_on_disk(str(root), r.path.replace("/", os.sep), dir_index) is None:
+        # Directories never appear in the file scan, and a differently-cased
+        # recorded spelling can miss it — resolve_on_disk settles both.
+        if disk.resolve(r.path) is None and resolve_on_disk(str(root), r.path.replace("/", os.sep), dir_index) is None:
             entries.append(VerifyEntry(path=r.path, status=Status.MISSING))
         elif not r.record.is_directory:
             entries.append(
@@ -610,21 +663,8 @@ def _completeness_entries(
                 )
             )
 
-    def on_unreadable(rel_dir: str, exc: OSError) -> None:
-        entries.append(
-            VerifyEntry(
-                path=rel_dir,
-                status=Status.ERROR,
-                error=ErrorKind.IO,
-                detail=f"cannot scan directory: {exc.strerror or exc}",
-            )
-        )
-
-    entries.extend(
-        VerifyEntry(path=rel, status=Status.NEW)
-        for rel in walk_disk_files(root, ignore, on_unreadable)
-        if rel not in recorded_paths
-    )
+    entries.extend(disk.unreadable)
+    entries.extend(VerifyEntry(path=rel, status=Status.NEW) for rel in disk.files if rel not in recorded_paths)
     return entries
 
 
@@ -710,25 +750,34 @@ def verify_ascmhl(
         checks = [c for fmt, digest in pairs if (c := asc_check(fmt, digest)) is not None]
         file_records.append(FileRecord(path=r.path, checks=checks, recorded_size=r.record.size))
 
-    entries = verify_core.verify_records(
-        root,
-        file_records,
-        selection=selection,
-        size_only=size_only,
-        missing_size_is_error=False,
-        on_progress=on_progress,
-    )
-
     if size_only:
-        # Directories and unverifiable records are skipped in size-only mode
-        # (nothing recorded to compare); missing/mismatch already classified.
+        # No disk scan: size-only stats only the recorded files, which can be
+        # far fewer than the tree holds. Directories and unverifiable records
+        # are skipped (nothing recorded to compare); missing/mismatch already
+        # classified.
+        entries = verify_core.verify_records(
+            root, file_records, selection=selection, size_only=True, missing_size_is_error=False
+        )
         n_fail = sum(1 for e in entries if e.status in (Status.MISMATCH, Status.ERROR))
         n_missing = sum(1 for e in entries if e.status == Status.MISSING)
         code = ExitCode.SIZE_MISMATCH if n_fail else (ExitCode.MISSING if n_missing else ExitCode.OK)
         return VerifyReport(entries=entries, code=code, size_only_mode=True)
 
+    # One disk scan feeds both phases: the hash phase resolves paths and sizes
+    # from it instead of stat-ing each record, and the completeness pass reuses
+    # it instead of walking again.
+    disk = _DiskScan(root, ignore)
+    entries = verify_core.verify_records(
+        root,
+        file_records,
+        selection=selection,
+        missing_size_is_error=False,
+        on_progress=on_progress,
+        resolved=disk.resolve,
+    )
+
     # --- ASC-only policy: completeness of the rest of the recorded set -------
     verifiable_paths = {r.path for r in verifiable}
-    entries.extend(_completeness_entries(root, recorded, verifiable_paths, ignore))
+    entries.extend(_completeness_entries(root, recorded, verifiable_paths, disk))
 
     return VerifyReport(entries=entries, code=ascmhl_exit_code(entries))

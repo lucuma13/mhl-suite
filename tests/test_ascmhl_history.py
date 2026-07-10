@@ -410,6 +410,29 @@ class TestSpecConformance:
         assert report.code == 0
         assert statuses(report) == {"C.txt": Status.OK}
 
+    def test_all_finds_formats_recorded_after_a_rename(self, tmp_path):
+        """
+        Gen 1 records A (xxh64 original); gen 2 renames A→B; gen 3 verifies B
+        adding an md5 hash. A file's records span its names (spec 5.3.3 locates
+        records "renamed throughout the lifecycle"), so an `all` verify must
+        track the name forward and check the format recorded under B too.
+        """
+        content = b"payload"
+        path = _write(tmp_path / "pkg" / "B.txt", content)
+        xxh = get_hashes(path, [ALGORITHMS["xxh64"].factory])[0]
+        md5 = get_hashes(path, [ALGORITHMS["md5"].factory])[0]
+        make_asc_package(
+            tmp_path / "pkg",
+            [
+                [asc_hash_record("A.txt", xxh, "original", size=len(content))],
+                [asc_hash_record("B.txt", xxh, "verified", previous_path="A.txt")],
+                [asc_hash_record("B.txt", md5, "verified", fmt="md5")],
+            ],
+        )
+        report = verify.verify_ascmhl(tmp_path / "pkg", selection=VERIFY_ALL)
+        assert report.code == 0
+        assert {h.tag for h in _entry(report, "B.txt").hashes} == {"xxh64", "md5"}
+
     def test_verified_entry_vouches_when_no_original_exists(self, tmp_path):
         """
         Gen 1 lost its action attributes (a non-conforming writer); gen 2
