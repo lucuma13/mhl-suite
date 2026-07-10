@@ -13,7 +13,7 @@ per (file, format) with its action preserved and skipping `failed` entries.
 
 All manifest/collection output goes through the writers in
 mhl_suite.ascmhl_seal; loading and record resolution reuse
-mhl_suite.ascmhl_verify. Never prints, never exits: argument problems raise
+mhl_suite.ascmhl_history. Never prints, never exits: argument problems raise
 AscmhlSealError, history-integrity problems raise HistoryError (diff maps
 them into its report, matching verify_ascmhl).
 """
@@ -29,18 +29,7 @@ from lxml import etree
 from mhl_suite import hashing
 from mhl_suite._exit_codes import ExitCode
 from mhl_suite.algorithms import ASC_FORMATS, asc_check
-from mhl_suite.ascmhl_seal import (
-    AscmhlSealError,
-    DirEntryOut,
-    FileEntryOut,
-    HashEntryOut,
-    ManifestOut,
-    append_directory_entry,
-    latest_dir_entries,
-    manifest_filename,
-    write_manifest,
-)
-from mhl_suite.ascmhl_verify import (
+from mhl_suite.ascmhl_history import (
     ASCMHL_FOLDER,
     CHAIN_FILENAME,
     DEFAULT_IGNORE_PATTERNS,
@@ -54,6 +43,17 @@ from mhl_suite.ascmhl_verify import (
     load_history,
     resolve_hashes,
     walk_disk_files,
+)
+from mhl_suite.ascmhl_seal import (
+    AscmhlSealError,
+    DirEntryOut,
+    FileEntryOut,
+    HashEntryOut,
+    ManifestOut,
+    append_directory_entry,
+    latest_dir_entries,
+    manifest_filename,
+    write_manifest,
 )
 from mhl_suite.osutils import resolve_on_disk
 from mhl_suite.verify import HashComparison, Status, VerifyEntry, VerifyReport

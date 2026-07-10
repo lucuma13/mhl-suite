@@ -7,7 +7,7 @@ derived behaviour (`ok`, the mismatch predicates), independent of either
 engine. render_verify_lines is the only place [OK]/[ERROR] terminal text is
 built; the render tests pin that a semantic VerifyReport reproduces the terminal
 form in both quiet and verbose modes. The engine (verify_records) is exercised
-through the dialect drivers in test_classic_verify / test_ascmhl_verify.
+through the dialect drivers in test_classic_verify / test_ascmhl_history.
 """
 
 import pytest

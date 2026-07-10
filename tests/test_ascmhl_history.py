@@ -1,6 +1,6 @@
 """
 ASC-MHL verification: the native history loader and dialect policy
-(mhl_suite.ascmhl_verify).
+(mhl_suite.ascmhl_history).
 
 The suite owns the ASC-MHL parsing; verification semantics are pinned to the
 ASC MHL specification, on two kinds of fixture: packages sealed by the
@@ -27,7 +27,7 @@ import pytest
 from ascmhl import commands
 from click.testing import CliRunner
 
-from mhl_suite import ascmhl_verify as verify
+from mhl_suite import ascmhl_history as verify
 from mhl_suite import hashing, xsd_check
 from mhl_suite.algorithms import ALGORITHMS
 from mhl_suite.hashing import get_hashes

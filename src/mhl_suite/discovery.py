@@ -14,7 +14,7 @@ file is never treated as ASC-MHL even inside a folder named `ascmhl`; the
 folder-name check is a pure performance gate.
 
 verify_item() then runs the right dialect verify for each item — classic via
-classic_verify, ASC-MHL via ascmhl_verify, both in-process through the shared
+classic_verify, ASC-MHL via ascmhl_history, both in-process through the shared
 engine. It is print-free: it returns structured ManifestResults and emits
 per-manifest StatusLine render data through an injected `emit` callback, so the
 CLI (mhl_suite.cli.mhlver) owns all terminal I/O and this stays a testable
@@ -28,9 +28,9 @@ from typing import TYPE_CHECKING
 
 from lxml import etree
 
-from mhl_suite import ascmhl_verify, classic_verify, xsd_check
+from mhl_suite import ascmhl_history, classic_verify, xsd_check
 from mhl_suite._exit_codes import ExitCode
-from mhl_suite.ascmhl_verify import verify_ascmhl
+from mhl_suite.ascmhl_history import verify_ascmhl
 from mhl_suite.classic_verify import verify_classic
 from mhl_suite.report import ManifestResult
 from mhl_suite.verify import VerifyReport, render_verify_lines
@@ -38,7 +38,7 @@ from mhl_suite.verify import VerifyReport, render_verify_lines
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from mhl_suite.ascmhl_verify import History
+    from mhl_suite.ascmhl_history import History
     from mhl_suite.classic_verify import ParsedManifest
 
 
@@ -146,8 +146,8 @@ class AscmhlPackage:
         """
         if self._history is None and not self._load_failed:
             try:
-                self._history = ascmhl_verify.load_history(self.root)
-            except (ascmhl_verify.HistoryError, etree.XMLSyntaxError, OSError):
+                self._history = ascmhl_history.load_history(self.root)
+            except (ascmhl_history.HistoryError, etree.XMLSyntaxError, OSError):
                 self._load_failed = True
         return self._history
 
@@ -156,7 +156,7 @@ class AscmhlPackage:
         if size_only:
             return 1
         history = self.try_history()
-        return ascmhl_verify.history_byte_total(history) if history is not None else 0
+        return ascmhl_history.history_byte_total(history) if history is not None else 0
 
 
 DiscoveredItem = ClassicManifest | AscmhlPackage
@@ -175,7 +175,7 @@ def _find_mhl_files(root: Path) -> "Iterator[Path]":
 
 def _routes_to_ascmhl(mhl_file: Path) -> bool:
     """Dialect decision for one file (see module docstring for the rule)."""
-    return mhl_file.parent.name == ascmhl_verify.ASCMHL_FOLDER and is_ascmhl_v2(mhl_file)
+    return mhl_file.parent.name == ascmhl_history.ASCMHL_FOLDER and is_ascmhl_v2(mhl_file)
 
 
 def classify(mhl_file: Path) -> DiscoveredItem:
@@ -192,7 +192,7 @@ def classify(mhl_file: Path) -> DiscoveredItem:
         siblings = sorted(
             p
             for p in mhl_file.parent.glob("*.mhl")
-            if not p.name.startswith("._") and ascmhl_verify.GENERATION_RE.match(p.stem) and is_ascmhl_v2(p)
+            if not p.name.startswith("._") and ascmhl_history.GENERATION_RE.match(p.stem) and is_ascmhl_v2(p)
         )
         return AscmhlPackage(root=package_dir, manifests=siblings or [mhl_file])
     return ClassicManifest(path=mhl_file)

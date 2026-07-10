@@ -7,7 +7,7 @@ from importlib.metadata import version
 # circular-imports).
 __version__ = version("mhl-suite")
 
-from mhl_suite.ascmhl_verify import verify_ascmhl
+from mhl_suite.ascmhl_history import verify_ascmhl
 from mhl_suite.classic_seal import seal_classic
 from mhl_suite.classic_verify import verify_classic
 from mhl_suite.hashing import Hasher, get_hashes, hash_files

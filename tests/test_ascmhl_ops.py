@@ -15,7 +15,7 @@ from ascmhl import commands
 from click.testing import CliRunner
 from lxml import etree
 
-from mhl_suite import ascmhl_verify, hashing
+from mhl_suite import ascmhl_history, hashing
 from mhl_suite.ascmhl_ops import diff_ascmhl, flatten_ascmhl, rename_ascmhl
 from mhl_suite.ascmhl_seal import AscmhlSealError, SealOptions, seal_ascmhl
 from mhl_suite.verify import Status
@@ -84,13 +84,13 @@ class TestRenameFile:
         assert "<previousPath>Clips/a.mov</previousPath>" in text
         assert 'action="verified"' in text
         assert ascmhl_schema_report(str(manifest))[0] == 0
-        assert ascmhl_verify.verify_ascmhl(root).code == 0
+        assert ascmhl_history.verify_ascmhl(root).code == 0
 
     def test_rename_chain_across_generations_resolves(self, tmp_path):
         root = sealed_tree(tmp_path, {"a.mov": b"aa"})
         rename_ascmhl(root / "a.mov", root / "b.mov")
         rename_ascmhl(root / "b.mov", root / "c.mov")
-        report = ascmhl_verify.verify_ascmhl(root)
+        report = ascmhl_history.verify_ascmhl(root)
         assert report.code == 0
         assert statuses(report) == {"c.mov": Status.OK}
 
@@ -119,7 +119,7 @@ class TestRenameFile:
 
         assert len(list((base / "A001" / "ascmhl").glob("*.mhl"))) == child_generations + 1
         assert len(list((base / "ascmhl").glob("*.mhl"))) == parent_generations  # no upward propagation
-        assert ascmhl_verify.verify_ascmhl(base / "A001").code == 0
+        assert ascmhl_history.verify_ascmhl(base / "A001").code == 0
 
 
 class TestRenameDirectory:
@@ -135,7 +135,7 @@ class TestRenameDirectory:
         assert 'action="verified"' in dirhash.group(0)  # copied values: a rename cannot change them
         assert "<previousPath>Clips/a.mov</previousPath>" in text
         assert "<previousPath>Clips/Sub/b.mov</previousPath>" in text
-        assert ascmhl_verify.verify_ascmhl(root).code == 0
+        assert ascmhl_history.verify_ascmhl(root).code == 0
 
     def test_reference_tool_verifies_after_our_directory_rename(self, tmp_path):
         root = sealed_tree(tmp_path, {"Clips/a.mov": b"aa"})
@@ -147,7 +147,7 @@ class TestRenameDirectory:
 class TestRenameValidation:
     def test_rejects_paths_outside_any_history(self, tmp_path):
         (tmp_path / "a.txt").write_bytes(b"x")
-        with pytest.raises(ascmhl_verify.NoHistoryError):
+        with pytest.raises(ascmhl_history.NoHistoryError):
             rename_ascmhl(tmp_path / "a.txt", tmp_path / "b.txt")
 
     def test_rejects_crossing_history_boundaries(self, tmp_path):

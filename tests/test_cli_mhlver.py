@@ -22,7 +22,7 @@ from rich.live import Live
 from rich.progress import Progress
 from rich.text import Text
 
-from mhl_suite import ascmhl_verify, discovery, xsd_check
+from mhl_suite import ascmhl_history, discovery, xsd_check
 from mhl_suite.cli import mhlver
 from mhl_suite.verify import HashComparison, Status, VerifyEntry, VerifyReport
 
@@ -115,11 +115,11 @@ def _history_total(latest_mhl):
     gens = []
     for i, path in enumerate(sorted(latest_mhl.parent.glob("*.mhl")), start=1):
         try:
-            gens.append(ascmhl_verify.parse_generation_manifest(path, i))
+            gens.append(ascmhl_history.parse_generation_manifest(path, i))
         except etree.XMLSyntaxError:
             continue
-    history = ascmhl_verify.History(root=latest_mhl.parent.parent, generations=gens)
-    return ascmhl_verify.history_byte_total(history)
+    history = ascmhl_history.History(root=latest_mhl.parent.parent, generations=gens)
+    return ascmhl_history.history_byte_total(history)
 
 
 def _classic_total(mhl):
@@ -630,7 +630,7 @@ class TestAscMhlSizeOnly:
     size_only=True): the loaded-history integrity gate, the byte-free size
     compare, and how each maps to an exit code + ManifestResult. The size engine
     itself (verify_ascmhl_sizes: matching/missing/mismatch, no-size, renames,
-    nested child histories) is unit-tested in test_ascmhl_verify.py — here we
+    nested child histories) is unit-tested in test_ascmhl_history.py — here we
     drive real sealed packages end to end through _verify_ascmhl.
     """
 
@@ -703,7 +703,7 @@ class TestAscMhlSizeOnly:
 class TestAscMhlDispatch:
     """
     ASC-MHL exit-code translation, schema dispatch, and schema=False routing,
-    all verified in-process via mhl_suite.ascmhl_verify.
+    all verified in-process via mhl_suite.ascmhl_history.
     """
 
     @pytest.mark.parametrize(
@@ -1656,7 +1656,7 @@ class TestSinglePassVerify:
     MHL is in-process too; see TestClassicMhlDispatch.)
     """
 
-    def test_ascmhl_verify_invokes_engine_once(self, monkeypatch, tmp_path):
+    def test_ascmhl_history_invokes_engine_once(self, monkeypatch, tmp_path):
         calls = {"n": 0}
 
         def _spy(root_path, *, size_only=False, on_progress=None, history=None):

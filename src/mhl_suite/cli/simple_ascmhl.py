@@ -4,7 +4,7 @@ simple-ascmhl — native sealing and verification tool for ASC MHL histories.
 
 This module is the command-line interface, and the only place in the ASC-MHL
 path that writes to the terminal or exits the process: the engines
-(ascmhl_seal, ascmhl_ops, ascmhl_verify) return structured results or raise
+(ascmhl_seal, ascmhl_ops, ascmhl_history) return structured results or raise
 typed errors, and this module renders them (via the shared renderer in
 mhl_suite.verify) and maps them to exit codes.
 
@@ -25,9 +25,9 @@ import sys
 from mhl_suite import __version__
 from mhl_suite._exit_codes import ExitCode
 from mhl_suite.algorithms import ASC_FORMATS
+from mhl_suite.ascmhl_history import ASCMHL_FOLDER, HistoryError, NoHistoryError, verify_ascmhl
 from mhl_suite.ascmhl_ops import diff_ascmhl, flatten_ascmhl, rename_ascmhl
 from mhl_suite.ascmhl_seal import AscmhlSealError, SealOptions, SealResult, seal_ascmhl
-from mhl_suite.ascmhl_verify import ASCMHL_FOLDER, HistoryError, NoHistoryError, verify_ascmhl
 from mhl_suite.osutils import to_terminal_sep
 from mhl_suite.update_checker import run_with_update_check
 from mhl_suite.verify import Status, VerifyReport, render_verify_lines, status_line

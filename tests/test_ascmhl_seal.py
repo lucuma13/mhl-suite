@@ -16,7 +16,7 @@ from ascmhl import commands
 from click.testing import CliRunner
 from lxml import etree
 
-from mhl_suite import ascmhl_verify
+from mhl_suite import ascmhl_history
 from mhl_suite.ascmhl_seal import (
     AscmhlSealError,
     DirEntryOut,
@@ -136,7 +136,7 @@ class TestSealInitiate:
         manifest = manifest_of(result, root)
         assert re.fullmatch(r"0001_card_\d{4}-\d{2}-\d{2}_\d{6}Z\.mhl", manifest.name)
         assert (root / "ascmhl" / "ascmhl_chain.xml").exists()
-        assert ascmhl_verify.verify_ascmhl(root).code == 0
+        assert ascmhl_history.verify_ascmhl(root).code == 0
 
     def test_first_generation_records_original_actions(self, tmp_path):
         root = tmp_path / "card"
@@ -166,7 +166,7 @@ class TestSealInitiate:
         text = manifest_of(result, root).read_text()
         assert '<path size="0"' in text
         assert "<directoryhash>" in text  # the empty directory still gets hashes
-        assert ascmhl_verify.verify_ascmhl(root).code == 0
+        assert ascmhl_history.verify_ascmhl(root).code == 0
 
     def test_empty_scope_seals_to_a_manifest_without_hashes(self, tmp_path):
         root = tmp_path / "empty"
@@ -290,7 +290,7 @@ class TestSealAppend:
         make_tree(root, {"a.txt": b"x"})
         seal(root)
         (root / "ascmhl" / "ascmhl_chain.xml").unlink()
-        with pytest.raises(ascmhl_verify.NoChainError):
+        with pytest.raises(ascmhl_history.NoChainError):
             seal_ascmhl(root, SealOptions())
 
     def test_read_only_history_reports_write_failure_not_crash(self, tmp_path):
@@ -342,7 +342,7 @@ class TestNestedHistories:
         for digest in re.findall(r">([0-9a-f]{16})<", child_roothash):
             assert digest in parent_a001
 
-        assert ascmhl_verify.verify_ascmhl(base).code == 0
+        assert ascmhl_history.verify_ascmhl(base).code == 0
 
     def test_nested_updates_receive_cli_ignore_patterns(self, tmp_path):
         # Spec 5.3.2: data-set-wide updates (ignore patterns included)
@@ -365,7 +365,7 @@ class TestReferenceToolInterop:
         assert created.exit_code == 0, created.output
         verified = CliRunner().invoke(commands.verify, [str(root)])
         assert verified.exit_code == 0, verified.output
-        assert ascmhl_verify.verify_ascmhl(root).code == 0  # and we accept its generation
+        assert ascmhl_history.verify_ascmhl(root).code == 0  # and we accept its generation
 
     def test_our_verify_accepts_reference_history_we_extended(self, package):
         result = seal(package)

@@ -3,7 +3,7 @@ The simple-ascmhl CLI: argument handling, smart dispatch, rendering, and the
 exit-code contract (seal semantics vs verify semantics, pinned ASC codes).
 """
 
-from mhl_suite.ascmhl_verify import load_history
+from mhl_suite.ascmhl_history import load_history
 
 from .helpers import make_tree
 

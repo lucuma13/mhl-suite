@@ -23,7 +23,7 @@ UTF-8, NFC posix paths. Chain and collection files share one schema and one
 writer (spec 7/8).
 
 Argument and filesystem problems raise AscmhlSealError for the CLI to render;
-history-integrity problems raise ascmhl_verify.HistoryError with its pinned
+history-integrity problems raise ascmhl_history.HistoryError with its pinned
 3x code. This module never prints and never exits.
 """
 
@@ -41,7 +41,7 @@ from mhl_suite import __version__, hashing
 from mhl_suite import ascmhl_dirhash as dirhash
 from mhl_suite._exit_codes import ExitCode
 from mhl_suite.algorithms import ASC_FORMATS, asc_check
-from mhl_suite.ascmhl_verify import (
+from mhl_suite.ascmhl_history import (
     ASCMHL_FOLDER,
     CHAIN_FILENAME,
     DEFAULT_IGNORE_PATTERNS,
@@ -766,7 +766,7 @@ def seal_ascmhl(
     sharing this operation's UTC start timestamp. Never prints, never exits.
 
     Raises AscmhlSealError for unusable arguments and lets
-    ascmhl_verify.HistoryError propagate for a broken existing history (the
+    ascmhl_history.HistoryError propagate for a broken existing history (the
     chain gate runs before any media is read). Manifest write failures (e.g.
     a read-only volume, Implementation Guidelines 2.7) are reported in
     `write_failures` while the verification outcome stands.

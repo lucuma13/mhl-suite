@@ -9,7 +9,7 @@ verify-specific):
     VerifyReport. Entries record *what was checked and what was found*, never
     terminal text.
   * verify_records() — the one engine both dialects drive. A dialect module
-    (classic_verify's manifest parser, ascmhl_verify's history loader) reduces
+    (classic_verify's manifest parser, ascmhl_history's history loader) reduces
     its manifest to FileRecords — path, recorded size, recorded hashes with
     their matching rules — and the engine does everything the dialects have in
     common: resolve each path against the disk (traversal jail + Unicode-

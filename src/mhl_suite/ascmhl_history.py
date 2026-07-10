@@ -1,5 +1,8 @@
 """
-ASC-MHL verification: a native history loader and the dialect policy.
+ASC-MHL history reading: the native loader, the history model, and read-only
+verification. Everything here only ever *reads* a package — the manifest
+writers and the generation-appending engine live in mhl_suite.ascmhl_seal,
+the remaining operations in mhl_suite.ascmhl_ops.
 
 The suite owns the parsing end-to-end: load_history() reads an ASC-MHL
 package's `ascmhl/` folder — validating the chain file (each generation
