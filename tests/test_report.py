@@ -82,7 +82,7 @@ class TestRenderReportDetails:
         assert "1 missing" in out
         assert "1 mismatch" in out
         assert "1 error" in out
-        assert "1 new (untracked)" in out
+        assert "1 unknown (not recorded)" in out
         # Manifest section is rendered for a non-empty result set (singular
         # header for a single manifest).
         assert "Manifest\n" in out
@@ -218,7 +218,7 @@ class TestRenderReportDetails:
 
     def test_issues_section_collects_non_ok_across_manifests(self):
         """
-        The Issues section surfaces every non-OK entry — including new/untracked
+        The Issues section surfaces every non-OK entry — including unknown/not-recorded
         warnings and manifest-level errors — pulled above the per-manifest
         Manifests section.
         """
@@ -243,7 +243,7 @@ class TestRenderReportDetails:
         out = self._render([good, bad, broken], exit_status=40)
         issues = out.split("Issues", 1)[1].split("Manifests", 1)[0]
         assert "bad.mxf" in issues
-        assert "extra.mxf" in issues  # new/untracked included
+        assert "extra.mxf" in issues  # unknown (not recorded) included
         assert "parse failed" in issues  # manifest-level error included
         assert "ok.mxf" not in issues  # clean entries stay out
 
@@ -259,7 +259,7 @@ class TestRenderReportDetails:
 
     def test_per_manifest_sub_summary_line(self):
         """
-        Each manifest header is followed by its own verdict line; new/untracked
+        Each manifest header is followed by its own verdict line; unknown files
         is a warning and does not flip the manifest to FAILED.
         """
         mr = report.ManifestResult(
@@ -272,7 +272,7 @@ class TestRenderReportDetails:
         )
         details = self._render([mr], exit_status=0).split("Manifest\n", 1)[1]
         assert "📄 m.mhl" in details
-        assert "✅ VERIFIED | 2 files | 1 verified | 1 new (untracked)" in details
+        assert "✅ VERIFIED | 2 files | 1 verified | 1 unknown (not recorded)" in details
 
 
 class TestFormatFileResult:
@@ -319,7 +319,7 @@ class TestFormatFileResult:
 
     def test_new(self):
         out = report._format_file_result(VerifyEntry(path="f.mxf", status=Status.NEW))
-        assert "new (untracked)" in out
+        assert "unknown (not recorded)" in out
         assert "f.mxf" in out
 
     def test_io_error_names_kind_and_os_text(self):

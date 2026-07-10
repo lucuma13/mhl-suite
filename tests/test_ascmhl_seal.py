@@ -156,7 +156,7 @@ class TestSealInitiate:
         tags = [child.tag.rpartition("}")[2] for child in info]
         assert tags == ["creationdate", "hostname", "tool", "author"]
         tool = find(info, "{*}tool")
-        assert tool.text == "simple-ascmhl"
+        assert tool.text == "advanced-mhl"
         assert tool.get("version")
 
     def test_zero_byte_files_and_empty_directories_are_recorded(self, tmp_path):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-simple-ascmhl — native sealing and verification tool for ASC MHL histories.
+advanced-mhl — native sealing and verification tool for ASC MHL histories.
 
 This module is the command-line interface, and the only place in the ASC-MHL
 path that writes to the terminal or exits the process: the engines
@@ -10,12 +10,12 @@ mhl_suite.verify) and maps them to exit codes.
 
 Subcommands (ASC MHL Specification v1.0 operations):
 
-    simple-ascmhl seal <directory>       — create or append a generation (5.6.2/5.6.5)
-    simple-ascmhl verify <directory>     — verify and append a generation (5.6.4)
-    simple-ascmhl diff <directory>       — unknown/missing files, no hashing (5.6.3)
-    simple-ascmhl rename <old> <new>     — rename and record previousPath (5.6.6)
-    simple-ascmhl flatten <dir> <dest>   — packing list + collection (5.6.7)
-    simple-ascmhl xsd-schema-check <f>   — validate against the bundled XSD
+    advanced-mhl seal <directory>       — create or append a generation (5.6.2/5.6.5)
+    advanced-mhl verify <directory>     — verify and append a generation (5.6.4)
+    advanced-mhl diff <directory>       — unknown/missing files, no hashing (5.6.3)
+    advanced-mhl rename <old> <new>     — rename and record previousPath (5.6.6)
+    advanced-mhl flatten <dir> <dest>   — packing list + collection (5.6.7)
+    advanced-mhl xsd-schema-check <f>   — validate against the bundled XSD
 """
 
 import argparse
@@ -100,7 +100,7 @@ def _print_seal_result(result: SealResult, verbose: bool) -> None:
     """
     Seal-flavoured rendering: newly recorded files are the operation's point,
     so they show as [NEW] (verbose) rather than the verify renderer's
-    "new file found" failure; everything else reuses the shared renderer.
+    "unknown file" failure; everything else reuses the shared renderer.
     """
     for line in result.report.notices:
         print(to_terminal_sep(line))
@@ -221,7 +221,7 @@ def main() -> None:
 
 def _dispatch_bare_argument() -> None:
     """
-    Smart dispatch: `simple-ascmhl <dir>` verifies when the directory already
+    Smart dispatch: `advanced-mhl <dir>` verifies when the directory already
     carries a history and seals when it doesn't; a bare .mhl/.xml file goes to
     the schema check. sys.argv is rewritten before argparse sees it, so all
     normal validation still applies.
@@ -284,7 +284,7 @@ def _main() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        prog="simple-ascmhl",
+        prog="advanced-mhl",
         description="Native sealing and verification tool for ASC MHL histories (ASC MHL spec v1.0)",
         parents=[global_opts],
     )

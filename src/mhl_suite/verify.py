@@ -55,7 +55,7 @@ class Status(StrEnum):
     MISSING = "missing"  # file not found on disk
     MISMATCH = "mismatch"  # a hash or size differs from the manifest
     ERROR = "error"  # any other per-file failure (see ErrorKind)
-    NEW = "new"  # on disk but not recorded (ASC-MHL history check)
+    NEW = "new"  # on disk but not recorded (ASC-MHL only)
 
 
 class ErrorKind(StrEnum):
@@ -432,13 +432,14 @@ _DETAIL_INDENT = "        "
 def failure_label(entry: VerifyEntry) -> str:
     """
     Short category label for a non-OK entry: "hash mismatch", "size mismatch",
-    "missing file", "new file found", or the error kind's label. Shared with
-    mhl_suite.report so both outputs name failures identically.
+    "missing file", "unknown file" (ASC MHL spec 5.6.3: on disk but not
+    recorded), or the error kind's label. Shared with mhl_suite.report so both
+    outputs name failures identically.
     """
     if entry.status == Status.MISSING:
         return "missing file"
     if entry.status == Status.NEW:
-        return "new file found"
+        return "unknown file"
     if entry.status == Status.MISMATCH:
         return "hash mismatch" if entry.hash_mismatch else "size mismatch"
     # Status.ERROR

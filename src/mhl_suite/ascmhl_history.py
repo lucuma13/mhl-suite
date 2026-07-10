@@ -21,7 +21,7 @@ here, notably:
   * A hash entry labeled `original` or `verified` can vouch for a file;
     `failed` and unlabeled entries cannot (5.6.4).
   * A recorded file whose entries are all unusable is an unsuccessful
-    verification, never a "new file" — unknown means *not recorded* (5.6.3).
+    verification, never an "unknown file".
   * Every history's recorded ignore patterns govern its own subtree, and the
     mandatory default set always applies (5.6.1.2).
 
@@ -464,7 +464,7 @@ def build_ignore_spec(history: History) -> IgnoreMatcher:
     recorded patterns scoped to its subtree, with the mandatory defaults
     always appended (a foreign manifest that recorded custom patterns without
     the defaults must not make verify descend into ascmhl/ and flag the
-    manifests as new files).
+    manifests as unknown files).
     """
     return IgnoreMatcher(history)
 
@@ -552,7 +552,7 @@ def scan_disk_files(
 
     `on_unreadable`, if given, is called as on_unreadable(rel_dir, exc) for a
     directory that cannot be scanned ('.' for the root itself) — a silently
-    dropped directory would leave any new files inside it undetected, so the
+    dropped directory would leave any unknown files inside it undetected, so the
     caller must be able to surface it.
     """
 
@@ -637,11 +637,11 @@ def _completeness_entries(
     Recorded paths outside the verifiable set must still exist (absent →
     missing); a recorded *file* among them has no usable hash entry (nothing
     labeled original or verified — spec 5.6.4), which is an unsuccessful
-    verification, never a "new file" — spec 5.6.3 defines unknown files as
-    those *not* recorded in the history. The disk scan then reports everything
-    the history has no record for as new; a directory it could not scan is
-    surfaced as an error, because new files inside it would otherwise go
-    undetected without a trace.
+    verification, never an "unknown file" — spec 5.6.3 defines unknown files
+    as those *not* recorded in the history. The disk scan then reports
+    everything the history has no record for as unknown; a directory it could
+    not scan is surfaced as an error, because unknown files inside it would
+    otherwise go undetected without a trace.
     """
     entries: list[VerifyEntry] = []
     recorded_paths = {r.path for r in recorded}
@@ -677,7 +677,7 @@ def ascmhl_exit_code(entries: "list[VerifyEntry]") -> ExitCode:
     """
     The ASC-MHL verification exit code for a set of per-file entries — a fixed
     precedence, pinned for tool interop: hash mismatch / per-file failure 11
-    beats new-files 21, which beats nothing-verifiable-found 20 (no record
+    beats unknown-files 21, which beats nothing-verifiable-found 20 (no record
     reached the hash comparison), which beats missing-files 10.
     """
     if any(e.status in (Status.MISMATCH, Status.ERROR) for e in entries):
@@ -718,7 +718,7 @@ def verify_ascmhl(
     hasher and may fire from worker threads.
 
     Report codes follow a fixed precedence (pinned for tool interop): hash
-    mismatch / per-file failure 11 beats new-files 21, which beats
+    mismatch / per-file failure 11 beats unknown-files 21, which beats
     nothing-verifiable-found 20, which beats missing-files 10; size-only
     failures report 13.
 

@@ -77,7 +77,7 @@ def diff_ascmhl(root_path: "str | Path") -> VerifyReport:
     """
     Report unknown files (on disk, neither recorded nor ignored) and missing
     files (recorded, absent from disk) for the media directory rooted at `root_path`.
-    No hashes are computed (spec 5.6.3). Report codes: new-files 21 beats
+    No hashes are computed (spec 5.6.3). Report codes: unknown-files 21 beats
     missing 10; history-integrity failures surface as their pinned 3x codes,
     exactly like verify_ascmhl.
     """
@@ -351,7 +351,7 @@ def _flatten_file(sub: History, final_name: str) -> "tuple[dict[str, HashEntry],
 
 
 def _packinglist_path(destination: Path, op_start: datetime) -> Path:
-    """A non-colliding packinglist__<date>_<time>.mhl path (spec 5.5 naming)."""
+    """A non-colliding packinglist__<date>_<time>.mhl path (the name is conventional, not normative)."""
     stem = f"packinglist__{op_start.strftime('%Y-%m-%d_%H%M%S')}"
     path = destination / f"{stem}.mhl"
     suffix = 0

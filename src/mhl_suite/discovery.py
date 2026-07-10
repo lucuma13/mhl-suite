@@ -313,7 +313,7 @@ _ASCMHL_VERIFY_RESULTS: dict[int, tuple[str, str]] = {
     ExitCode.SIZE_MISMATCH: ("❌ ASC-MHL verification failed: {target}", "error"),
     ExitCode.SINGLE_FILE_NOT_FOUND: ("❌ ASC-MHL verification failed: {target}", "error"),
     ExitCode.NEW_FILES: (
-        "⚠️ ASC-MHL: new files found in {target} that are not recorded in history.",
+        "⚠️ ASC-MHL: unknown files found in {target} that are not recorded in history.",
         "error",
     ),
     ExitCode.NO_HISTORY: ("❌ ASC-MHL verification failed: {target}", "error"),
@@ -447,7 +447,7 @@ def _verify_and_append(
     The conformant default: verify the managed data set and append a new
     generation recording the results (spec 5.6.4/5.6.5), via the seal engine —
     which also propagates generations through nested histories (spec 5.3.2).
-    The report carries verify semantics (its code treats new files as drift).
+    The report carries verify semantics (its code treats unknown files as drift).
 
     A generation that cannot be written (a locked or read-only volume) must
     not pass silently as if it were recorded: the failure is surfaced and an

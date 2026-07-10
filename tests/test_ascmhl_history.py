@@ -241,7 +241,7 @@ class TestVerifyPackage:
         The spec-mandated default ignore set (.DS_Store, ascmhl) always applies,
         even when a manifest recorded custom ignore patterns without the
         defaults. Otherwise verify would descend into ascmhl/ and flag its
-        manifests and chain as new files (exit 21). We simulate such a foreign
+        manifests and chain as unknown files (exit 21). We simulate such a foreign
         manifest by returning a custom-only pattern list.
         """
         monkeypatch.setattr(verify.History, "latest_ignore_patterns", lambda self: ["*.tmp"])
@@ -280,7 +280,7 @@ class TestVerifyPackage:
     def test_unreadable_directory_is_reported_not_silenced(self, package):
         """
         A directory that cannot be scanned during new-file detection surfaces
-        as a per-file failure — new files inside it would otherwise go
+        as a per-file failure — unknown files inside it would otherwise go
         undetected without a trace.
         """
         locked = package / "locked"

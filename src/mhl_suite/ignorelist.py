@@ -6,7 +6,7 @@ kept as its own module so the whole list is readable in one place.
 
 These files/dirs are rewritten by the system on its own (Finder, Spotlight,
 Time Machine, Windows Explorer) or back the filesystem itself. Hashing them
-would make a later `verify` fail with spurious mismatches and "new file"
+would make a later `verify` fail with spurious mismatches and "unknown file"
 reports every time the OS touches them.
 
 Matched case-sensitively against the exact-name set, or by prefix — the OS

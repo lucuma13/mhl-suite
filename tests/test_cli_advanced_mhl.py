@@ -1,5 +1,5 @@
 """
-The simple-ascmhl CLI: argument handling, smart dispatch, rendering, and the
+The advanced-mhl CLI: argument handling, smart dispatch, rendering, and the
 exit-code contract (seal semantics vs verify semantics, pinned ASC codes).
 """
 
@@ -96,7 +96,7 @@ class TestVerify:
         (root / "b.txt").write_bytes(b"y")
         rc, out, _ = ascmhl_cli(["verify", root])
         assert rc == 21
-        assert "new file found: b.txt" in out
+        assert "unknown file: b.txt" in out
 
     def test_verify_without_history_is_exit_30(self, ascmhl_cli, tmp_path):
         (tmp_path / "bare").mkdir()
@@ -118,7 +118,7 @@ class TestDiff:
         (root / "new.txt").write_bytes(b"n")
         rc, out, _ = ascmhl_cli(["diff", root])
         assert rc == 21
-        assert "new file found: new.txt" in out
+        assert "unknown file: new.txt" in out
         assert generation_count(root) == 1
 
 

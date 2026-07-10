@@ -182,7 +182,7 @@ def _creatorinfo_element(creation_date: str) -> "etree._Element":
     etree.SubElement(info, "creationdate").text = creation_date
     etree.SubElement(info, "hostname").text = friendly_hostname()
     tool = etree.SubElement(info, "tool")
-    tool.text = "simple-ascmhl"
+    tool.text = "advanced-mhl"
     tool.set("version", __version__)
     etree.SubElement(info, "author").text = getpass.getuser()
     return info
@@ -304,7 +304,7 @@ class SealOptions:
 class SealResult:
     """
     The outcome of one seal/verify operation. `report.code` carries the
-    verify-semantics exit code (the pinned precedence, new files included);
+    verify-semantics exit code (the pinned precedence, unknown files included);
     `seal_code` treats newly recorded files as the point of the operation
     rather than drift. `write_failures` lists manifests that could not be
     written (e.g. a read-only volume) — the hashing results stay valid.

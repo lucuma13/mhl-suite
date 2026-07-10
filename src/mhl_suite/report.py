@@ -150,7 +150,7 @@ def _summary_line(
     if n_error:
         parts.append(f"{n_error} error")
     if n_new:
-        parts.append(f"{n_new} new (untracked)")
+        parts.append(f"{n_new} unknown (not recorded)")
     return " | ".join(parts)
 
 
@@ -253,7 +253,7 @@ def _render_report(
             continue
 
         # Per-manifest sub-summary — same fields as the global verdict minus the
-        # manifest count. New/untracked is a warning, not a verification
+        # manifest count. An unknown file (spec 5.6.3) is a warning, not a verification
         # failure, so it doesn't flip the manifest's PASSED/FAILED state.
         line(
             _summary_line(
@@ -306,7 +306,7 @@ def _format_file_result(fr: VerifyEntry, indent: str = "    ") -> str:
         # A multi-hash (-a all) mismatch has no single parenthetical.
         return f"{indent}❌ {failure_label(fr)}: {fr.path}"
     if fr.status == Status.NEW:
-        return f"{indent}⚠️ new (untracked): {fr.path}"
+        return f"{indent}⚠️ unknown (not recorded): {fr.path}"
     # Status.ERROR — the label carries the category; IO errors add the OS text.
     reason = failure_label(fr)
     if fr.error == ErrorKind.IO and fr.detail:

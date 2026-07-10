@@ -8,6 +8,7 @@ version = "1.4.0"
 description = "Simple MHL verification and sealing tools"
 readme = "README.md"
 keywords = [
+  "advanced-mhl",
   "asc-mhl",
   "ascmhl",
   "c4",
@@ -49,14 +50,12 @@ dependencies = [
   "xxhash>=3.8.1",
 ]
 urls.Homepage = "https://github.com/lucuma13/mhl-suite"
+scripts.advanced-mhl = "mhl_suite.cli.advanced_mhl:main"
 scripts.mhlver = "mhl_suite.cli.mhlver:main"
-scripts.simple-ascmhl = "mhl_suite.cli.simple_ascmhl:main"
 scripts.simple-mhl = "mhl_suite.cli.simple_mhl:main"
 
 [dependency-groups]
 dev = [
-  # The reference implementation stays as a dev dependency: the test suite
-  # seals its ASC-MHL parity fixtures with it.
   "ascmhl>=1.2",
   "hypothesis",
   "lxml-stubs",
