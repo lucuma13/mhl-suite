@@ -32,7 +32,8 @@ from lxml import etree
 
 from mhl_suite import ascmhl_history, classic_verify, xsd_check
 from mhl_suite._exit_codes import ExitCode
-from mhl_suite.ascmhl_history import verify_ascmhl
+from mhl_suite.ascmhl_history import HistoryError, verify_ascmhl
+from mhl_suite.ascmhl_seal import AscmhlSealError, seal_ascmhl
 from mhl_suite.classic_verify import verify_classic
 from mhl_suite.report import ManifestResult
 from mhl_suite.verify import VerifyReport, render_verify_lines
@@ -300,6 +301,9 @@ _CLASSICMHL_SCHEMA_RESULTS: dict[int, tuple[str, str]] = {
 
 _ASCMHL_VERIFY_RESULTS: dict[int, tuple[str, str]] = {
     ExitCode.OK: ("✅ ASC-MHL verified: {target}", "success"),
+    # The append the spec mandates could not happen (or the engine balked at
+    # the target) — the notice lines above the status carry the specifics.
+    ExitCode.ERROR: ("🚨 ASC-MHL verification error: {target}", "warning"),
     ExitCode.MISSING: ("❌ ASC-MHL verification failed: {target}", "error"),
     ExitCode.HASH_MISMATCH: ("❌ ASC-MHL verification failed: {target}", "error"),
     ExitCode.DIRECTORY_HASH_MISMATCH: ("❌ ASC-MHL verification failed: {target}", "error"),
@@ -358,23 +362,29 @@ def verify_item(
     verbose: bool,
     schema: bool,
     size_only: bool = False,
+    read_only: bool = False,
     emit: "Callable[[StatusLine], None] | None" = None,
     on_bytes: "Callable[[int], None] | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
     """
     Verify one discovered item with the right dialect engine.
 
-    `size_only` requests the fast size-only check; `schema` validates against
-    the bundled XSDs instead of verifying. `emit`, if given, receives a
-    StatusLine per manifest for the CLI to render; `on_bytes` advances a
-    progress bar as each file is hashed (per chunk, possibly from worker
-    threads).
+    Verifying an ASC MHL History appends a new generation recording the
+    results, as spec 5.6.4 requires; `read_only` keeps the check from writing
+    anything (a flatten → manifest-verify, spec 5.6.7/5.6.4 — for locked or
+    WORM media). Classic MHL verification never writes either way. `size_only`
+    requests the fast size-only check and `schema` validates against the
+    bundled XSDs instead of verifying; neither computes content hashes, so
+    neither is a spec 5.6.4 verification to record — no generation is
+    appended. `emit`, if given, receives a StatusLine per manifest for the CLI
+    to render; `on_bytes` advances a progress bar as each file is hashed (per
+    chunk, possibly from worker threads).
 
     Returns (exit_code, ManifestResult | None). ManifestResult is None in
     schema mode (no per-file detail exists then).
     """
     if isinstance(item, AscmhlHistory):
-        return _verify_ascmhl_item(item, verbose, schema, size_only, emit, on_bytes)
+        return _verify_ascmhl_item(item, verbose, schema, size_only, read_only, emit, on_bytes)
     return _verify_classic_item(item, verbose, schema, size_only, emit, on_bytes)
 
 
@@ -403,6 +413,7 @@ def _verify_ascmhl_item(
     verbose: bool,
     schema: bool,
     size_only: bool,
+    read_only: bool,
     emit: "Callable[[StatusLine], None] | None",
     on_bytes: "Callable[[int], None] | None",
 ) -> "tuple[int, ManifestResult | None]":
@@ -418,7 +429,45 @@ def _verify_ascmhl_item(
         _emit(emit, _ASCMHL_SCHEMA_RESULTS, chain_code, str(chain_file), "\n".join(chain_lines))
         return (mhl_code if mhl_code != 0 else chain_code), None
 
-    report = verify_ascmhl(item.root, size_only=size_only, on_progress=on_bytes, history=item.try_history())
-    output = "\n".join(render_verify_lines(report, verbose))
+    if size_only or read_only:
+        report = verify_ascmhl(item.root, size_only=size_only, on_progress=on_bytes, history=item.try_history())
+        extra_lines: list[str] = []
+    else:
+        report, extra_lines = _verify_and_append(item, verbose, on_bytes)
+
+    output = "\n".join([*render_verify_lines(report, verbose), *extra_lines])
     _emit(emit, _ASCMHL_VERIFY_RESULTS, report.code, item.label, output)
     return report.code, _manifest_result(item, report, _ASCMHL_VERIFY_RESULTS)
+
+
+def _verify_and_append(
+    item: AscmhlHistory, verbose: bool, on_bytes: "Callable[[int], None] | None"
+) -> "tuple[VerifyReport, list[str]]":
+    """
+    The conformant default: verify the managed data set and append a new
+    generation recording the results (spec 5.6.4/5.6.5), via the seal engine —
+    which also propagates generations through nested histories (spec 5.3.2).
+    The report carries verify semantics (its code treats new files as drift).
+
+    A generation that cannot be written (a locked or read-only volume) must
+    not pass silently as if it were recorded: the failure is surfaced and an
+    otherwise-clean code escalates to ERROR, pointing at --read-only, the mode
+    that makes the no-write behaviour explicit.
+    """
+    try:
+        result = seal_ascmhl(item.root, on_progress=on_bytes)
+    except HistoryError as err:
+        return VerifyReport(code=err.code, notices=[str(err)]), []
+    except AscmhlSealError as err:
+        return VerifyReport(code=ExitCode.ERROR, notices=[str(err)]), []
+
+    report = result.report
+    if result.write_failures:
+        report.notices.append(
+            "[ERROR] verification results could not be recorded in a new generation "
+            "(spec 5.6.4); use --read-only to verify without writing"
+        )
+        if report.code == ExitCode.OK:
+            report.code = ExitCode.ERROR
+    extra_lines = [f"Created new generation: {m}" for m in result.manifests_written] if verbose else []
+    return report, extra_lines

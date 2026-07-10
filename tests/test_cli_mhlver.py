@@ -15,6 +15,8 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from ascmhl import commands
+from click.testing import CliRunner
 from hypothesis import HealthCheck, given, settings, strategies
 from lxml import etree
 from rich.console import Console
@@ -100,8 +102,9 @@ def _pkg_item(manifest):
 
 
 def call_verify(manifest):
-    """Verify one ASC-MHL package item with sane defaults; return its exit code."""
-    rc, _mr = discovery.verify_item(_pkg_item(manifest), verbose=False, schema=False)
+    """Read-only-verify one ASC-MHL history item (the verify_ascmhl path the
+    wiring tests stub); return its exit code."""
+    rc, _mr = discovery.verify_item(_pkg_item(manifest), verbose=False, schema=False, read_only=True)
     return rc
 
 
@@ -769,7 +772,9 @@ class TestAscMhlDispatch:
         ]
         stub_verify_ascmhl(monkeypatch, 11, entries)
         # The orchestrator is print-free; the CLI sink (_render_status) does the printing.
-        discovery.verify_item(_pkg_item(ascmhl_setup), verbose=False, schema=False, emit=mhlver._render_status)
+        discovery.verify_item(
+            _pkg_item(ascmhl_setup), verbose=False, schema=False, read_only=True, emit=mhlver._render_status
+        )
         assert "hash mismatch: b.mxf" in capsys.readouterr().err
 
     def test_schema_false_dispatches_to_verify(self, ascmhl_setup, monkeypatch):
@@ -780,7 +785,7 @@ class TestAscMhlDispatch:
             xsd_check, "ascmhl_schema_report", lambda *a, **k: called.setdefault("schema", True) and (0, [])
         )
 
-        rc, _mr = discovery.verify_item(_pkg_item(ascmhl_setup), verbose=False, schema=False)
+        rc, _mr = discovery.verify_item(_pkg_item(ascmhl_setup), verbose=False, schema=False, read_only=True)
 
         assert "schema" not in called, "the schema check must not run in verify mode"
         assert rc == 0
@@ -788,7 +793,7 @@ class TestAscMhlDispatch:
     def test_schema_false_return_value_is_propagated(self, ascmhl_setup, monkeypatch):
         """The exit code from verify_ascmhl is returned unchanged."""
         stub_verify_ascmhl(monkeypatch, 11, [VerifyEntry(path="f", status=Status.MISMATCH)])
-        rc, _mr = discovery.verify_item(_pkg_item(ascmhl_setup), verbose=False, schema=False)
+        rc, _mr = discovery.verify_item(_pkg_item(ascmhl_setup), verbose=False, schema=False, read_only=True)
         assert rc == 11
 
     def test_schema_true_dispatches_to_schema_check(self, ascmhl_setup, monkeypatch):
@@ -804,6 +809,118 @@ class TestAscMhlDispatch:
         rc, _mr = discovery.verify_item(_pkg_item(ascmhl_setup), verbose=False, schema=True)
         assert called.get("yes") is True
         assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# TestAscMhlAppendOnVerify
+# ---------------------------------------------------------------------------
+
+
+class TestAscMhlAppendOnVerify:
+    """
+    The conformant default: verifying an ASC MHL History appends a new
+    generation recording the results (spec 5.6.4/5.6.5). read_only and the
+    hash-free modes (-S size-only, -s schema) record nothing, and a generation
+    that cannot be written never passes silently. Driven on real histories
+    sealed by the reference tool, so every append here doubles as an interop
+    pin.
+    """
+
+    @staticmethod
+    def _item(pkg):
+        return discovery.classify(next((pkg / "ascmhl").glob("*.mhl")))
+
+    @staticmethod
+    def _generations(pkg):
+        return sorted(p.name for p in (pkg / "ascmhl").glob("*.mhl"))
+
+    @staticmethod
+    def _snapshot(pkg):
+        return {p.name: p.read_bytes() for p in (pkg / "ascmhl").iterdir()}
+
+    def test_default_verify_appends_a_generation(self, tmp_path):
+        pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
+        rc, mr = discovery.verify_item(self._item(pkg), verbose=False, schema=False)
+        assert rc == 0
+        assert mr is not None
+        assert mr.manifest_status == "ok"
+        gens = self._generations(pkg)
+        assert len(gens) == 2
+        assert gens[1].startswith("0002")
+        # The extended history passes our integrity gate and the reference
+        # tool's verify alike.
+        assert ascmhl_history.verify_ascmhl(pkg).code == 0
+        verified = CliRunner().invoke(commands.verify, [str(pkg)])
+        assert verified.exit_code == 0, verified.output
+
+    def test_mismatch_appends_and_still_exits_11(self, tmp_path):
+        pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
+        (pkg / "a.mov").write_bytes(b"y" * 100)
+        rc, mr = discovery.verify_item(self._item(pkg), verbose=False, schema=False)
+        assert rc == 11
+        assert mr is not None
+        assert mr.manifest_status == "failed"
+        # The failure is recorded in the appended generation (spec 5.6.5).
+        latest = sorted((pkg / "ascmhl").glob("*.mhl"))[-1]
+        assert len(self._generations(pkg)) == 2
+        assert 'action="failed"' in latest.read_text()
+
+    def test_new_file_appends_and_still_exits_21(self, tmp_path):
+        pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
+        (pkg / "extra.mov").write_bytes(b"new")
+        rc, _mr = discovery.verify_item(self._item(pkg), verbose=False, schema=False)
+        assert rc == 21
+        latest = sorted((pkg / "ascmhl").glob("*.mhl"))[-1]
+        assert "extra.mov" in latest.read_text()
+
+    def test_read_only_and_hash_free_modes_write_nothing(self, tmp_path):
+        pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
+        before = self._snapshot(pkg)
+        for size_only, read_only, schema in ((False, True, False), (True, False, False), (False, False, True)):
+            rc, _mr = discovery.verify_item(
+                self._item(pkg), verbose=False, schema=schema, size_only=size_only, read_only=read_only
+            )
+            assert rc == 0
+        assert self._snapshot(pkg) == before
+
+    def test_nested_history_appends_once_per_level(self, tmp_path):
+        root = tmp_path / "card"
+        make_package(root / "pkg", {"clip.mov": b"inner"})
+        make_package(root, {"top.txt": b"outer"})
+        outer_before = len(self._generations(root))
+        inner_before = len(self._generations(root / "pkg"))
+
+        # The nested history folds into the outer item (spec 5.3.2/5.3.3)…
+        (item,) = discovery.discover(root)
+        assert isinstance(item, discovery.AscmhlHistory)
+        assert item.root == root
+        rc, _mr = discovery.verify_item(item, verbose=False, schema=False)
+        assert rc == 0
+        # …and one run appends exactly one generation at each level.
+        assert len(self._generations(root)) == outer_before + 1
+        assert len(self._generations(root / "pkg")) == inner_before + 1
+
+    def test_unwritable_history_reports_but_never_exits_zero(self, tmp_path):
+        pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
+        emitted = []
+        (pkg / "ascmhl").chmod(0o555)
+        try:
+            rc, mr = discovery.verify_item(self._item(pkg), verbose=False, schema=False, emit=emitted.append)
+        finally:
+            (pkg / "ascmhl").chmod(0o755)
+        # The verification itself succeeded and is still reported…
+        assert mr is not None
+        # …but the mandated append could not happen: non-zero, pointing at the
+        # explicit no-write mode.
+        assert rc == 1
+        assert any("--read-only" in sl.output for sl in emitted)
+
+    def test_verbose_lists_created_generations(self, tmp_path):
+        pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
+        emitted = []
+        rc, _mr = discovery.verify_item(self._item(pkg), verbose=True, schema=False, emit=emitted.append)
+        assert rc == 0
+        assert any("Created new generation" in sl.output for sl in emitted)
 
 
 # ---------------------------------------------------------------------------
@@ -1352,7 +1469,7 @@ class TestRunWithProgress:
             file_results=[VerifyEntry(path="a.bin", status=Status.OK)],
         )
 
-        def _verify(f, verbose, schema, size_only, emit=None, on_bytes=None):
+        def _verify(f, verbose, schema, size_only, read_only=False, emit=None, on_bytes=None):
             assert on_bytes is not None
             on_bytes(100)  # exercise the _advance callback from the progress branch
             return 0, mr
@@ -1433,7 +1550,7 @@ class TestMain:
         """Omitting the path argument defaults to the current directory."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema, size_only=False):
+        def _stub_run(src, verbose, schema, size_only=False, read_only=False):
             called_with["src"] = src
             return 0, [], True
 
@@ -1447,7 +1564,7 @@ class TestMain:
         """An explicit path is resolved and forwarded to _run."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema, size_only=False):
+        def _stub_run(src, verbose, schema, size_only=False, read_only=False):
             called_with["src"] = src
             return 0, [], True
 
@@ -1462,7 +1579,7 @@ class TestMain:
         """--verbose is passed through to _run."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema, size_only=False):
+        def _stub_run(src, verbose, schema, size_only=False, read_only=False):
             called_with["verbose"] = verbose
             return 0, [], True
 
@@ -1472,11 +1589,25 @@ class TestMain:
         mhlver_cli(["-v", str(mhl)])
         assert called_with["verbose"] is True
 
+    def test_read_only_flag_forwarded(self, mhlver_cli, monkeypatch, tmp_path):
+        """-R/--read-only is passed through to _run."""
+        called_with = {}
+
+        def _stub_run(src, verbose, schema, size_only=False, read_only=False):
+            called_with["read_only"] = read_only
+            return 0, [], True
+
+        monkeypatch.setattr(mhlver, "_run", _stub_run)
+        mhl = tmp_path / "manifest.mhl"
+        mhl.write_text("")
+        mhlver_cli(["-R", str(mhl)])
+        assert called_with["read_only"] is True
+
     def test_schema_flag_forwarded(self, mhlver_cli, monkeypatch, tmp_path):
         """--xsd-schema-check is passed through to _run."""
         called_with = {}
 
-        def _stub_run(src, verbose, schema, size_only=False):
+        def _stub_run(src, verbose, schema, size_only=False, read_only=False):
             called_with["schema"] = schema
             return 0, [], True
 
@@ -1669,6 +1800,6 @@ class TestSinglePassVerify:
         target = pkg / "0001.mhl"
         target.write_text("<x/>")
 
-        discovery.verify_item(_pkg_item(target), verbose=False, schema=False)
+        discovery.verify_item(_pkg_item(target), verbose=False, schema=False, read_only=True)
 
         assert calls["n"] == 1, f"expected 1 hashing pass, got {calls['n']}"

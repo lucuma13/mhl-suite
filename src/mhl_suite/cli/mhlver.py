@@ -9,6 +9,11 @@ is the terminal front end — argument parsing, the rich progress bar, colour
 output, and the report file. It drives discovery.verify_item per manifest and
 renders each returned StatusLine to the terminal via _report_via_table.
 
+Verifying an ASC MHL History appends a new generation recording the results,
+as spec 5.6.4 requires; -R/--read-only keeps the check from writing anything
+(for locked/WORM media — it does not update the chain of custody). Classic MHL
+verification never writes either way.
+
 Exit code policy: the first non-zero backend exit code becomes mhlver's exit
 code, so an automation script gets a meaningful signal even when many rolls
 verify together.
@@ -298,7 +303,12 @@ def main() -> None:
 def _main() -> None:
     parser = argparse.ArgumentParser(
         prog="mhlver",
-        description="One tool to verify them all: find and verify MHL files or directories.",
+        description=(
+            "One tool to verify them all: find and verify MHL files or directories.\n"
+            "Verifying an ASC MHL History appends a new generation recording the\n"
+            "results (ASC MHL spec 5.6.4); use -R to check without writing anything.\n"
+            "Classic MHL verification never writes."
+        ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
@@ -308,10 +318,19 @@ def _main() -> None:
         help="export a verification report to the target directory",
     )
     parser.add_argument(
+        "-R",
+        "--read-only",
+        action="store_true",
+        help=(
+            "verify without appending a generation to ASC-MHL histories\n"
+            "(safe for locked/WORM media; does not update the chain of custody)"
+        ),
+    )
+    parser.add_argument(
         "-S",
         "--size-only",
         action="store_true",
-        help="check file sizes only (skip hashing)",
+        help="check file sizes only (skip hashing, records nothing)",
     )
     parser.add_argument(
         "-s",
@@ -365,14 +384,16 @@ def _main() -> None:
     # up no MHL files).
     if args.report:
         started_at = datetime.now().astimezone()
-        exit_status, manifest_results, found = _run(src, args.verbose, args.xsd_schema_check, args.size_only)
+        exit_status, manifest_results, found = _run(
+            src, args.verbose, args.xsd_schema_check, args.size_only, args.read_only
+        )
         finished_at = datetime.now().astimezone()
         if found:
             with _open_report(src) as (rf, rp):
                 _render_report(rf, src, started_at, finished_at, manifest_results, exit_status)
             print(f"report saved to: {rp}")
     else:
-        exit_status, _, _ = _run(src, args.verbose, args.xsd_schema_check, args.size_only)
+        exit_status, _, _ = _run(src, args.verbose, args.xsd_schema_check, args.size_only, args.read_only)
 
     sys.exit(exit_status)
 
@@ -388,6 +409,7 @@ def _verify_with_progress(
     verbose: bool,
     schema: bool,
     size_only: bool,
+    read_only: bool,
 ) -> "tuple[int, list[ManifestResult], Console]":
     """
     Verify each discovered item with a live rich progress bar.
@@ -436,6 +458,7 @@ def _verify_with_progress(
                 verbose,
                 schema,
                 size_only,
+                read_only,
                 emit=lambda sl: _render_status(sl, con),
                 on_bytes=_advance,
             )
@@ -451,7 +474,9 @@ def _verify_with_progress(
     return exit_status, manifest_results, stdout_console
 
 
-def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tuple[int, list[ManifestResult], bool]":
+def _run(
+    src: Path, verbose: bool, schema: bool, size_only: bool = False, read_only: bool = False
+) -> "tuple[int, list[ManifestResult], bool]":
     """
     Execute the verification pass on `src`.
 
@@ -505,10 +530,12 @@ def _run(src: Path, verbose: bool, schema: bool, size_only: bool = False) -> "tu
         # legitimate — never an error, just a less precise ETA. Verify, not the
         # weight, is the source of truth; the weight only paces the bar.
         weights = {item: item.weight(size_only) for item in items}
-        exit_status, manifest_results, console = _verify_with_progress(items, weights, verbose, schema, size_only)
+        exit_status, manifest_results, console = _verify_with_progress(
+            items, weights, verbose, schema, size_only, read_only
+        )
     else:
         for f in items:
-            code, mr = verify_item(f, verbose, schema, size_only, emit=_render_status)
+            code, mr = verify_item(f, verbose, schema, size_only, read_only, emit=_render_status)
             if mr is not None:
                 manifest_results.append(mr)
             if exit_status == 0:
