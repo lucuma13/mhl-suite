@@ -27,7 +27,7 @@ from rich.progress import BarColumn, Progress, TextColumn
 from rich.text import Text
 
 from mhl_suite import __version__
-from mhl_suite.discovery import AscmhlPackage, DiscoveredItem, StatusLine, discover, verify_item
+from mhl_suite.discovery import AscmhlHistory, DiscoveredItem, StatusLine, discover, verify_item
 from mhl_suite.osutils import normalization_variant_on_disk, to_terminal_sep
 from mhl_suite.report import (
     ManifestResult,
@@ -379,7 +379,7 @@ def _main() -> None:
 
 def _item_display_name(item: DiscoveredItem) -> str:
     """The short name shown on the progress label: the manifest's filename."""
-    return item.latest.name if isinstance(item, AscmhlPackage) else item.path.name
+    return item.latest.name if isinstance(item, AscmhlHistory) else item.path.name
 
 
 def _verify_with_progress(

@@ -4,8 +4,10 @@ Cross-dialect discovery and verification orchestrator.
 The engine behind the `mhlver` CLI, in two halves that feed each other:
 
 Discovery finds every MHL under a path and classifies it once into typed items
-— ClassicManifest for a classic (v1) file, AscmhlPackage for an ASC-MHL package
-(one item per package, however many generation files its ascmhl/ folder holds).
+— ClassicManifest for a classic (v1) file, AscmhlHistory for an ASC MHL History
+(one item per History, however many generation manifests its ascmhl/ folder
+holds; a History nested inside another discovered History's media directory is
+folded into the outer item, spec 5.3.2/5.3.3).
 Each item lazily parses/loads its manifest exactly once and caches the result,
 so the dialect sniff happens once per file and the progress weights come from
 the same parse verification consumes. Dialect rule: the manifest header is
@@ -121,10 +123,10 @@ class ClassicManifest:
 
 
 @dataclass(eq=False)
-class AscmhlPackage:
-    """An ASC-MHL package (the ascmhl/ folder with its generation manifests); loads its history once, lazily."""
+class AscmhlHistory:
+    """An ASC MHL History (the ascmhl/ folder with its chain and generation manifests); loads itself once, lazily."""
 
-    root: Path  # the folder the manifests describe (parent of ascmhl/)
+    root: Path  # the media directory the manifests describe (parent of ascmhl/)
     manifests: list[Path]  # generation files, sorted (latest last)
     _history: "History | None" = field(default=None, repr=False)
     _load_failed: bool = field(default=False, repr=False)
@@ -159,7 +161,7 @@ class AscmhlPackage:
         return ascmhl_history.history_byte_total(history) if history is not None else 0
 
 
-DiscoveredItem = ClassicManifest | AscmhlPackage
+DiscoveredItem = ClassicManifest | AscmhlHistory
 
 
 def _find_mhl_files(root: Path) -> "Iterator[Path]":
@@ -182,43 +184,54 @@ def classify(mhl_file: Path) -> DiscoveredItem:
     """
     Classify a single manifest path into its typed item.
 
-    A v2 manifest stands for its whole package: the item collects every
+    A v2 manifest stands for its whole History: the item collects every
     sibling generation file — by the loader's own rule (the NNNN_* naming
     convention and a v2 header), so a stray classic manifest sitting inside
     the ascmhl/ folder is never mistaken for a generation.
     """
     if _routes_to_ascmhl(mhl_file):
-        package_dir = mhl_file.parent.parent
+        media_dir = mhl_file.parent.parent
         siblings = sorted(
             p
             for p in mhl_file.parent.glob("*.mhl")
             if not p.name.startswith("._") and ascmhl_history.GENERATION_RE.match(p.stem) and is_ascmhl_v2(p)
         )
-        return AscmhlPackage(root=package_dir, manifests=siblings or [mhl_file])
+        return AscmhlHistory(root=media_dir, manifests=siblings or [mhl_file])
     return ClassicManifest(path=mhl_file)
 
 
 def discover(src: Path) -> list[DiscoveredItem]:
     """
     Find and classify every manifest under `src` (or `src` itself when it is a
-    file), sorted by path with ASC-MHL packages deduplicated: a package's
-    generations verify as one unit, so its ascmhl/ folder contributes a single
-    item however many .mhl files it holds.
+    file), sorted by path with ASC MHL Histories deduplicated twice over: a
+    History's generations verify as one unit, so its ascmhl/ folder contributes
+    a single item however many .mhl files it holds — and a History nested
+    inside another discovered History's media directory contributes none. Hash
+    records live in the History closest to the file and the whole record set is
+    assembled across nested Histories (spec 5.3.2/5.3.3), so the outer item
+    already covers the nested one; visiting it separately would verify its
+    files twice (and append a second, unreferenced generation when recording).
     """
     if src.is_file():
         return [classify(src)]
     if not src.is_dir():
         return []
 
-    items: dict[Path, DiscoveredItem] = {}  # key: classic file path / package root
+    items: dict[Path, DiscoveredItem] = {}  # key: classic file path / media directory
     for f in sorted(_find_mhl_files(src)):
         if _routes_to_ascmhl(f):
-            package_dir = f.parent.parent
-            if package_dir not in items:
-                items[package_dir] = classify(f)
+            media_dir = f.parent.parent
+            if media_dir not in items:
+                items[media_dir] = classify(f)
         else:
             items[f] = ClassicManifest(path=f)
-    return [items[key] for key in sorted(items)]
+
+    scopes = [key for key, item in items.items() if isinstance(item, AscmhlHistory)]
+    return [
+        items[key]
+        for key in sorted(items)
+        if not (isinstance(items[key], AscmhlHistory) and any(scope in key.parents for scope in scopes))
+    ]
 
 
 # -----------------------------------------------------------------------------
@@ -331,7 +344,7 @@ def _manifest_result(item: DiscoveredItem, report: VerifyReport, table: "dict[in
         mstatus = "error"  # manifest-level failure: malformed / integrity gate
     template, _severity = table.get(report.code, ("Unexpected exit {code}", "warning"))
     merror = "" if mstatus != "error" else template.format(target=item.label, code=report.code)
-    manifest_path = item.latest if isinstance(item, AscmhlPackage) else item.path
+    manifest_path = item.latest if isinstance(item, AscmhlHistory) else item.path
     return ManifestResult(
         manifest_path=manifest_path,
         manifest_status=mstatus,
@@ -360,7 +373,7 @@ def verify_item(
     Returns (exit_code, ManifestResult | None). ManifestResult is None in
     schema mode (no per-file detail exists then).
     """
-    if isinstance(item, AscmhlPackage):
+    if isinstance(item, AscmhlHistory):
         return _verify_ascmhl_item(item, verbose, schema, size_only, emit, on_bytes)
     return _verify_classic_item(item, verbose, schema, size_only, emit, on_bytes)
 
@@ -386,16 +399,16 @@ def _verify_classic_item(
 
 
 def _verify_ascmhl_item(
-    item: AscmhlPackage,
+    item: AscmhlHistory,
     verbose: bool,
     schema: bool,
     size_only: bool,
     emit: "Callable[[StatusLine], None] | None",
     on_bytes: "Callable[[int], None] | None",
 ) -> "tuple[int, ManifestResult | None]":
-    """ASC-MHL package: schema mode (latest manifest + chain) or verify via the shared engine."""
+    """ASC MHL History: schema mode (latest manifest + chain) or verify via the shared engine."""
     if schema:
-        # Both halves of the package are always checked; the worst exit code
+        # Both halves of the History are always checked; the worst exit code
         # (preferring the manifest's) is returned so the caller has one signal.
         mhl_code, mhl_lines = xsd_check.ascmhl_schema_report(item.latest)
         _emit(emit, _ASCMHL_SCHEMA_RESULTS, mhl_code, str(item.latest), "\n".join(mhl_lines))

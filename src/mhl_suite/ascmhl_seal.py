@@ -342,9 +342,9 @@ class _DirItem:
 
 @dataclass
 class _Level:
-    """One history level of the operation (the package root or a nested history)."""
+    """One history level of the operation (the media directory root or a nested history)."""
 
-    prefix: str  # package-root-relative posix prefix ('' at the root)
+    prefix: str  # media-directory-relative posix prefix ('' at the root)
     history: History
     merged_ignores: "list[str]"
     tree: _DirItem
@@ -358,8 +358,8 @@ class _Level:
     manifest_c4: "str | None" = None
 
 
-def _pkg_path(prefix: str, rel: str) -> str:
-    """Join a level prefix and a level-relative path into a package-root-relative one."""
+def _scope_path(prefix: str, rel: str) -> str:
+    """Join a level prefix and a level-relative path into a media-directory-relative one."""
     if not rel:
         return prefix
     return f"{prefix}/{rel}" if prefix else rel
@@ -378,7 +378,7 @@ def _resolve_algorithms(algorithms: "Sequence[str]") -> "tuple[str, ...]":
     return resolved
 
 
-def _load_package(root: Path) -> History:
+def _load_root_history(root: Path) -> History:
     """
     The history tree the operation appends to: the root's own history when one
     exists, else an uninitiated root level over any nested histories below
@@ -433,7 +433,7 @@ def _scan_level(prefix: str, history: History, options: SealOptions) -> _Level:
             unreadable.append((rel or ".", exc.strerror or str(exc)))
             return node
         for entry in entries:
-            entry_rel = _pkg_path(rel, unicodedata.normalize("NFC", entry.name))
+            entry_rel = _scope_path(rel, unicodedata.normalize("NFC", entry.name))
             try:
                 is_dir = entry.is_dir(follow_symlinks=False)
                 if is_dir:
@@ -455,7 +455,7 @@ def _scan_level(prefix: str, history: History, options: SealOptions) -> _Level:
         item.formats = list(dict.fromkeys([*options.algorithms, *extra]))
 
     children = [
-        _scan_level(_pkg_path(prefix, child.root.relative_to(history.root).as_posix()), child, options)
+        _scan_level(_scope_path(prefix, child.root.relative_to(history.root).as_posix()), child, options)
         for child in history.children
     ]
     return _Level(
@@ -532,7 +532,7 @@ def _label_files(level: _Level, entries: "list[VerifyEntry]") -> "list[FileEntry
     """
     out: list[FileEntryOut] = []
     for item in level.files:
-        pkg = _pkg_path(level.prefix, item.rel)
+        scope_path = _scope_path(level.prefix, item.rel)
         recorded = item.recorded
         original = recorded.original if recorded is not None else None
         if recorded is not None and original is None:
@@ -540,7 +540,7 @@ def _label_files(level: _Level, entries: "list[VerifyEntry]") -> "list[FileEntry
             # an unsuccessful verification, and no new record is written.
             entries.append(
                 VerifyEntry(
-                    path=pkg,
+                    path=scope_path,
                     status=Status.ERROR,
                     error=ErrorKind.UNUSABLE_HASH,
                     detail="no hash entry labeled original or verified",
@@ -549,7 +549,7 @@ def _label_files(level: _Level, entries: "list[VerifyEntry]") -> "list[FileEntry
             continue
         if recorded is None or original is None:
             action = "original"
-            entries.append(VerifyEntry(path=pkg, status=Status.NEW, actual_size=item.stat.st_size))
+            entries.append(VerifyEntry(path=scope_path, status=Status.NEW, actual_size=item.stat.st_size))
         else:
             fmt, expected = original
             check = asc_check(fmt, expected)
@@ -557,7 +557,7 @@ def _label_files(level: _Level, entries: "list[VerifyEntry]") -> "list[FileEntry
             action = "verified" if matched else "failed"
             entries.append(
                 VerifyEntry(
-                    path=pkg,
+                    path=scope_path,
                     status=Status.OK if matched else Status.MISMATCH,
                     hashes=[HashComparison(tag=fmt, expected=expected, computed=item.digests[fmt], ok=matched)],
                     recorded_size=recorded.record.size,
@@ -592,11 +592,11 @@ def _completeness(level: _Level, entries: "list[VerifyEntry]") -> None:
     for r in level.recorded:
         present = r.path in (present_dirs if r.record.is_directory else present_files)
         if not present:
-            entries.append(VerifyEntry(path=_pkg_path(level.prefix, r.path), status=Status.MISSING))
+            entries.append(VerifyEntry(path=_scope_path(level.prefix, r.path), status=Status.MISSING))
     for rel_dir, error_text in level.unreadable:
         entries.append(
             VerifyEntry(
-                path=_pkg_path(level.prefix, rel_dir),
+                path=_scope_path(level.prefix, rel_dir),
                 status=Status.ERROR,
                 error=ErrorKind.IO,
                 detail=f"cannot scan directory: {error_text}",
@@ -676,7 +676,7 @@ def _directory_hashes(
                     if failed:
                         failed_any = True
                         notices.append(
-                            f"[ERROR] directory hash mismatch: {_pkg_path(level.prefix, node.rel)} ({fmt} {label})"
+                            f"[ERROR] directory hash mismatch: {_scope_path(level.prefix, node.rel)} ({fmt} {label})"
                         )
             created, modified = (None, None) if node.stat is None else _file_dates(node.stat)
             records.append(
@@ -784,8 +784,8 @@ def seal_ascmhl(
         raise AscmhlSealError(msg)
 
     op_start = datetime.now(UTC)
-    package = _load_package(root)
-    top = _scan_level("", package, options)
+    history = _load_root_history(root)
+    top = _scan_level("", history, options)
     levels = _flatten_levels(top)
     _hash_all(levels, options, on_progress)
 

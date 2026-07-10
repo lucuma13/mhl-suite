@@ -17,7 +17,7 @@ from pathlib import Path
 from hypothesis import HealthCheck, assume, given, settings, strategies
 
 from mhl_suite import discovery
-from mhl_suite.discovery import AscmhlPackage, ClassicManifest
+from mhl_suite.discovery import AscmhlHistory, ClassicManifest
 from mhl_suite.verify import VerifyReport
 
 from .helpers import make_mhl_with_size, make_package, make_tree
@@ -57,7 +57,7 @@ def _fs_name_key(name: str) -> str:
 
 def _selected_paths(root: Path) -> list[Path]:
     """Each discovered item's representative manifest file (a package is represented by its latest generation)."""
-    return [item.latest if isinstance(item, AscmhlPackage) else item.path for item in discovery.discover(root)]
+    return [item.latest if isinstance(item, AscmhlHistory) else item.path for item in discovery.discover(root)]
 
 
 class TestFindMhlFiles:
@@ -95,7 +95,7 @@ class TestDiscover:
             },
         )
         (item,) = discovery.discover(tmp_path)
-        assert isinstance(item, AscmhlPackage)
+        assert isinstance(item, AscmhlHistory)
         assert item.latest.name == "0003.mhl"
         assert [p.name for p in item.manifests] == ["0001.mhl", "0002.mhl", "0003.mhl"]
 
@@ -134,10 +134,14 @@ class TestDiscover:
         assert len(selected) == 1
         assert selected[0].name == "0003.mhl"
 
-    def test_top_level_and_nested_ascmhl_dedup_independently(self, tmp_path):
+    def test_nested_history_folds_into_enclosing_item(self, tmp_path):
         """
-        A top-level ascmhl/ and a nested package's ascmhl/ each contribute one
-        item — they must not share a dedup key despite both being 'ascmhl'.
+        A History nested inside another discovered History's media directory
+        contributes no item of its own: hash records live in the History
+        closest to the file and the loader assembles the full record set
+        across nested Histories (spec 5.3.2/5.3.3), so the outer item already
+        covers it — a second item would verify its files twice (and append a
+        second, unreferenced generation when recording).
         """
         make_tree(
             tmp_path,
@@ -147,7 +151,24 @@ class TestDiscover:
                 "pkg/ascmhl/0002.mhl": _V2_MHL,
             },
         )
-        assert {p.name for p in _selected_paths(tmp_path)} == {"0001.mhl", "0002.mhl"}
+        (item,) = discovery.discover(tmp_path)
+        assert isinstance(item, AscmhlHistory)
+        assert item.root == tmp_path
+
+    def test_sibling_histories_stay_separate_items(self, tmp_path):
+        """Histories that don't enclose one another each keep their own item."""
+        make_tree(
+            tmp_path,
+            {
+                "a/ascmhl/0001.mhl": _V2_MHL,
+                "b/ascmhl/0001.mhl": _V2_MHL,
+                "b/ascmhl/0002.mhl": _V2_MHL,
+            },
+        )
+        items = discovery.discover(tmp_path)
+        roots = [item.root for item in items if isinstance(item, AscmhlHistory)]
+        assert len(items) == 2
+        assert roots == [tmp_path / "a", tmp_path / "b"]
 
     def test_classic_v1_inside_ascmhl_folder_is_not_grouped_as_package(self, tmp_path):
         """
@@ -171,7 +192,7 @@ class TestDiscover:
     def test_single_file_src_classifies_directly(self, tmp_path):
         make_tree(tmp_path, {"pkg/ascmhl/0001.mhl": _V2_MHL, "loose.mhl": b""})
         (pkg_item,) = discovery.discover(tmp_path / "pkg" / "ascmhl" / "0001.mhl")
-        assert isinstance(pkg_item, AscmhlPackage)
+        assert isinstance(pkg_item, AscmhlHistory)
         assert pkg_item.root == tmp_path / "pkg"
         (classic_item,) = discovery.discover(tmp_path / "loose.mhl")
         assert isinstance(classic_item, ClassicManifest)
@@ -306,7 +327,7 @@ class TestDiscoverInvariants:
             for i in range(n_loose):
                 (root / f"loose{i}.mhl").write_text("")
 
-            keys = [i.root if isinstance(i, AscmhlPackage) else i.path for i in discovery.discover(root)]
+            keys = [i.root if isinstance(i, AscmhlHistory) else i.path for i in discovery.discover(root)]
             assert keys == sorted(keys)
 
 

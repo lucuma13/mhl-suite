@@ -95,8 +95,8 @@ def stub_verify_ascmhl(monkeypatch, code, entries=None):
 
 
 def _pkg_item(manifest):
-    """An AscmhlPackage item wrapping one (possibly dummy) generation manifest."""
-    return discovery.AscmhlPackage(root=manifest.parent.parent, manifests=[manifest])
+    """An AscmhlHistory item wrapping one (possibly dummy) generation manifest."""
+    return discovery.AscmhlHistory(root=manifest.parent.parent, manifests=[manifest])
 
 
 def call_verify(manifest):

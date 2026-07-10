@@ -76,7 +76,7 @@ def _iso(moment: datetime) -> str:
 def diff_ascmhl(root_path: "str | Path") -> VerifyReport:
     """
     Report unknown files (on disk, neither recorded nor ignored) and missing
-    files (recorded, absent from disk) for the package rooted at `root_path`.
+    files (recorded, absent from disk) for the media directory rooted at `root_path`.
     No hashes are computed (spec 5.6.3). Report codes: new-files 21 beats
     missing 10; history-integrity failures surface as their pinned 3x codes,
     exactly like verify_ascmhl.
@@ -380,19 +380,19 @@ def flatten_ascmhl(root_path: "str | Path", destination: "str | Path") -> "tuple
     files: list[FileEntryOut] = []
     for prefix, sub in history.walk():
         for final_name in _final_names(sub):
-            pkg_path = f"{prefix}/{final_name}" if prefix else final_name
-            if ignore.match_file(pkg_path):
+            scope_path = f"{prefix}/{final_name}" if prefix else final_name
+            if ignore.match_file(scope_path):
                 continue
             flattened = _flatten_file(sub, final_name)
             if flattened is None:
                 continue
             earliest, latest, previous_path = flattened
-            pkg_previous = None
+            scope_previous = None
             if previous_path is not None:
-                pkg_previous = f"{prefix}/{previous_path}" if prefix else previous_path
+                scope_previous = f"{prefix}/{previous_path}" if prefix else previous_path
             files.append(
                 FileEntryOut(
-                    path=pkg_path,
+                    path=scope_path,
                     entries=[
                         HashEntryOut(entry.fmt, entry.digest, entry.action, entry.hashdate)
                         for entry in earliest.values()
@@ -400,7 +400,7 @@ def flatten_ascmhl(root_path: "str | Path", destination: "str | Path") -> "tuple
                     size=latest.size,
                     creation_date=latest.creation_date,
                     last_modification_date=latest.last_modification_date,
-                    previous_path=pkg_previous,
+                    previous_path=scope_previous,
                 )
             )
 

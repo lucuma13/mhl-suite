@@ -1,11 +1,11 @@
 """
 ASC-MHL history reading: the native loader, the history model, and read-only
-verification. Everything here only ever *reads* a package — the manifest
+verification. Everything here only ever *reads* a History — the manifest
 writers and the generation-appending engine live in mhl_suite.ascmhl_seal,
 the remaining operations in mhl_suite.ascmhl_ops.
 
-The suite owns the parsing end-to-end: load_history() reads an ASC-MHL
-package's `ascmhl/` folder — validating the chain file (each generation
+The suite owns the parsing end-to-end: load_history() reads a media
+directory's `ascmhl/` folder — validating the chain file (each generation
 manifest's recorded hash is recomputed — the history integrity gate of spec
 5.4), parsing every generation manifest, and descending into nested child
 histories — and verify_ascmhl() reduces the loaded history to the shared
@@ -28,7 +28,7 @@ here, notably:
 Where the spec is silent, behaviour stays interoperable with the reference
 `ascmhl` tool: generation-file discovery, traversal/report order, and the
 10/11/20/21/30-33 exit codes. The test suite pins both — spec conformance on
-hand-written histories, interop on packages sealed by the reference library
+hand-written histories, interop on histories sealed by the reference library
 (a dev dependency only). Never prints, never exits.
 """
 
@@ -57,7 +57,7 @@ CHAIN_FILENAME = "ascmhl_chain.xml"
 
 # Generation manifest naming convention: 0001_name_date.mhl (the leading
 # sequence number is what matters; ._ AppleDouble copies are skipped). Public:
-# discovery applies the same rule when collecting a package's generations.
+# discovery applies the same rule when collecting a History's generations.
 GENERATION_RE = re.compile(r"^(\d{4,})(?:_(.+))?$")
 
 # The ASC-MHL default ignore set is mandated by the specification to always
@@ -162,7 +162,7 @@ class Generation:
 
 @dataclass
 class History:
-    """A loaded ASC-MHL history: the package's generations plus nested child histories."""
+    """A loaded ASC MHL History: its generations plus nested child histories."""
 
     root: Path
     generations: list[Generation]
@@ -417,11 +417,11 @@ def resolve_hashes(
 
 class IgnoreMatcher:
     """
-    Package-wide ignore matching for a verify run. The root history's latest
+    History-wide ignore matching for a verify run. The root history's latest
     recorded patterns apply to the whole tree, and each nested history's
     recorded patterns apply within its own subtree, matched against paths
     relative to that history's root — spec 5.6.1.2: a manifest's patterns
-    govern operations on the data set *it* manages. Paths are package-root-
+    govern operations on the data set *it* manages. Paths are media-directory-
     relative posix; directories carry a trailing slash, as gitignore matching
     expects.
     """
@@ -466,9 +466,9 @@ def build_ignore_spec(history: History) -> IgnoreMatcher:
 
 @dataclass
 class Recorded:
-    """One recorded path reduced for verification, relative to the package root."""
+    """One recorded path reduced for verification, relative to the media directory."""
 
-    path: str  # posix, package-root-relative, post-rename
+    path: str  # posix, media-directory-relative, post-rename
     record: MediaRecord
     original: "tuple[str, str] | None"  # (format, digest) checked by a default verify
     usable: "list[tuple[str, str]]"  # every distinct usable format (original-preferred)
@@ -477,7 +477,7 @@ class Recorded:
 def collect_recorded(history: History, ignore: IgnoreMatcher) -> list[Recorded]:
     """
     Every recorded path across the history and its nested children, resolved
-    to package-root-relative posix form with renames applied and ignored paths
+    to media-directory-relative posix form with renames applied and ignored paths
     dropped, in sorted-path order. Each history resolves its own paths (a
     nested history owns its subtree), deduplicated on the final name.
     """
@@ -515,7 +515,7 @@ def collect_recorded(history: History, ignore: IgnoreMatcher) -> list[Recorded]:
 def history_byte_total(history: History) -> int:
     """
     The recorded byte volume a full verify of `history` will hash-read (its
-    verifiable files' original-generation sizes) — the package's progress-bar
+    verifiable files' original-generation sizes) — the History's progress-bar
     weight. Reads no media bytes itself.
     """
     ignore = build_ignore_spec(history)
@@ -537,7 +537,7 @@ def walk_disk_files(
     on_unreadable: "Callable[[str, OSError], None] | None" = None,
 ) -> "Iterator[str]":
     """
-    Yield package-root-relative posix paths of every non-ignored file under
+    Yield media-directory-relative posix paths of every non-ignored file under
     `root`, post-order lexicographic (a stable report order, shared with the
     reference tool). Ignore patterns see directories
     with a trailing slash, as gitignore matching expects; symlinked
@@ -660,8 +660,8 @@ def verify_ascmhl(
     history: "History | None" = None,
 ) -> VerifyReport:
     """
-    Verify the ASC-MHL package rooted at `root_path` (the directory the
-    manifests describe, parent of the `ascmhl/` folder) and return a
+    Verify the managed data set rooted at `root_path` (the media directory,
+    parent of the `ascmhl/` folder) and return a
     structured VerifyReport. Never prints and never exits.
 
     Loading the history is the integrity gate: a broken chain or modified
@@ -682,7 +682,7 @@ def verify_ascmhl(
     nothing-verifiable-found 20, which beats missing-files 10; size-only
     failures report 13.
 
-    `history` lets a caller that already loaded the package (mhl_suite.
+    `history` lets a caller that already loaded the History (mhl_suite.
     discovery, for progress weights) hand it over instead of paying the load —
     and the chain gate — twice.
     """
