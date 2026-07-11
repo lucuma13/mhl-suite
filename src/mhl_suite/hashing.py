@@ -200,6 +200,15 @@ _AUTO_MIN_BYTES = 2 * 1024 * 1024 * 1024
 _AUTO_PROBE_MIN_BYTES = 128 * 1024 * 1024
 _AUTO_PROBE_SECONDS = 1.0
 _AUTO_PROBE_MAX_SECONDS = 2.0
+# The wall floor's only job is outlasting ramp, so the multi-stream probe may
+# return at the byte floor once the aggregate is demonstrably NOT ramping: it
+# samples consecutive sub-windows of this length, and two adjacent windows
+# agreeing within the tolerance end the probe early (a quiet SSD is
+# characterised in ~0.3-0.5 s instead of padding to the 1 s floor). Any ramp
+# signature or noise fails the agreement and falls through to the floors/cap
+# unchanged, so NAS ramp behaviour is untouched.
+_AUTO_PROBE_WINDOW_SECONDS = 0.15
+_AUTO_PROBE_STABLE_TOLERANCE = 0.10
 # Concurrent streams the aggregate-bandwidth probe issues (and the worker floor
 # when parallelising).
 _AUTO_PROBE_STREAMS = 4
@@ -395,18 +404,22 @@ def _probe_read_bw_multi(slots: "list[tuple[str, int]]", stream_count: int) -> f
     _AUTO_PROBE_MIN_BYTES, _AUTO_PROBE_SECONDS) and all of them stop at a shared
     _AUTO_PROBE_MAX_SECONDS deadline — the deadline matters most on exactly the
     volume this probe protects, a seek-bound disk, where the aggregate collapses
-    and a byte budget alone would thrash the head for tens of seconds. Not
-    hashed — the bytes are re-read when the files are hashed for real, a
-    negligible cost against a multi-GB seal.
+    and a byte budget alone would thrash the head for tens of seconds. Past the
+    byte floor, a demonstrably stable aggregate (see the stability watch below)
+    ends the probe before the wall floor, so a fast non-ramping volume pays
+    almost no decision overhead. Not hashed — the bytes are re-read when the
+    files are hashed for real, a negligible cost against a multi-GB seal.
     """
     n = min(stream_count, len(slots))
     if n <= 1:
         return _probe_read_bw([path for path, _offset in slots])
     per_stream = max(HASH_CHUNK_SIZE, _AUTO_PROBE_MIN_BYTES // n)
+    progress = _Progress()
+    stop = threading.Event()
     start = time.perf_counter()
     deadline = start + _AUTO_PROBE_MAX_SECONDS
 
-    def _one(slot: "tuple[str, int]") -> int:
+    def _one(slot: "tuple[str, int]") -> None:
         path, offset = slot
         buf = bytearray(HASH_CHUNK_SIZE)
         got = 0
@@ -416,17 +429,46 @@ def _probe_read_bw_multi(slots: "list[tuple[str, int]]", stream_count: int) -> f
                     f.seek(offset)
                 while m := f.readinto(buf):
                     got += m
+                    progress.add(m)
                     now = time.perf_counter()
-                    if now >= deadline or (got >= per_stream and now - start >= _AUTO_PROBE_SECONDS):
+                    if stop.is_set() or now >= deadline or (got >= per_stream and now - start >= _AUTO_PROBE_SECONDS):
                         break
         except OSError:
-            return 0  # unreadable file is the real hash pass's problem; count it as zero contribution
-        return got
+            pass  # unreadable file is the real hash pass's problem; whatever it did read still counts
 
     with ThreadPoolExecutor(max_workers=n) as ex:
-        total = sum(ex.map(_one, slots[:n]))
+        futs = [ex.submit(_one, slot) for slot in slots[:n]]
+        # Stability watch: the wall floor exists only to outlast a NAS's
+        # multi-second TCP/SMB ramp on fresh streams. Once the byte floor is
+        # met, sample the aggregate in consecutive sub-windows; two adjacent
+        # windows agreeing within tolerance mean the streams are not ramping
+        # and the sample is already representative → signal the streams to
+        # stop. A ramping (later window faster) or noisy aggregate never
+        # agrees and reads on to the floors/deadline exactly as before.
+        prev_rate = 0.0
+        win_t = 0.0
+        win_bytes = 0
+        while not all(fut.done() for fut in futs):
+            time.sleep(0.01)
+            now = time.perf_counter()
+            nbytes = progress.bytes
+            if now >= deadline or nbytes < _AUTO_PROBE_MIN_BYTES:
+                continue  # streams enforce the deadline themselves
+            if not win_t:
+                win_t, win_bytes = now, nbytes
+                continue
+            if now - win_t < _AUTO_PROBE_WINDOW_SECONDS:
+                continue
+            rate = (nbytes - win_bytes) / (now - win_t)
+            if prev_rate and abs(rate - prev_rate) <= _AUTO_PROBE_STABLE_TOLERANCE * max(rate, prev_rate):
+                stop.set()
+                break
+            prev_rate = rate
+            win_t, win_bytes = now, nbytes
+    # Leaving the with-block joins the streams; each exits within one chunk of
+    # the stop signal, and those bytes are counted, so the rate stays honest.
     elapsed = time.perf_counter() - start
-    return total / elapsed if elapsed > 0 else float("inf")
+    return progress.bytes / elapsed if elapsed > 0 else float("inf")
 
 
 def _warmup(jobs: "list[HashJob[_T]]", warm_ex: ThreadPoolExecutor, progress: _Progress) -> "tuple[list, int, float]":
