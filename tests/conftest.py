@@ -96,5 +96,5 @@ def mhlver_cli():
 
 @pytest.fixture
 def package(tmp_path):
-    """A sealed, clean ASC-MHL package with a couple of files."""
+    """A generated, clean ASC-MHL package with a couple of files."""
     return make_package(tmp_path / "pkg", {"top.txt": b"hello\n", "A/a1.txt": b"aaa\n", "A/a2.txt": b"bbb\n"})

@@ -1,7 +1,7 @@
 """
 ASC-MHL history reading: the native loader, the history model, and read-only
 verification. Everything here only ever *reads* a History — the manifest
-writers and the generation-appending engine live in mhl_suite.ascmhl_seal,
+writers and the generation-appending engine live in mhl_suite.ascmhl_generate,
 the remaining operations in mhl_suite.ascmhl_ops.
 
 The suite owns the parsing end-to-end: load_history() reads a media
@@ -28,7 +28,7 @@ here, notably:
 Where the spec is silent, behaviour stays interoperable with the reference
 `ascmhl` tool: generation-file discovery, traversal/report order, and the
 10/11/20/21/30-33 exit codes. The test suite pins both — spec conformance on
-hand-written histories, interop on histories sealed by the reference library
+hand-written histories, interop on histories written by the reference library
 (a dev dependency only). Never prints, never exits.
 """
 

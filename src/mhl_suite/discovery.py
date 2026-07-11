@@ -32,8 +32,8 @@ from lxml import etree
 
 from mhl_suite import ascmhl_history, classic_verify, xsd_check
 from mhl_suite._exit_codes import ExitCode
+from mhl_suite.ascmhl_generate import AscmhlGenerateError, generate_ascmhl
 from mhl_suite.ascmhl_history import HistoryError, verify_ascmhl
-from mhl_suite.ascmhl_seal import AscmhlSealError, seal_ascmhl
 from mhl_suite.classic_verify import verify_classic
 from mhl_suite.report import ManifestResult
 from mhl_suite.verify import VerifyReport, render_verify_lines
@@ -445,7 +445,7 @@ def _verify_and_append(
 ) -> "tuple[VerifyReport, list[str]]":
     """
     The conformant default: verify the managed data set and append a new
-    generation recording the results (spec 5.6.4/5.6.5), via the seal engine —
+    generation recording the results (spec 5.6.4/5.6.5), via the generation engine —
     which also propagates generations through nested histories (spec 5.3.2).
     The report carries verify semantics (its code treats unknown files as drift).
 
@@ -455,10 +455,10 @@ def _verify_and_append(
     that makes the no-write behaviour explicit.
     """
     try:
-        result = seal_ascmhl(item.root, on_progress=on_bytes)
+        result = generate_ascmhl(item.root, on_progress=on_bytes)
     except HistoryError as err:
         return VerifyReport(code=err.code, notices=[str(err)]), []
-    except AscmhlSealError as err:
+    except AscmhlGenerateError as err:
         return VerifyReport(code=ExitCode.ERROR, notices=[str(err)]), []
 
     report = result.report

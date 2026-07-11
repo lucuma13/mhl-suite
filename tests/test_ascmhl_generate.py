@@ -1,10 +1,10 @@
 """
-ASC-MHL sealing: the XML writers and the seal/verify-append engine.
+ASC-MHL generating: the XML writers and the generate/verify-append engine.
 
 Spec conformance is asserted structurally (XSD validation of every emitted
 file, element order, action labels per 5.6.4, generation naming per 6.3,
 nested propagation per 5.3.2) and interop by letting the reference `ascmhl`
-library read and extend packages we sealed.
+library read and extend packages we generated.
 """
 
 import re
@@ -17,15 +17,15 @@ from click.testing import CliRunner
 from lxml import etree
 
 from mhl_suite import ascmhl_history
-from mhl_suite.ascmhl_seal import (
-    AscmhlSealError,
+from mhl_suite.ascmhl_generate import (
+    AscmhlGenerateError,
     DirEntryOut,
     FileEntryOut,
+    GenerateOptions,
     HashEntryOut,
     ManifestOut,
-    SealOptions,
+    generate_ascmhl,
     manifest_filename,
-    seal_ascmhl,
     write_directory_file,
     write_manifest,
 )
@@ -35,8 +35,8 @@ from mhl_suite.xsd_check import ascmhl_schema_report
 from .helpers import make_tree
 
 
-def seal(root, *, algorithms=("xxh64",), **kwargs):
-    result = seal_ascmhl(root, SealOptions(algorithms=algorithms, **kwargs))
+def generate(root, *, algorithms=("xxh64",), **kwargs):
+    result = generate_ascmhl(root, GenerateOptions(algorithms=algorithms, **kwargs))
     check_package_files(Path(root))
     return result
 
@@ -56,7 +56,7 @@ def manifest_of(result, root: Path) -> Path:
     return next(p for p in result.manifests_written if p.parent.parent == root)
 
 
-def seal_statuses(result):
+def generate_statuses(result):
     return {e.path: e.status for e in result.report.entries}
 
 
@@ -128,11 +128,11 @@ class TestSealInitiate:
     def test_fresh_seal_creates_a_valid_history(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"Clips/a.mov": b"aa", "Sidecar.txt": b"s"})
-        result = seal(root)
+        result = generate(root)
 
-        assert result.seal_code == 0
+        assert result.generate_code == 0
         assert result.report.code == 21  # verify semantics: everything is new
-        assert set(seal_statuses(result).values()) == {Status.NEW}
+        assert set(generate_statuses(result).values()) == {Status.NEW}
         manifest = manifest_of(result, root)
         assert re.fullmatch(r"0001_card_\d{4}-\d{2}-\d{2}_\d{6}Z\.mhl", manifest.name)
         assert (root / "ascmhl" / "ascmhl_chain.xml").exists()
@@ -141,7 +141,7 @@ class TestSealInitiate:
     def test_first_generation_records_original_actions(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"x"})
-        result = seal(root)
+        result = generate(root)
         text = manifest_of(result, root).read_text()
         assert 'action="original"' in text
         assert "<process>in-place</process>" in text
@@ -151,7 +151,7 @@ class TestSealInitiate:
         # author; no location/comment.
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"x"})
-        result = seal(root)
+        result = generate(root)
         info = find(etree.parse(str(manifest_of(result, root))), "{*}creatorinfo")
         tags = [child.tag.rpartition("}")[2] for child in info]
         assert tags == ["creationdate", "hostname", "tool", "author"]
@@ -162,7 +162,7 @@ class TestSealInitiate:
     def test_zero_byte_files_and_empty_directories_are_recorded(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"empty.bin": b"", "emptydir": None})
-        result = seal(root)
+        result = generate(root)
         text = manifest_of(result, root).read_text()
         assert '<path size="0"' in text
         assert "<directoryhash>" in text  # the empty directory still gets hashes
@@ -171,22 +171,22 @@ class TestSealInitiate:
     def test_empty_scope_seals_to_a_manifest_without_hashes(self, tmp_path):
         root = tmp_path / "empty"
         root.mkdir()
-        result = seal(root)
-        assert result.seal_code == 0
+        result = generate(root)
+        assert result.generate_code == 0
         text = manifest_of(result, root).read_text()
         assert "<hashes>" not in text
         assert "<roothash>" in text  # the (empty) root still has a pair
 
     def test_rejects_unknown_algorithm_and_missing_directory(self, tmp_path):
-        with pytest.raises(AscmhlSealError, match="unsupported algorithm"):
-            seal_ascmhl(tmp_path, SealOptions(algorithms=("xxh32",)))
-        with pytest.raises(AscmhlSealError, match="is not a directory"):
-            seal_ascmhl(tmp_path / "absent", SealOptions())
+        with pytest.raises(AscmhlGenerateError, match="unsupported algorithm"):
+            generate_ascmhl(tmp_path, GenerateOptions(algorithms=("xxh32",)))
+        with pytest.raises(AscmhlGenerateError, match="is not a directory"):
+            generate_ascmhl(tmp_path / "absent", GenerateOptions())
 
     def test_directory_hashes_can_be_disabled(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"Clips/a.mov": b"aa"})
-        result = seal(root, directory_hashes=False)
+        result = generate(root, directory_hashes=False)
         text = manifest_of(result, root).read_text()
         assert "<roothash>" not in text
         assert "<directoryhash>" not in text
@@ -196,12 +196,12 @@ class TestSealAppend:
     def test_second_seal_verifies_and_appends_a_generation(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"Clips/a.mov": b"aa", "Sidecar.txt": b"s"})
-        seal(root)
-        result = seal(root)
+        generate(root)
+        result = generate(root)
 
-        assert result.seal_code == 0
+        assert result.generate_code == 0
         assert result.report.code == 0
-        assert set(seal_statuses(result).values()) == {Status.OK}
+        assert set(generate_statuses(result).values()) == {Status.OK}
         manifest = manifest_of(result, root)
         assert manifest.name.startswith("0002_")
         assert 'action="verified"' in manifest.read_text()
@@ -211,25 +211,25 @@ class TestSealAppend:
     def test_tampered_file_records_failed_and_exits_11(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"good"})
-        seal(root)
+        generate(root)
         (root / "a.txt").write_bytes(b"evil")
-        result = seal(root)
+        result = generate(root)
 
-        assert result.seal_code == 11
+        assert result.generate_code == 11
         assert result.report.code == 11
-        assert seal_statuses(result)["a.txt"] == Status.MISMATCH
+        assert generate_statuses(result)["a.txt"] == Status.MISMATCH
         assert 'action="failed"' in manifest_of(result, root).read_text()
 
     def test_added_file_gets_original_next_to_verified_records(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"x"})
-        seal(root)
+        generate(root)
         (root / "b.txt").write_bytes(b"y")
-        result = seal(root)
+        result = generate(root)
 
-        assert result.seal_code == 0  # recording additions is what seal is for
+        assert result.generate_code == 0  # recording additions is what generate is for
         assert result.report.code == 21  # verify semantics: drift
-        assert seal_statuses(result) == {"a.txt": Status.OK, "b.txt": Status.NEW}
+        assert generate_statuses(result) == {"a.txt": Status.OK, "b.txt": Status.NEW}
         text = manifest_of(result, root).read_text()
         assert 'action="original"' in text
         assert 'action="verified"' in text
@@ -237,22 +237,22 @@ class TestSealAppend:
     def test_missing_file_reports_10_and_writes_no_record_for_it(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"x", "b.txt": b"y"})
-        seal(root)
+        generate(root)
         (root / "b.txt").unlink()
-        result = seal(root)
+        result = generate(root)
 
-        assert result.seal_code == 10
-        assert seal_statuses(result)["b.txt"] == Status.MISSING
+        assert result.generate_code == 10
+        assert generate_statuses(result)["b.txt"] == Status.MISSING
         assert "b.txt" not in manifest_of(result, root).read_text()
 
     def test_verification_format_is_computed_alongside_requested_ones(self, tmp_path):
-        # gen 1 in xxh64; a md5 seal must verify via xxh64 (the recorded
+        # gen 1 in xxh64; a md5 generate must verify via xxh64 (the recorded
         # format, spec 5.6.4) and record BOTH digests as verified — the
         # single-read multi-format flow of Implementation Guidelines 2.3.
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"x"})
-        seal(root, algorithms=("xxh64",))
-        result = seal(root, algorithms=("md5",))
+        generate(root, algorithms=("xxh64",))
+        result = generate(root, algorithms=("md5",))
 
         assert result.report.code == 0
         record = find(etree.parse(str(manifest_of(result, root))), "{*}hashes/{*}hash")
@@ -262,22 +262,22 @@ class TestSealAppend:
     def test_ignore_patterns_grow_and_apply_from_the_record(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"x"})
-        seal(root, ignore_patterns=("*.tmp",))
+        generate(root, ignore_patterns=("*.tmp",))
         (root / "junk.tmp").write_bytes(b"j")
-        result = seal(root)  # no CLI patterns this time
+        result = generate(root)  # no CLI patterns this time
 
-        assert "junk.tmp" not in seal_statuses(result)  # recorded pattern still governs
+        assert "junk.tmp" not in generate_statuses(result)  # recorded pattern still governs
         text = manifest_of(result, root).read_text()
         assert "<pattern>*.tmp</pattern>" in text  # the list only grows
 
     def test_renaming_a_file_fails_structure_hash_only(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"Clips/a.mov": b"aa"})
-        seal(root)
+        generate(root)
         (root / "Clips" / "a.mov").rename(root / "Clips" / "b.mov")
-        result = seal(root)
+        result = generate(root)
 
-        assert result.seal_code == 12  # directory-hash mismatch, no file failed
+        assert result.generate_code == 12  # directory-hash mismatch, no file failed
         text = manifest_of(result, root).read_text()
         directoryhash = block(r"<directoryhash>.*?</directoryhash>", text)
         content_block = block(r"<content>.*?</content>", directoryhash)
@@ -288,19 +288,19 @@ class TestSealAppend:
     def test_broken_chain_still_gates_the_operation(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"x"})
-        seal(root)
+        generate(root)
         (root / "ascmhl" / "ascmhl_chain.xml").unlink()
         with pytest.raises(ascmhl_history.NoChainError):
-            seal_ascmhl(root, SealOptions())
+            generate_ascmhl(root, GenerateOptions())
 
     def test_read_only_history_reports_write_failure_not_crash(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"x"})
-        seal(root)
+        generate(root)
         ascmhl_dir = root / "ascmhl"
         ascmhl_dir.chmod(0o555)
         try:
-            result = seal_ascmhl(root, SealOptions(algorithms=("xxh64",)))
+            result = generate_ascmhl(root, GenerateOptions(algorithms=("xxh64",)))
         finally:
             ascmhl_dir.chmod(0o755)
         assert result.report.code == 0  # the verification itself succeeded
@@ -311,17 +311,17 @@ class TestSealAppend:
     def test_unicode_paths_round_trip_nfc(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"Clips/café.mov": b"aa"})  # NFC on write; APFS may store NFD
-        seal(root)
-        result = seal(root)
-        assert seal_statuses(result) == {"Clips/café.mov": Status.OK}
+        generate(root)
+        result = generate(root)
+        assert generate_statuses(result) == {"Clips/café.mov": Status.OK}
 
 
 class TestNestedHistories:
     def test_root_seal_propagates_into_nested_histories(self, tmp_path):
         base = tmp_path / "day"
         make_tree(base, {"A001/Clips/c1.mov": b"c1", "loose.txt": b"l"})
-        seal(base / "A001")
-        result = seal(base)
+        generate(base / "A001")
+        result = generate(base)
 
         # Bottom-up: the child got generation 2, the root generation 1, both
         # stamped with the operation's shared start time (spec 6.3).
@@ -349,8 +349,8 @@ class TestNestedHistories:
         # propagate into nested histories.
         base = tmp_path / "day"
         make_tree(base, {"A001/c1.mov": b"c1", "loose.txt": b"l"})
-        seal(base / "A001")
-        result = seal(base, ignore_patterns=("*.tmp",))
+        generate(base / "A001")
+        result = generate(base, ignore_patterns=("*.tmp",))
         child_manifest = manifest_of(result, base / "A001")
         assert "<pattern>*.tmp</pattern>" in child_manifest.read_text()
 
@@ -359,7 +359,7 @@ class TestReferenceToolInterop:
     def test_reference_tool_extends_and_verifies_our_package(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"Clips/a.mov": b"aa", "Sidecar.txt": b"s"})
-        seal(root, algorithms=("xxh128",))
+        generate(root, algorithms=("xxh128",))
 
         created = CliRunner().invoke(commands.create, [str(root), "-h", "md5"])
         assert created.exit_code == 0, created.output
@@ -368,16 +368,16 @@ class TestReferenceToolInterop:
         assert ascmhl_history.verify_ascmhl(root).code == 0  # and we accept its generation
 
     def test_our_verify_accepts_reference_history_we_extended(self, package):
-        result = seal(package)
+        result = generate(package)
         assert result.report.code == 0
-        assert set(seal_statuses(result).values()) == {Status.OK}
+        assert set(generate_statuses(result).values()) == {Status.OK}
 
     @pytest.mark.parametrize("fmt", ["xxh64", "c4"])
     def test_roothash_digests_match_reference_tool(self, tmp_path, fmt):
         ours, refs = tmp_path / "ours", tmp_path / "refs"
         for d in (ours, refs):
             make_tree(d, {"Clips/x.bin": b"xxdata", "top.txt": b"top"})
-        seal(ours, algorithms=(fmt,))
+        generate(ours, algorithms=(fmt,))
         assert CliRunner().invoke(commands.create, [str(refs), "-h", fmt]).exit_code == 0
 
         def roothash_digests(root):

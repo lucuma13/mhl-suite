@@ -1,5 +1,5 @@
 """
-ASC-MHL operations beyond sealing: diff, rename, flatten.
+ASC-MHL operations beyond generation: diff, rename, flatten.
 
 Diff (spec 5.6.3) compares a history's recorded set against the file system
 without hashing anything: files on disk but never recorded are unknown, files
@@ -12,9 +12,9 @@ an ascmhl_collection.xml entry (spec 5.5), copying the earliest usable hash
 per (file, format) with its action preserved and skipping `failed` entries.
 
 All manifest/collection output goes through the writers in
-mhl_suite.ascmhl_seal; loading and record resolution reuse
+mhl_suite.ascmhl_generate; loading and record resolution reuse
 mhl_suite.ascmhl_history. Never prints, never exits: argument problems raise
-AscmhlSealError, history-integrity problems raise HistoryError (diff maps
+AscmhlGenerateError, history-integrity problems raise HistoryError (diff maps
 them into its report, matching verify_ascmhl).
 """
 
@@ -29,6 +29,17 @@ from lxml import etree
 from mhl_suite import hashing
 from mhl_suite._exit_codes import ExitCode
 from mhl_suite.algorithms import ASC_FORMATS, asc_check
+from mhl_suite.ascmhl_generate import (
+    AscmhlGenerateError,
+    DirEntryOut,
+    FileEntryOut,
+    HashEntryOut,
+    ManifestOut,
+    append_directory_entry,
+    latest_dir_entries,
+    manifest_filename,
+    write_manifest,
+)
 from mhl_suite.ascmhl_history import (
     ASCMHL_FOLDER,
     CHAIN_FILENAME,
@@ -44,17 +55,6 @@ from mhl_suite.ascmhl_history import (
     resolve_hashes,
     walk_disk_files,
 )
-from mhl_suite.ascmhl_seal import (
-    AscmhlSealError,
-    DirEntryOut,
-    FileEntryOut,
-    HashEntryOut,
-    ManifestOut,
-    append_directory_entry,
-    latest_dir_entries,
-    manifest_filename,
-    write_manifest,
-)
 from mhl_suite.osutils import resolve_on_disk
 from mhl_suite.verify import HashComparison, Status, VerifyEntry, VerifyReport
 
@@ -69,7 +69,7 @@ def _iso(moment: datetime) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Diff (spec 5.6.3)
+# Diff
 # -----------------------------------------------------------------------------
 
 
@@ -114,7 +114,7 @@ def diff_ascmhl(root_path: "str | Path") -> VerifyReport:
 
 
 # -----------------------------------------------------------------------------
-# Rename (spec 5.6.6)
+# Rename
 # -----------------------------------------------------------------------------
 
 
@@ -133,21 +133,21 @@ def _rel_posix(path: Path, root: Path) -> str:
 def _validate_rename(old: Path, new: Path) -> Path:
     """Validate a rename request and return the owning history root."""
     if not os.path.lexists(old):
-        raise AscmhlSealError(f"Error: '{old}' not found")
+        raise AscmhlGenerateError(f"Error: '{old}' not found")
     if old == new:
-        raise AscmhlSealError("Error: old and new path are identical")
+        raise AscmhlGenerateError("Error: old and new path are identical")
     if os.path.lexists(new):
-        raise AscmhlSealError(f"Error: '{new}' already exists")
+        raise AscmhlGenerateError(f"Error: '{new}' already exists")
     if not new.parent.is_dir():
-        raise AscmhlSealError(f"Error: '{new.parent}' is not a directory")
+        raise AscmhlGenerateError(f"Error: '{new.parent}' is not a directory")
     history_root = _enclosing_history_root(old)
     if history_root is None:
         raise NoHistoryError(old)
     if _enclosing_history_root(new) != history_root:
-        raise AscmhlSealError("Error: cannot rename across ASC MHL history boundaries")
+        raise AscmhlGenerateError("Error: cannot rename across ASC MHL history boundaries")
     for rel in (old.relative_to(history_root), new.relative_to(history_root)):
         if ASCMHL_FOLDER in rel.parts:
-            raise AscmhlSealError("Error: cannot rename inside an ascmhl folder")
+            raise AscmhlGenerateError("Error: cannot rename inside an ascmhl folder")
     return history_root
 
 
@@ -246,7 +246,7 @@ def rename_ascmhl(old_path: "str | Path", new_path: "str | Path") -> "tuple[Path
     else:
         moved = [r for r in collect_recorded(level, ignore) if r.path == old_rel]
     if not moved:
-        raise AscmhlSealError(f"Error: '{old_rel}' is not recorded in the ASC MHL history at {history_root}")
+        raise AscmhlGenerateError(f"Error: '{old_rel}' is not recorded in the ASC MHL history at {history_root}")
 
     os.rename(old, new)
 
@@ -294,7 +294,7 @@ def _append_generation(history: History, manifest: ManifestOut, op_start: dateti
 
 
 # -----------------------------------------------------------------------------
-# Flatten (spec 5.6.7)
+# Flatten
 # -----------------------------------------------------------------------------
 
 

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-advanced-mhl — native sealing and verification tool for ASC MHL histories.
+advanced-mhl — native tool for generating and verifying ASC MHL histories.
 
 This module is the command-line interface, and the only place in the ASC-MHL
 path that writes to the terminal or exits the process: the engines
-(ascmhl_seal, ascmhl_ops, ascmhl_history) return structured results or raise
+(ascmhl_generate, ascmhl_ops, ascmhl_history) return structured results or raise
 typed errors, and this module renders them (via the shared renderer in
 mhl_suite.verify) and maps them to exit codes.
 
 Subcommands (ASC MHL Specification v1.0 operations):
 
-    advanced-mhl seal <directory>       — create or append a generation (5.6.2/5.6.5)
-    advanced-mhl verify <directory>     — verify and append a generation (5.6.4)
+    advanced-mhl generate <directory>   — create/verify and append a generation (5.6.2/5.6.4/5.6.5)
+    advanced-mhl check <directory>      — verify read-only, writes nothing
     advanced-mhl diff <directory>       — unknown/missing files, no hashing (5.6.3)
     advanced-mhl rename <old> <new>     — rename and record previousPath (5.6.6)
     advanced-mhl flatten <dir> <dest>   — packing list + collection (5.6.7)
@@ -25,9 +25,9 @@ import sys
 from mhl_suite import __version__
 from mhl_suite._exit_codes import ExitCode
 from mhl_suite.algorithms import ASC_FORMATS
+from mhl_suite.ascmhl_generate import AscmhlGenerateError, GenerateOptions, GenerateResult, generate_ascmhl
 from mhl_suite.ascmhl_history import ASCMHL_FOLDER, HistoryError, NoHistoryError, verify_ascmhl
 from mhl_suite.ascmhl_ops import diff_ascmhl, flatten_ascmhl, rename_ascmhl
-from mhl_suite.ascmhl_seal import AscmhlSealError, SealOptions, SealResult, seal_ascmhl
 from mhl_suite.osutils import to_terminal_sep
 from mhl_suite.update_checker import run_with_update_check
 from mhl_suite.verify import Status, VerifyReport, render_verify_lines, status_line
@@ -96,9 +96,9 @@ def _print_report(report: VerifyReport, verbose: bool) -> None:
         print(to_terminal_sep(line))
 
 
-def _print_seal_result(result: SealResult, verbose: bool) -> None:
+def _print_generate_result(result: GenerateResult, verbose: bool) -> None:
     """
-    Seal-flavoured rendering: newly recorded files are the operation's point,
+    Generate-flavoured rendering: newly recorded files are the operation's point,
     so they show as [NEW] (verbose) rather than the verify renderer's
     "unknown file" failure; everything else reuses the shared renderer.
     """
@@ -118,53 +118,37 @@ def _print_seal_result(result: SealResult, verbose: bool) -> None:
             print(f"Created new generation: {manifest}")
 
 
-def seal(
+def generate(
     path: str, algorithms: tuple[str, ...], directory_hashes: bool, patterns: tuple[str, ...], verbose: bool
 ) -> None:
-    """Seal a directory: initiate or append one generation per history level."""
-    options = SealOptions(algorithms=algorithms, directory_hashes=directory_hashes, ignore_patterns=patterns)
+    """Generate a new generation: initiate or append one per history level."""
+    options = GenerateOptions(algorithms=algorithms, directory_hashes=directory_hashes, ignore_patterns=patterns)
     try:
-        result = seal_ascmhl(path, options)
-    except (AscmhlSealError, HistoryError) as e:
+        result = generate_ascmhl(path, options)
+    except (AscmhlGenerateError, HistoryError) as e:
         sys.exit(_fail(e))
-    _print_seal_result(result, verbose)
-    if result.write_failures and result.seal_code == ExitCode.OK:
+    _print_generate_result(result, verbose)
+    if result.write_failures and result.generate_code == ExitCode.OK:
         sys.exit(ExitCode.ERROR)
-    sys.exit(int(result.seal_code))
+    sys.exit(int(result.generate_code))
 
 
-def verify(
+def check(
     path: str,
     algorithms: "tuple[str, ...] | None",
-    directory_hashes: bool,
-    patterns: tuple[str, ...],
-    read_only: bool,
+    size_only: bool,
     verbose: bool,
 ) -> None:
     """
-    Verify a managed data set. By default this appends a new generation
-    recording the results (spec 5.6.4); --read-only checks without writing.
+    Verify a managed data set read-only: check recorded hashes (or recorded
+    sizes with --size-only) and write nothing. Use `generate` to record the
+    verification as a new generation (spec 5.6.4).
     """
     if not os.path.isdir(os.path.join(path, ASCMHL_FOLDER)):
         sys.exit(_fail(NoHistoryError(os.path.abspath(path))))
-    if read_only:
-        report = verify_ascmhl(path, selection=list(algorithms) if algorithms else None)
-        _print_report(report, verbose)
-        sys.exit(int(report.code))
-    options = SealOptions(
-        algorithms=algorithms or (DEFAULT_ALGORITHM,),
-        directory_hashes=directory_hashes,
-        ignore_patterns=patterns,
-    )
-    try:
-        result = seal_ascmhl(path, options)
-    except (AscmhlSealError, HistoryError) as e:
-        sys.exit(_fail(e))
-    _print_report(result.report, verbose)
-    if verbose:
-        for manifest in result.manifests_written:
-            print(f"Created new generation: {manifest}")
-    sys.exit(int(result.report.code))
+    report = verify_ascmhl(path, size_only=size_only, selection=list(algorithms) if algorithms else None)
+    _print_report(report, verbose)
+    sys.exit(int(report.code))
 
 
 def diff(path: str, verbose: bool) -> None:
@@ -178,7 +162,7 @@ def rename(old: str, new: str, verbose: bool) -> None:
     """Rename a file/directory and record previousPath in a new generation."""
     try:
         manifest, report = rename_ascmhl(old, new)
-    except (AscmhlSealError, HistoryError) as e:
+    except (AscmhlGenerateError, HistoryError) as e:
         sys.exit(_fail(e))
     _print_report(report, verbose)
     if verbose:
@@ -190,7 +174,7 @@ def flatten(path: str, destination: str, verbose: bool) -> None:
     """Consolidate a history into a packing list plus collection entry."""
     try:
         packinglist, collection = flatten_ascmhl(path, destination)
-    except (AscmhlSealError, HistoryError) as e:
+    except (AscmhlGenerateError, HistoryError) as e:
         sys.exit(_fail(e))
     print(f"Created packing list: {packinglist}")
     if verbose:
@@ -211,7 +195,7 @@ def validate_schema(file_path: str) -> None:
 # CLI entry point
 # -----------------------------------------------------------------------------
 
-_SUBCOMMANDS = {"seal", "verify", "diff", "rename", "flatten", "xsd-schema-check"}
+_SUBCOMMANDS = {"generate", "check", "diff", "rename", "flatten", "xsd-schema-check"}
 
 
 def main() -> None:
@@ -221,24 +205,24 @@ def main() -> None:
 
 def _dispatch_bare_argument() -> None:
     """
-    Smart dispatch: `advanced-mhl <dir>` verifies when the directory already
-    carries a history and seals when it doesn't; a bare .mhl/.xml file goes to
-    the schema check. sys.argv is rewritten before argparse sees it, so all
-    normal validation still applies.
+    Smart dispatch: `advanced-mhl <dir>` generates a new generation — creating
+    the history when there is none and verifying-and-appending when one already
+    exists (spec 5.6.4); a bare .mhl/.xml file goes to the schema check. Use
+    `check` for a read-only verification. sys.argv is rewritten before argparse
+    sees it, so all normal validation still applies.
     """
     raw = sys.argv[1:]
     if not raw or raw[0] in _SUBCOMMANDS or raw[0].startswith("-"):
         return
     candidate = raw[0]
     if os.path.isdir(candidate):
-        command = "verify" if os.path.isdir(os.path.join(candidate, ASCMHL_FOLDER)) else "seal"
-        sys.argv = [sys.argv[0], command, *raw]
+        sys.argv = [sys.argv[0], "generate", *raw]
     elif candidate.lower().endswith((".mhl", ".xml")):
         sys.argv = [sys.argv[0], "xsd-schema-check", *raw]
     # Anything else falls through to argparse's normal "invalid choice".
 
 
-def _add_seal_options(parser: argparse.ArgumentParser) -> None:
+def _add_generate_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "-a",
         "--algorithm",
@@ -285,19 +269,19 @@ def _main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="advanced-mhl",
-        description="Native sealing and verification tool for ASC MHL histories (ASC MHL spec v1.0)",
+        description="Native tool for generating and verifying ASC MHL histories (ASC MHL spec v1.0)",
         parents=[global_opts],
     )
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    seal_p = subparsers.add_parser(
-        "seal", help="seal a directory (create or extend its ASC MHL history)", parents=[global_opts]
+    generate_p = subparsers.add_parser(
+        "generate", help="generate a generation (create or extend an ASC MHL history)", parents=[global_opts]
     )
-    seal_p.add_argument("path", help="directory to seal")
-    _add_seal_options(seal_p)
-    seal_p.set_defaults(
-        func=lambda a: seal(
+    generate_p.add_argument("path", help="directory to generate a generation for")
+    _add_generate_options(generate_p)
+    generate_p.set_defaults(
+        func=lambda a: generate(
             a.path,
             combine_algorithms(a.algorithm),
             a.directory_hashes,
@@ -306,23 +290,31 @@ def _main() -> None:
         )
     )
 
-    verify_p = subparsers.add_parser(
-        "verify", help="verify a managed data set (appends a new generation)", parents=[global_opts]
+    check_p = subparsers.add_parser(
+        "check", help="verify a managed data set read-only (writes nothing)", parents=[global_opts]
     )
-    verify_p.add_argument("path", help="directory carrying an ascmhl history")
-    _add_seal_options(verify_p)
-    verify_p.add_argument(
-        "--read-only",
+    check_p.add_argument("path", help="directory carrying an ascmhl history")
+    check_p.add_argument(
+        "-a",
+        "--algorithm",
+        type=parse_asc_algorithms,
+        action="append",
+        default=None,
+        metavar="ALGO[,ALGO...]",
+        help=f"recorded hash format(s) to check against: {', '.join(sorted(ASC_FORMATS))} (default: the original)",
+    )
+    check_p.add_argument(
+        "-S",
+        "--size-only",
+        dest="size_only",
         action="store_true",
-        help="verify without writing a new generation (spec 5.6.4 normally appends one)",
+        help="compare recorded file sizes without hashing",
     )
-    verify_p.set_defaults(
-        func=lambda a: verify(
+    check_p.set_defaults(
+        func=lambda a: check(
             a.path,
             combine_algorithms(a.algorithm) if a.algorithm else None,
-            a.directory_hashes,
-            gather_ignore_patterns(a.ignore, a.ignore_spec),
-            a.read_only,
+            a.size_only,
             a.verbose,
         )
     )
