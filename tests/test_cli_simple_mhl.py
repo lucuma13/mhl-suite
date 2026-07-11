@@ -731,6 +731,34 @@ class TestCombineAlgorithms:
         assert simple_mhl.combine_verify_algorithms([["md5"], "all"]) == VERIFY_ALL
 
 
+class TestSealSizeOnlyFlag:
+    """`seal -S` is an alias for `seal -a null` (record sizes, no digest)."""
+
+    def test_size_only_records_null_no_digest(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"a.txt": b"hello"})
+        rc, _, _ = mhl_cli(["seal", "-S", str(tmp_path)])
+        assert rc == 0
+        mhl = next(tmp_path.glob("*.mhl"))
+        xml = mhl.read_text()
+        assert "<null>" in xml
+        assert "<size>5</size>" in xml
+        assert "xxhash" not in xml
+        assert "<md5>" not in xml
+
+    def test_size_only_resolves_to_same_algorithms_as_a_null(self):
+        # -S injects a [["null"]] group; parsing `-a null` yields the same list,
+        # so both drive the seal engine with exactly ["null"].
+        assert simple_mhl.combine_seal_algorithms([["null"]]) == simple_mhl.combine_seal_algorithms(
+            [simple_mhl.parse_algorithms("null")]
+        )
+
+    def test_size_only_combined_with_real_algorithm_errors(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"a.txt": b"hello"})
+        rc, _, err = mhl_cli(["seal", "-S", "-a", "md5", str(tmp_path)])
+        assert rc == 2
+        assert "'null' cannot be combined" in err
+
+
 class TestParseVerifyAlgorithms:
     """
     The verify -a comma-list parser (accepts the 'all' keyword, dedups by tag).

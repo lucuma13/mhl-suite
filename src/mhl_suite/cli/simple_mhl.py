@@ -335,6 +335,12 @@ def _main() -> None:
         help="hash algorithm: xxh64 (default), md5, sha1, null (size-only)",
     )
     seal_p.add_argument(
+        "-S",
+        "--size-only",
+        action="store_true",
+        help="record file sizes only, no digest (alias for -a null)",
+    )
+    seal_p.add_argument(
         "-o",
         "--output-dir",
         dest="output_dir",
@@ -342,7 +348,14 @@ def _main() -> None:
         metavar="DIR",
         help="directory to write the MHL into (default: directory root)",
     )
-    seal_p.set_defaults(func=lambda a: seal(a.path, combine_seal_algorithms(a.algorithm), a.verbose, a.output_dir))
+    seal_p.set_defaults(
+        func=lambda a: seal(
+            a.path,
+            combine_seal_algorithms(([[NULL_TAG]] if a.size_only else []) + (a.algorithm or [])),
+            a.verbose,
+            a.output_dir,
+        )
+    )
 
     verify_p = subparsers.add_parser("verify", help="verify an MHL file", parents=[global_opts])
     verify_p.add_argument("path", help="path to MHL file")
