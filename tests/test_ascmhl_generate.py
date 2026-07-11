@@ -234,6 +234,27 @@ class TestSealAppend:
         assert 'action="original"' in text
         assert 'action="verified"' in text
 
+    def test_append_reports_true_byte_total_including_new_files(self, tmp_path):
+        # The progress weight is recorded bytes only; the append path also
+        # hashes new files, so on_total must report the real hashed volume
+        # (recorded + new) — the number a bar needs to pace to 100%, not past.
+        root = tmp_path / "card"
+        make_tree(root, {"a.bin": b"x" * 1000})
+        generate(root)
+        (root / "new.bin").write_bytes(b"z" * 5000)
+
+        totals: list[int] = []
+        hashed = [0]
+        generate_ascmhl(
+            root,
+            GenerateOptions(algorithms=("xxh64",)),
+            on_progress=lambda n: hashed.__setitem__(0, hashed[0] + n),
+            on_total=totals.append,
+        )
+
+        assert totals == [6000]  # 1000 recorded + 5000 new
+        assert hashed[0] == 6000  # reported total matches what was actually read
+
     def test_missing_file_reports_10_and_writes_no_record_for_it(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"x", "b.txt": b"y"})

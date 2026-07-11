@@ -447,11 +447,22 @@ def _verify_with_progress(
             # already thread-safe.
             advanced_box: list[int] = [0]
             advance_lock = threading.Lock()
+            # The recorded-bytes weight can undercount when the ASC-MHL append
+            # path hashes new files; if it reports its true byte total we adopt
+            # it so the bar paces to 100% instead of running past. Fires once,
+            # on this thread, before any on_bytes.
+            effective_weight = [weights[f]]
 
             def _advance(n: int, box: list[int] = advanced_box, lock: threading.Lock = advance_lock) -> None:
                 progress.advance(bar_task, n)
                 with lock:
                     box[0] += n
+
+            def _set_total(real: int, ew: list[int] = effective_weight) -> None:
+                nonlocal total_bytes
+                total_bytes += real - ew[0]
+                ew[0] = real
+                progress.update(bar_task, total=total_bytes)
 
             code, mr = verify_item(
                 f,
@@ -461,10 +472,11 @@ def _verify_with_progress(
                 read_only,
                 emit=lambda sl: _render_status(sl, con),
                 on_bytes=_advance,
+                on_total=_set_total,
             )
             if mr is not None:
                 manifest_results.append(mr)
-            progress.advance(bar_task, max(0, weights[f] - advanced_box[0]))
+            progress.advance(bar_task, max(0, effective_weight[0] - advanced_box[0]))
             if exit_status == 0:
                 exit_status = code
         label.plain = ""

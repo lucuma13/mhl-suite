@@ -365,6 +365,7 @@ def verify_item(
     read_only: bool = False,
     emit: "Callable[[StatusLine], None] | None" = None,
     on_bytes: "Callable[[int], None] | None" = None,
+    on_total: "Callable[[int], None] | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
     """
     Verify one discovered item with the right dialect engine.
@@ -378,13 +379,16 @@ def verify_item(
     neither is a spec 5.6.4 verification to record — no generation is
     appended. `emit`, if given, receives a StatusLine per manifest for the CLI
     to render; `on_bytes` advances a progress bar as each file is hashed (per
-    chunk, possibly from worker threads).
+    chunk, possibly from worker threads). `on_total`, if given, receives the
+    append path's true byte total before hashing, so a caller can correct a
+    bar whose weight excluded new files (ASC-MHL append only; never fired for
+    classic, schema, size-only, or read-only checks, which hash nothing new).
 
     Returns (exit_code, ManifestResult | None). ManifestResult is None in
     schema mode (no per-file detail exists then).
     """
     if isinstance(item, AscmhlHistory):
-        return _verify_ascmhl_item(item, verbose, schema, size_only, read_only, emit, on_bytes)
+        return _verify_ascmhl_item(item, verbose, schema, size_only, read_only, emit, on_bytes, on_total)
     return _verify_classic_item(item, verbose, schema, size_only, emit, on_bytes)
 
 
@@ -416,6 +420,7 @@ def _verify_ascmhl_item(
     read_only: bool,
     emit: "Callable[[StatusLine], None] | None",
     on_bytes: "Callable[[int], None] | None",
+    on_total: "Callable[[int], None] | None" = None,
 ) -> "tuple[int, ManifestResult | None]":
     """ASC MHL History: schema mode (latest manifest + chain) or verify via the shared engine."""
     if schema:
@@ -433,7 +438,7 @@ def _verify_ascmhl_item(
         report = verify_ascmhl(item.root, size_only=size_only, on_progress=on_bytes, history=item.try_history())
         extra_lines: list[str] = []
     else:
-        report, extra_lines = _verify_and_append(item, verbose, on_bytes)
+        report, extra_lines = _verify_and_append(item, verbose, on_bytes, on_total)
 
     output = "\n".join([*render_verify_lines(report, verbose), *extra_lines])
     _emit(emit, _ASCMHL_VERIFY_RESULTS, report.code, item.label, output)
@@ -441,7 +446,10 @@ def _verify_ascmhl_item(
 
 
 def _verify_and_append(
-    item: AscmhlHistory, verbose: bool, on_bytes: "Callable[[int], None] | None"
+    item: AscmhlHistory,
+    verbose: bool,
+    on_bytes: "Callable[[int], None] | None",
+    on_total: "Callable[[int], None] | None" = None,
 ) -> "tuple[VerifyReport, list[str]]":
     """
     The conformant default: verify the managed data set and append a new
@@ -455,7 +463,7 @@ def _verify_and_append(
     that makes the no-write behaviour explicit.
     """
     try:
-        result = generate_ascmhl(item.root, on_progress=on_bytes)
+        result = generate_ascmhl(item.root, on_progress=on_bytes, on_total=on_total)
     except HistoryError as err:
         return VerifyReport(code=err.code, notices=[str(err)]), []
     except AscmhlGenerateError as err:

@@ -1469,7 +1469,7 @@ class TestRunWithProgress:
             file_results=[VerifyEntry(path="a.bin", status=Status.OK)],
         )
 
-        def _verify(f, verbose, schema, size_only, read_only=False, emit=None, on_bytes=None):
+        def _verify(f, verbose, schema, size_only, read_only=False, emit=None, on_bytes=None, on_total=None):
             assert on_bytes is not None
             on_bytes(100)  # exercise the _advance callback from the progress branch
             return 0, mr
