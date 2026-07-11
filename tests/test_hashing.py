@@ -9,6 +9,7 @@ the verify engine's integration is covered in the verify tests.
 """
 
 import hashlib
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -275,6 +276,86 @@ class TestAdaptiveHashing:
         good.write_bytes(b"x" * (2 * 1024 * 1024))
         bw = core_hashing._probe_read_bw_multi([(str(tmp_path / "missing.bin"), 0), (str(good), 0)], 2)
         assert bw >= 0
+
+    # --- probe stability early exit -------------------------------------------
+    #
+    # The probe's 1 s wall floor exists only to outlast a NAS's multi-second
+    # TCP/SMB ramp; on a stable volume it may return at the byte floor. These
+    # tests pace fake streams (module-level `open` shadowed) so ramp vs stable
+    # is deterministic regardless of the machine's real disk.
+
+    class _PacedFile:
+        """Endless file-like stream delivering `chunk` bytes per read, paced by delay_fn(elapsed)."""
+
+        CHUNK = 65536
+
+        def __init__(self, t0, delay_fn):
+            self._t0 = t0
+            self._delay_fn = delay_fn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def seek(self, offset):
+            pass
+
+        def readinto(self, buf):
+            time.sleep(self._delay_fn(time.perf_counter() - self._t0))
+            return self.CHUNK
+
+    def _pace_probe(self, monkeypatch, delay_fn, *, floor_s=2.0, cap_s=4.0):
+        """
+        Shadow `open` inside the hashing module with paced fake streams and
+        shrink the byte floor so window sampling starts quickly. Returns
+        (aggregate_bw, elapsed) of a 4-stream probe.
+        """
+        t0 = time.perf_counter()
+        monkeypatch.setattr(core_hashing, "open", lambda path, mode: self._PacedFile(t0, delay_fn), raising=False)
+        monkeypatch.setattr(core_hashing, "_AUTO_PROBE_MIN_BYTES", 2 * 1024 * 1024)
+        monkeypatch.setattr(core_hashing, "_AUTO_PROBE_SECONDS", floor_s)
+        monkeypatch.setattr(core_hashing, "_AUTO_PROBE_MAX_SECONDS", cap_s)
+        monkeypatch.setattr(core_hashing, "_AUTO_PROBE_WINDOW_SECONDS", 0.1)
+        slots = [(f"/fake/{i}", 0) for i in range(4)]
+        start = time.perf_counter()
+        bw = core_hashing._probe_read_bw_multi(slots, 4)
+        return bw, time.perf_counter() - start
+
+    def test_probe_multi_stable_stream_exits_before_wall_floor(self, monkeypatch):
+        """
+        A fast, non-ramping aggregate ends the probe at the byte floor + two
+        agreeing sub-windows — far before the wall floor — so disk-bound runs
+        on quiet SSDs stop paying ~1 s of padding.
+        """
+        bw, elapsed = self._pace_probe(monkeypatch, lambda t: 0.002)  # steady ~32 MB/s per stream
+        assert bw > 0
+        assert elapsed < 1.0, f"stable stream should exit early, took {elapsed:.2f}s"
+
+    def test_probe_multi_ramping_stream_reads_to_wall_floor(self, monkeypatch):
+        """
+        An aggregate still ramping (each sub-window measurably faster than the
+        last, the NAS signature the wall floor exists for) never satisfies the
+        stability check and reads to the full floor.
+        """
+        # Rate grows linearly 5x/s: adjacent 0.1 s windows differ by >10%
+        # throughout the floor, so no two ever agree.
+        bw, elapsed = self._pace_probe(monkeypatch, lambda t: 0.002 / (1 + 5 * t), floor_s=0.8, cap_s=2.0)
+        assert bw > 0
+        assert elapsed >= 0.8, f"ramping stream must read to the wall floor, exited at {elapsed:.2f}s"
+
+    def test_probe_multi_slow_stable_stream_exits_early_with_low_rate(self, monkeypatch):
+        """
+        A collapsed-but-stable aggregate (seek-bound signature) may also exit
+        early — the sample is decisive either way — and must report the low
+        rate faithfully so the seek-collapse gate upstream still fires.
+        """
+        bw, elapsed = self._pace_probe(monkeypatch, lambda t: 0.008)  # steady ~8 MB/s per stream
+        assert elapsed < 1.0, f"stable stream should exit early, took {elapsed:.2f}s"
+        # ~4 streams * 64 KiB / 8 ms ≈ 32 MB/s aggregate; generous bounds, but
+        # far below any rate a warm cache or accounting bug would produce.
+        assert 8 * 1024**2 < bw < 48 * 1024**2
 
     def test_probe_slots_prefers_distinct_tail_files(self):
         """
