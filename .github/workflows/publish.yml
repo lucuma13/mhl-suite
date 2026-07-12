@@ -1,15 +1,15 @@
 ---
-name: Publish to PyPI
-run-name: Publish to PyPI - Release ${{ github.ref_name }}
+name: Publish
+run-name: Publish version ${{ github.ref_name }}
 "on":
   release:
     types: [published]
 concurrency:
-  group: pypi-publish
+  group: publish
   cancel-in-progress: true
 permissions: {} # deny all by default; each job grants only what it needs
 jobs:
-  # JOB 0: Run the full CI suite as a safety gate
+  # JOB 0: Run the full CI suite as a safety gate for every channel
   ci:
     name: CI
     uses: ./.github/workflows/ci.yml
@@ -59,8 +59,9 @@ jobs:
               print(f"smoke-test-cmds={cmds}", file=out)
               print(f"version={version}", file=out)
               print(f"python-versions={python_versions}", file=out)
+  # ---------------------------------------------------------------- PyPI ----
   # JOB 2: Verify tag, build and publish (only runs if CI passes)
-  build-n-publish:
+  publish-pypi:
     name: Build and publish Python distro to PyPI
     needs: [ci, read-metadata]
     runs-on: ubuntu-latest
@@ -107,9 +108,9 @@ jobs:
       - name: Publish to PyPI via uv
         run: uv publish
   # JOB 3: Post-deployment smoke test (verifies index installation and packaging)
-  verify-deployment:
+  verify-pypi-install:
     name: Verify Live Package (${{ matrix.os }}, py${{ matrix.python-version }})
-    needs: [read-metadata, build-n-publish]
+    needs: [read-metadata, publish-pypi]
     runs-on: ${{ matrix.os }}
     permissions: {}
     strategy:
@@ -149,6 +150,80 @@ jobs:
 
           echo "Package failed to propagate after $((MAX_RETRIES * RETRY_INTERVAL)) seconds."
           exit 1
+      - name: Smoke test CLI entry points
+        env:
+          SMOKE_TEST_CMDS: ${{ needs.read-metadata.outputs.smoke-test-cmds }}
+        shell: bash
+        run: |
+          for cmd in $SMOKE_TEST_CMDS; do
+            echo "→ $cmd --version"
+            "$cmd" --version
+          done
+  # ------------------------------------------------------------ Homebrew ----
+  # JOB 4: Generate the formula and push it to the tap. Runs in parallel with
+  # the PyPI channel: the formula builds from the GitHub release tarball, which
+  # exists the moment `release: published` fires, so there is nothing to wait on.
+  publish-homebrew:
+    name: Generate and push Homebrew formula
+    needs: [ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: homebrew
+      url: https://github.com/lucuma13/homebrew-dit
+    outputs:
+      formula-name: ${{ steps.generate.outputs.name }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Checkout homebrew-dit tap
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: lucuma13/homebrew-dit
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-dit
+          persist-credentials: false
+      - name: Generate formula from pyproject.toml + uv.lock
+        id: generate
+        run: |
+          FILENAME=$(python3 scripts/create_homebrew_formula.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --output-dir homebrew-dit/Formula)
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "name=${FILENAME%.rb}" >> "$GITHUB_OUTPUT"
+      - name: Commit and push formula
+        working-directory: homebrew-dit
+        env:
+          FORMULA_FILENAME: ${{ steps.generate.outputs.filename }}
+          FORMULA_NAME: ${{ steps.generate.outputs.name }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "Formula/${FORMULA_FILENAME}"
+          if git diff --cached --quiet; then
+            echo "Formula unchanged; nothing to push."
+            exit 0
+          fi
+          git commit -m "${FORMULA_NAME} ${GITHUB_REF_NAME}"
+          git push "https://x-access-token:${TAP_TOKEN}@github.com/lucuma13/homebrew-dit" HEAD:main
+  # JOB 5: Post-deployment smoke test (install the pushed formula from the tap)
+  verify-brew-install:
+    name: Verify brew install (macos-latest)
+    needs: [read-metadata, publish-homebrew]
+    runs-on: macos-latest
+    permissions: {}
+    steps:
+      - name: Install from tap
+        env:
+          FORMULA_NAME: ${{ needs.publish-homebrew.outputs.formula-name }}
+        run: |
+          brew tap lucuma13/dit
+          brew install --build-from-source "lucuma13/dit/${FORMULA_NAME}"
       - name: Smoke test CLI entry points
         env:
           SMOKE_TEST_CMDS: ${{ needs.read-metadata.outputs.smoke-test-cmds }}
