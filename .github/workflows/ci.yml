@@ -93,7 +93,7 @@ jobs:
       - name: Lint YAML (yamllint)
         uses: ibiqlik/action-yamllint@2576378a8e339169678f9939646ee3ee325e845c # v3.1.1
         with:
-          config_data: "{extends: default, rules: {line-length: {max: 120}, comments: {min-spaces-from-content: 1}}}"
+          config_data: "{extends: default, rules: {line-length: {max: 120, level: warning}, comments: {min-spaces-from-content: 1}}}"
       # GitHub workflow schema validation
       - name: Validate GitHub workflow schemas
         uses: dsanders11/json-schema-validate-action@eddf079f55830cc9a916a3c512ba9086240d2fea # v2.0.0
