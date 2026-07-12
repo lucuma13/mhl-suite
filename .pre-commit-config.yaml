@@ -1,4 +1,9 @@
 ---
+# Payload data and byte-exact test fixtures must never be reformatted.
+exclude: |
+  (?x)^(
+    tests/fixtures/.*
+  )$
 repos:
   # Pre-commit configuration checks
   - repo: meta
@@ -12,19 +17,48 @@ repos:
       - id: check-added-large-files
       - id: check-case-conflict
       - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: trailing-whitespace
+        exclude: \.md$
       - id: check-executables-have-shebangs
       - id: check-shebang-scripts-are-executable
       - id: debug-statements
-      - id: end-of-file-fixer
-      - id: mixed-line-ending
-      - id: trailing-whitespace
-        exclude: \.md$
   # Spellcheck
   - repo: https://github.com/crate-ci/typos
-    rev: v1.48.0 # pin to a concrete release; v1 is a mutable rolling tag
+    rev: v1.48.0
     hooks:
       - id: typos
         args: [--force-exclude] # Flag only: removed default --write-changes
+  # YAML formatter
+  - repo: https://github.com/google/yamlfmt
+    rev: v0.21.0
+    hooks:
+      - id: yamlfmt
+        args: ["-formatter", "include_document_start=true,line_length=120"]
+  # YAML linter
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        args:
+          - --config-data
+          # line-length is a warning, not an error: the powershell stack's `entry:`
+          # one-liners cannot be broken under 120 chars. truthy.check-keys is off
+          # so a workflow may write `on:` unquoted.
+          - "{extends: default, rules: {line-length: {max: 120, level: warning}, comments: {min-spaces-from-content: 1}, truthy: {check-keys: false}}}"
+  # GitHub workflow schema validation
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.37.4
+    hooks:
+      - id: check-github-workflows
+        args: ["--verbose"]
+  # CI security auditing
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.26.1
+    hooks:
+      - id: zizmor
   # Pyproject formatter
   - repo: https://github.com/tox-dev/pyproject-fmt
     rev: v2.25.1
@@ -73,28 +107,3 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
-  # YAML formatter
-  - repo: https://github.com/google/yamlfmt
-    rev: v0.21.0
-    hooks:
-      - id: yamlfmt
-        args: ["-formatter", "include_document_start=true,line_length=120"]
-  # YAML linter
-  - repo: https://github.com/adrienverge/yamllint
-    rev: v1.38.0
-    hooks:
-      - id: yamllint
-        args:
-          - --config-data
-          - "{extends: default, rules: {line-length: {max: 120}, comments: {min-spaces-from-content: 1}}}"
-  # GitHub workflow schema validation
-  - repo: https://github.com/python-jsonschema/check-jsonschema
-    rev: 0.37.4
-    hooks:
-      - id: check-github-workflows
-        args: ["--verbose"]
-  # CI security auditing
-  - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.26.1
-    hooks:
-      - id: zizmor
