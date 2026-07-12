@@ -104,6 +104,33 @@ class TestWriters:
         assert tags == ["path", "c4", "md5", "previousPath"][: len(tags)]
         assert tags[1] == "c4"
 
+    def test_hashes_interleave_directories_ahead_of_the_files_beside_them(self, tmp_path):
+        """
+        <directoryhash> records merge into the file order (mhl_suite.sorting): a
+        directory sits immediately ahead of its own subtree and ahead of its
+        siblings' files, which a plain path sort would not give — 'Alpha/a1.mov'
+        sorts before 'Alpha/sub'.
+        """
+        manifest = ManifestOut(creation_date="2026-01-01T00:00:00Z", process="in-place")
+        for path in ("notes.txt", "Alpha/a1.mov", "Alpha/sub/deep.mov", "Bravo/b1.mov"):
+            manifest.files.append(_file_entry(path, [("md5", "0" * 32)]))
+        for path in ("Bravo", "Alpha", "Alpha/sub"):
+            manifest.directories.append(_dir_entry(path, [("md5", "0" * 32)], [("md5", "1" * 32)]))
+        path = tmp_path / "m.mhl"
+        write_manifest(path, manifest)
+
+        hashes = find(etree.parse(str(path)), "{*}hashes")
+        recorded = [(child.tag.rpartition("}")[2], find(child, "{*}path").text) for child in hashes]
+        assert recorded == [
+            ("directoryhash", "Alpha"),
+            ("directoryhash", "Alpha/sub"),
+            ("hash", "Alpha/sub/deep.mov"),
+            ("hash", "Alpha/a1.mov"),
+            ("directoryhash", "Bravo"),
+            ("hash", "Bravo/b1.mov"),
+            ("hash", "notes.txt"),
+        ]
+
     def test_manifest_never_overwrites(self, tmp_path):
         path = tmp_path / "m.mhl"
         manifest = ManifestOut(creation_date="2026-01-01T00:00:00Z", process="in-place")

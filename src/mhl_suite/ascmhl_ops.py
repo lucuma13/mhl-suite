@@ -56,6 +56,7 @@ from mhl_suite.ascmhl_history import (
     walk_disk_files,
 )
 from mhl_suite.osutils import resolve_on_disk
+from mhl_suite.sorting import sort_key
 from mhl_suite.verify import HashComparison, Status, VerifyEntry, VerifyReport
 
 if TYPE_CHECKING:
@@ -102,7 +103,7 @@ def diff_ascmhl(root_path: "str | Path") -> VerifyReport:
     entries.extend(
         VerifyEntry(path=rel, status=Status.NEW) for rel in walk_disk_files(root, ignore) if rel not in recorded_paths
     )
-    entries.sort(key=lambda e: e.path)
+    entries.sort(key=lambda e: sort_key(e.path))
 
     if any(e.status == Status.NEW for e in entries):
         code = ExitCode.NEW_FILES

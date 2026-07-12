@@ -55,6 +55,7 @@ from mhl_suite.ascmhl_history import (
     parse_chain,
 )
 from mhl_suite.osutils import friendly_hostname, normalization_variant_on_disk
+from mhl_suite.sorting import sort_key
 from mhl_suite.verify import ErrorKind, HashComparison, Status, VerifyEntry, VerifyReport
 
 if TYPE_CHECKING:
@@ -251,12 +252,19 @@ def write_manifest(file_path: "str | Path", manifest: ManifestOut) -> None:
 
 
 def _write_hashes(fh: BinaryIO, manifest: ManifestOut) -> None:
-    """The <hashes> block, omitted entirely when there is nothing to record."""
+    """
+    The <hashes> block, omitted entirely when there is nothing to record.
+
+    manifest.files already arrives in order (it is the order they were hashed
+    in); this merges the <directoryhash> records into that same order, which is
+    what puts each directory immediately ahead of its own subtree and ahead of
+    its siblings' files.
+    """
     records: list[FileEntryOut | DirEntryOut] = [*manifest.files, *manifest.directories]
     if not records:
         return
     fh.write(b"  <hashes>\n")
-    for record in sorted(records, key=lambda r: r.path):
+    for record in sorted(records, key=lambda r: sort_key(r.path, is_dir=isinstance(r, DirEntryOut))):
         element = _file_element(record) if isinstance(record, FileEntryOut) else _dir_element(record)
         fh.write(_serialize(element, "    "))
     fh.write(b"  </hashes>\n")
@@ -428,7 +436,7 @@ def _scan_level(prefix: str, history: History, options: GenerateOptions) -> _Lev
         if node.child_history is not None:
             return node
         try:
-            entries = sorted(os.scandir(abs_dir), key=lambda e: e.name)
+            entries = list(os.scandir(abs_dir))
         except OSError as exc:
             unreadable.append((rel or ".", exc.strerror or str(exc)))
             return node
@@ -448,6 +456,14 @@ def _scan_level(prefix: str, history: History, options: GenerateOptions) -> _Lev
         return node
 
     tree = walk(os.fspath(history.root), "", _stat_or_none(history.root))
+
+    # The walk runs in filesystem order; this is where the level's order is
+    # decided, before _hash_all consumes the list, so hashing order and manifest
+    # order are the same one. The _DirItem tree stays unsorted: its only
+    # consumer is the directory hash, which sorts its own child digests.
+    files.sort(key=lambda item: sort_key(item.rel))
+    unreadable.sort(key=lambda u: sort_key(u[0]))
+
     recorded_by_path = {r.path: r for r in recorded}
     for item in files:
         item.recorded = recorded_by_path.get(item.rel)
@@ -811,7 +827,7 @@ def generate_ascmhl(
     entries: list[VerifyEntry] = []
     dir_failed = _assemble_level(top, options, op_start, result, entries)
 
-    entries.sort(key=lambda e: e.path)
+    entries.sort(key=lambda e: sort_key(e.path))
     code = ascmhl_exit_code(entries)
     if code != ExitCode.HASH_MISMATCH and dir_failed:
         code = ExitCode.DIRECTORY_HASH_MISMATCH

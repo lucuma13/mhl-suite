@@ -34,6 +34,60 @@ class TestSeal:
         assert "<md5>" in text
         assert text.count("<hash>") == 2
 
+    def test_manifest_orders_subtrees_before_the_files_beside_them(self, mhl_cli, tmp_path):
+        """
+        Entries follow mhl_suite.sorting: at each level a subdirectory's whole
+        subtree precedes that level's own files, and digit runs sort
+        numerically. The walk itself runs in filesystem order, so this also pins
+        that the sort is what decides the manifest — not the order readdir
+        happened to return.
+        """
+        make_tree(
+            tmp_path,
+            {
+                "take10.mov": b"j",
+                "take2.mov": b"i",
+                "Alpha/a1.mov": b"x",
+                "Alpha/sub/deep.mov": b"y",
+                "Bravo/b1.mov": b"z",
+            },
+        )
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+
+        assert rc == 0
+        text = next(tmp_path.glob("*.mhl")).read_text()
+        assert re.findall(r"<file>(.*?)</file>", text) == [
+            "Alpha/sub/deep.mov",
+            "Alpha/a1.mov",
+            "Bravo/b1.mov",
+            "take2.mov",
+            "take10.mov",
+        ]
+
+    def test_hashdates_ascend_down_the_manifest(self, mhl_cli, tmp_path):
+        """
+        Files are hashed in the order they are written — the sort happens before
+        hashing, not after it.
+        """
+        make_tree(tmp_path, {f"Alpha/take{n}.mov": b"x" * (n + 1) for n in range(6)} | {"z.mov": b"y"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+
+        assert rc == 0
+        text = next(tmp_path.glob("*.mhl")).read_text()
+        hashdates = re.findall(r"<hashdate>(.*?)</hashdate>", text)
+        assert hashdates == sorted(hashdates)
+
+    def test_empty_file_abort_lists_files_in_manifest_order(self, mhl_cli, tmp_path):
+        """
+        The empty-file abort is raised after the sort, so its [ERROR] lines read
+        in the same order the manifest would have — not in the filesystem's.
+        """
+        make_tree(tmp_path, {"zz.bin": b"", "Alpha/a.bin": b"", "ok.bin": b"data"})
+        rc, _, err = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+
+        assert rc != 0
+        assert re.findall(r"cannot seal empty file: (\S+)", err) == ["Alpha/a.bin", "zz.bin"]
+
     def test_manifest_paths_use_forward_slashes(self, mhl_cli, tmp_path):
         """Nested <file> entries are always forward-slash, never the native separator, so the manifest is portable
         regardless of the platform that sealed it. On Windows CI os.path.relpath yields backslashes, so this exercises

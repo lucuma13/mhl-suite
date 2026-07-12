@@ -26,10 +26,20 @@ from mhl_suite import __version__, hashing
 from mhl_suite.algorithms import NULL_TAG, classic_seal_algorithm, classic_seal_tag
 from mhl_suite.ignorelist import is_os_junk
 from mhl_suite.osutils import friendly_hostname, normalization_variant_on_disk
+from mhl_suite.sorting import sort_key
 
 
 class SealError(Exception):
     """A seal cannot proceed (bad arguments, unusable target, empty files). The message is CLI-ready stderr text."""
+
+
+def _relative_posix(path: str, base: str) -> str:
+    """
+    `path` relative to `base` with forward slashes, as the manifest and the sort
+    key both want it.
+    """
+    rel = os.path.relpath(path, base)
+    return rel.replace(os.sep, "/") if os.sep != "/" else rel
 
 
 # -----------------------------------------------------------------------------
@@ -44,8 +54,11 @@ def _iter_files_for_seal(
 ) -> Iterator[tuple[str, os.stat_result]]:
     """
     Walk `root` recursively and yield (absolute_path, stat_result) for every
-    file that should appear in the manifest, in deterministic sorted order.
-    Hidden files and directories (names starting with '.') are included.
+    file that should appear in the manifest. Hidden files and directories (names
+    starting with '.') are included.
+
+    The caller sorts the materialised result (mhl_suite.sorting.sort_key), so
+    this walk is deliberately order-agnostic.
 
     Skips:
       * OS-generated metadata (see mhl_suite.ignorelist), which the system
@@ -53,19 +66,16 @@ def _iter_files_for_seal(
       * the manifest file itself (so we don't hash what we're writing)
       * entries that disappear or stat-fail mid-walk
 
-    `on_skip`, if given, is called as on_skip(path, reason, is_warning) for
-    each skipped entry (except the manifest itself). is_warning is True for an
-    unreadable directory — a silently-dropped directory means media missing
-    from the manifest, so the caller surfaces it regardless of verbosity.
+    `on_skip`, if given, is called as on_skip(path, reason, is_warning) for each
+    skipped entry (except the manifest itself). is_warning is True for an
+    unreadable directory — a silently-dropped directory means media missing from
+    the manifest, so the caller surfaces it regardless of verbosity.
 
-    Implementation note: os.scandir rather than os.walk because DirEntry
-    caches the stat() info from getdents64, saving a syscall per file (~13%
-    faster on a 1000-file tree). Structured iteratively (stack-based) to avoid
-    Python's recursion limit on deeply nested shoots.
+    Implementation note: os.scandir rather than os.walk because DirEntry caches
+    the stat() info from getdents64, saving a syscall per file (~13% faster on a
+    1000-file tree). Structured iteratively (stack-based) to avoid Python's
+    recursion limit on deeply nested shoots.
     """
-    # Stack of directories yet to descend. Within each directory entries are
-    # sorted lexicographically and subdirectories explored depth-first in that
-    # same order — deterministic, though not globally sorted by full path.
     pending = [root]
 
     while pending:
@@ -80,10 +90,6 @@ def _iter_files_for_seal(
                 on_skip(current, f"unreadable: {exc.strerror or exc}", True)
             continue
 
-        entries.sort(key=lambda e: e.name)
-
-        # Two passes so files in this directory get yielded before recursing
-        # into subdirectories.
         subdirs: list[str] = []
         for entry in entries:
             if is_os_junk(entry.name):
@@ -108,8 +114,7 @@ def _iter_files_for_seal(
                     on_skip(entry.path, "vanished", False)
                 continue
 
-        # Push subdirs in reverse so popping gives lexicographic order.
-        pending.extend(reversed(subdirs))
+        pending.extend(subdirs)
 
 
 # -----------------------------------------------------------------------------
@@ -184,11 +189,7 @@ def _reject_empty_files(entries: "list[tuple[str, os.stat_result]]", root: str, 
     os.close(fd)
     os.unlink(mhl_path)
 
-    lines = []
-    for fp in empty:
-        rel = os.path.relpath(fp, root)
-        filename = rel.replace(os.sep, "/") if os.sep != "/" else rel
-        lines.append(f"[ERROR] cannot seal empty file: {filename}")
+    lines = [f"[ERROR] cannot seal empty file: {_relative_posix(fp, root)}" for fp in empty]
     lines.append("  Remove or exclude any empty files and retry.")
     raise SealError("\n".join(lines))
 
@@ -359,19 +360,36 @@ def seal_classic(root: str, algorithms: "list[str]", verbose: bool = False, outp
             suffix += 1
             mhl_path = os.path.join(output_dir, f"{base_name}_{timestamp_for_filename}_{suffix}.mhl")
 
+    # Buffered rather than printed as the walk hits them: the walk runs in
+    # filesystem order, so streaming these would report the same tree in a
+    # different order on every volume.
+    #
+    # Only what will actually be printed is kept. Warnings (one per unreadable
+    # directory) are bounded by the directory count and always shown. Per-entry
+    # skips are dropped unless -v asked for them, which matters on a card
+    # round-tripped through exFAT: an AppleDouble beside every file would
+    # otherwise buffer one string per file for output nobody requested.
+    skips: list[tuple[str, str, bool]] = []
+
     def _on_skip(path: str, reason: str, is_warning: bool) -> None:
-        rel = os.path.relpath(path, root)
-        rel_posix = rel.replace(os.sep, "/") if os.sep != "/" else rel
+        if is_warning or verbose:
+            skips.append((_relative_posix(path, root), reason, is_warning))
+
+    # Walk the tree first, then hash. Materialising the entry list lets files
+    # hash concurrently while the manifest is still emitted in sorted order.
+    entries = list(_iter_files_for_seal(root, mhl_path, on_skip=_on_skip))
+
+    for rel_posix, reason, is_warning in sorted(skips, key=lambda s: sort_key(s[0])):
         if is_warning:
             # Always shown: a dropped directory leaves files unprotected.
             sys.stderr.write(f"[WARNING] skipped: {rel_posix} ({reason})\n")
         elif verbose:
             print(f"[SKIP] {rel_posix} ({reason})")
 
-    # Walk the tree first (reporting skips as we go), then hash. Materialising
-    # the entry list lets files hash concurrently while the manifest is still
-    # emitted in deterministic walk order.
-    entries = list(_iter_files_for_seal(root, mhl_path, on_skip=_on_skip))
+    # The single sort of the run: it fixes hashing order and manifest order
+    # alike, and it precedes the empty-file check so that abort lists its files
+    # in the same order too.
+    entries.sort(key=lambda e: sort_key(_relative_posix(e[0], root)))
 
     # Refuse zero-byte files before any hashing; on abort this releases the
     # O_EXCL manifest fd claimed above.
@@ -397,9 +415,7 @@ def seal_classic(root: str, algorithms: "list[str]", verbose: bool = False, outp
             # so verify resolves them correctly; forward slashes per the MHL
             # spec, NFC-normalised so accented filenames round-trip across
             # macOS (NFD on disk) and Linux/Windows (NFC) alike.
-            rel_path = os.path.relpath(filepath, output_dir)
-            rel_path_posix = rel_path.replace(os.sep, "/") if os.sep != "/" else rel_path
-            rel_path_posix = unicodedata.normalize("NFC", rel_path_posix)
+            rel_path_posix = unicodedata.normalize("NFC", _relative_posix(filepath, output_dir))
 
             fh.write(_serialize(_hash_element(rel_path_posix, stat_result, xml_tags, file_digests, hashdate)))
             if verbose:

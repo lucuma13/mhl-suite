@@ -48,6 +48,7 @@ from mhl_suite import verify as verify_core
 from mhl_suite._exit_codes import ExitCode
 from mhl_suite.algorithms import ASC_FORMATS, asc_check
 from mhl_suite.osutils import resolve_on_disk
+from mhl_suite.sorting import sort_key
 from mhl_suite.verify import ErrorKind, FileRecord, Status, VerifyEntry, VerifyReport
 
 if TYPE_CHECKING:
@@ -514,7 +515,7 @@ def collect_recorded(history: History, ignore: IgnoreMatcher) -> list[Recorded]:
                 continue
             record, original, usable = resolved
             out.setdefault(top_rel, Recorded(path=top_rel, record=record, original=original, usable=usable))
-    return [out[path] for path in sorted(out)]
+    return [out[path] for path in sorted(out, key=sort_key)]
 
 
 def history_byte_total(history: History) -> int:
@@ -542,13 +543,14 @@ def scan_disk_files(
     on_unreadable: "Callable[[str, OSError], None] | None" = None,
 ) -> "Iterator[tuple[str, str, os.stat_result]]":
     """
-    Yield (rel, abs_path, lstat) for every non-ignored file under `root` —
-    the media-directory-relative posix path, the real on-disk absolute path,
-    and the entry's stat — post-order lexicographic (a stable report order,
-    shared with the reference tool). The stat comes from the scandir entry's
-    cache (the type check already paid for it), so the scan costs no extra
-    syscalls. Ignore patterns see directories with a trailing slash, as
-    gitignore matching expects; symlinked directories are not followed.
+    Yield (rel, abs_path, lstat) for every non-ignored file under `root` — the
+    media-directory-relative posix path, the real on-disk absolute path, and the
+    entry's stat — post-order, each directory's subtree ahead of that
+    directory's own files, names ordered by mhl_suite.sorting. The stat comes
+    from the scandir entry's cache (the type check already paid for it), so the
+    scan costs no extra syscalls. Ignore patterns see directories with a
+    trailing slash, as gitignore matching expects; symlinked directories are not
+    followed.
 
     `on_unreadable`, if given, is called as on_unreadable(rel_dir, exc) for a
     directory that cannot be scanned ('.' for the root itself) — a silently
@@ -558,7 +560,7 @@ def scan_disk_files(
 
     def walk(dir_path: str, rel_prefix: str) -> "Iterator[tuple[str, str, os.stat_result]]":
         try:
-            entries = sorted(os.scandir(dir_path), key=lambda e: e.name)
+            entries = sorted(os.scandir(dir_path), key=lambda e: sort_key(e.name))
         except OSError as exc:
             if on_unreadable is not None:
                 on_unreadable(rel_prefix.rstrip("/") or ".", exc)
