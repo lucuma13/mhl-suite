@@ -1046,6 +1046,27 @@ class TestLogHelpers:
         assert "hello" not in captured.out
         assert "hello" not in captured.err
 
+    def test_log_colours_a_stream_that_supports_it(self, monkeypatch, capsys):
+        """Colour reaches a stream supports_color approves of — a TTY, or FORCE_COLOR."""
+        monkeypatch.setattr(mhlver, "supports_color", lambda stream: True)
+        mhlver.log_error("boom")
+        assert f"{mhlver.RED}boom{mhlver.RESET}" in capsys.readouterr().err
+
+    def test_log_stays_plain_when_stream_lacks_colour(self, monkeypatch, capsys):
+        """Piped output (or NO_COLOR) must not be littered with escape sequences."""
+        monkeypatch.setattr(mhlver, "supports_color", lambda stream: False)
+        mhlver.log_error("boom")
+        err = capsys.readouterr().err
+        assert "boom" in err
+        assert "\033[" not in err
+
+    def test_log_honours_no_color_end_to_end(self, monkeypatch, capsys):
+        """The env var reaches the write; nothing is frozen at import time."""
+        monkeypatch.setenv("NO_COLOR", "1")
+        monkeypatch.setattr(mhlver.sys.stderr, "isatty", lambda: True)
+        mhlver.log_warning("careful")
+        assert "\033[" not in capsys.readouterr().err
+
     def test_emit_step_output_success_prints_to_stdout(self, capsys):
         """On exit_code==0 with show_on_terminal, output goes to stdout."""
         mhlver._emit_step_output("OK: file.bin", 0, show_on_terminal=True)

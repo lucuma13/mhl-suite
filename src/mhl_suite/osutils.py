@@ -12,7 +12,8 @@ Two concerns live here:
     normalization_variant_on_disk(): reconciling NFC/NFD filenames across
     normalization-sensitive filesystems.
   * Terminal display — to_terminal_sep(): the one place manifest paths are
-    rendered with the platform separator.
+    rendered with the platform separator; supports_color(): whether ANSI colour
+    should be written to a given stream.
 """
 
 import os
@@ -20,6 +21,7 @@ import platform
 import subprocess
 import sys
 import unicodedata
+from typing import Protocol
 
 # -----------------------------------------------------------------------------
 # Terminal display
@@ -33,6 +35,74 @@ import unicodedata
 def to_terminal_sep(text: str) -> str:
     """Convert forward slashes to the platform separator for terminal display; a no-op where os.sep is already '/'."""
     return text.replace("/", os.sep) if os.sep != "/" else text
+
+
+# Windows console handle IDs, keyed by the POSIX fd the stream wraps.
+_STD_HANDLE_BY_FD = {1: -11, 2: -12}  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+
+class TerminalStream(Protocol):
+    """
+    Structural type for the stream the colour check inspects.
+
+    Typing against the two methods actually called, rather than the concrete
+    TextIO, keeps the annotation honest about what is required and lets test
+    doubles conform without an Any escape hatch. sys.stdout / sys.stderr satisfy
+    it as they are.
+    """
+
+    def isatty(self) -> bool: ...
+
+    def fileno(self) -> int: ...
+
+
+def _enable_ansi(stream: TerminalStream) -> bool:
+    """Enable ANSI escape processing for `stream` on Windows 10+; a no-op on Unix.
+
+    Flips ENABLE_VIRTUAL_TERMINAL_PROCESSING on the stream's console handle so
+    VT-aware terminals render colour rather than echoing the escape sequences.
+    Returns True when ANSI is usable: always on Unix; on Windows only if the
+    stream is one of the two standard handles and the console mode call succeeds.
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes  # noqa: PLC0415 — Windows-only import, skipped entirely on Unix
+
+        handle_id = _STD_HANDLE_BY_FD.get(stream.fileno())
+        if handle_id is None:
+            return False
+        kernel32 = ctypes.windll.kernel32  # windll is Windows-only
+        handle = kernel32.GetStdHandle(handle_id)
+        mode = ctypes.c_ulong()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        kernel32.SetConsoleMode(handle, mode.value | _ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        return True
+    except (AttributeError, OSError, ValueError):  # no console attached, missing DLL, detached stream
+        return False
+
+
+def supports_color(stream: TerminalStream) -> bool:
+    """True when ANSI colour should be written to `stream`.
+
+    Follows the NO_COLOR / FORCE_COLOR conventions (https://no-color.org): a
+    non-empty NO_COLOR disables colour, else a non-empty FORCE_COLOR forces it,
+    else colour is used when the stream is a TTY and ANSI is available. Only a
+    non-empty value counts, so NO_COLOR="" leaves the decision to the TTY check.
+
+    Evaluated per call rather than cached at import so the environment is read
+    at the point of output, which also keeps it patchable from tests.
+    """
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    try:
+        return stream.isatty() and _enable_ansi(stream)
+    except Exception:  # noqa: BLE001 — the stream may be closed or replaced; stay monochrome
+        return False
 
 
 # -----------------------------------------------------------------------------

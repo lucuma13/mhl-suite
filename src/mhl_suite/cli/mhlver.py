@@ -33,7 +33,7 @@ from rich.text import Text
 
 from mhl_suite import __version__
 from mhl_suite.discovery import AscmhlHistory, DiscoveredItem, StatusLine, discover, verify_item
-from mhl_suite.osutils import normalization_variant_on_disk, to_terminal_sep
+from mhl_suite.osutils import normalization_variant_on_disk, supports_color, to_terminal_sep
 from mhl_suite.report import (
     ManifestResult,
     _open_report,
@@ -44,17 +44,17 @@ from mhl_suite.update_checker import run_with_update_check
 # -----------------------------------------------------------------------------
 # Terminal colours
 # -----------------------------------------------------------------------------
-# We deliberately suppress colour codes when stdout is not a TTY (e.g. piped
-# into a log file); otherwise the report file gets littered with raw ANSI escape
-# sequences. The check happens once at module load.
+# The codes are unconditional; whether they are actually emitted is decided per
+# write by osutils.supports_color(), which suppresses colour when the stream is
+# not a TTY (e.g. piped into a log file, which would otherwise be littered with
+# raw escape sequences) and honours NO_COLOR / FORCE_COLOR. Deciding per write
+# rather than once at import means the destination stream is the one consulted,
+# and the environment is read at the point of output.
 
-if sys.stdout.isatty():
-    RED = "\033[0;31m"
-    ORANGE = "\033[38;5;208m"
-    GREEN = "\033[0;32m"
-    RESET = "\033[0m"
-else:
-    RED = ORANGE = GREEN = RESET = ""
+RED = "\033[0;31m"
+ORANGE = "\033[38;5;208m"
+GREEN = "\033[0;32m"
+RESET = "\033[0m"
 
 
 # -----------------------------------------------------------------------------
@@ -99,8 +99,10 @@ def _log(
         # markup=False: filenames contain bracket sequences (e.g. "[26_163234]") that rich would misinterpret as markup
         # tags, causing bold artefacts. highlight=False: prevents rich auto-colouring numbers/paths.
         console.print(msg, markup=False, highlight=False)
-    else:
+    elif colour and stream is not None and supports_color(stream):
         print(f"{colour}{msg}{RESET}", file=stream)
+    else:
+        print(msg, file=stream)
 
 
 def log_success(
@@ -261,7 +263,11 @@ def _build_live() -> "tuple[Live, Progress, Text, Console]":
     visibility. This approach keeps the label line completely clean (no bar
     artefacts) and the bar line completely clean (no spinner).
     """
-    stdout_console = Console(file=sys.stdout, force_terminal=True)
+    # no_color is passed explicitly so the progress display answers to the same
+    # predicate as our own ANSI writes; rich's built-in NO_COLOR handling keys
+    # off the variable merely being present, which the convention says should
+    # not count when it is empty.
+    stdout_console = Console(file=sys.stdout, force_terminal=True, no_color=not supports_color(sys.stdout))
 
     label = Text()
     label.append("🔎 Verifying… ", style="bold")

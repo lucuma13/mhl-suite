@@ -1,5 +1,5 @@
 """
-Tests for mhl_suite.osutils — friendly_hostname and resolve_on_disk.
+Tests for mhl_suite.osutils — friendly_hostname, supports_color and resolve_on_disk.
 
 The CLI wiring that consumes the resolver (the "did you mean" not-found hint)
 lives with the CLI tests; the resolver tests here pin it against a simulated
@@ -8,6 +8,8 @@ normalization-sensitive filesystem.
 
 import os
 import unicodedata
+
+import pytest
 
 from mhl_suite import classic_seal as core_seal
 from mhl_suite import osutils
@@ -58,10 +60,12 @@ class TestFriendlyHostname:
         assert osutils.friendly_hostname() == "unknown"
 
     def test_scutil_decoded_as_utf8_regardless_of_locale(self, monkeypatch):
-        """scutil output must be decoded as UTF-8, not via the (possibly ASCII)
+        """
+        scutil output must be decoded as UTF-8, not via the (possibly ASCII)
         locale — otherwise a ComputerName with a curly apostrophe, accent, or
-        emoji would raise UnicodeDecodeError under LANG=C. A non-ASCII name
-        must round-trip intact."""
+        emoji would raise UnicodeDecodeError under LANG=C. A non-ASCII name must
+        round-trip intact.
+        """
         captured: dict = {}
 
         def fake_run(*a, **kw):
@@ -95,7 +99,10 @@ class TestToTerminalSep:
     """
 
     def test_forward_slashes_become_native_separator(self, monkeypatch):
-        """On Windows, forward slashes are rewritten to backward slashes for display."""
+        """
+        On Windows, forward slashes are rewritten to backward slashes for
+        display.
+        """
         monkeypatch.setattr(osutils.os, "sep", "\\")
         assert osutils.to_terminal_sep("[OK] sub/b.bin") == "[OK] sub\\b.bin"
 
@@ -103,6 +110,69 @@ class TestToTerminalSep:
         """Where os.sep is already '/', the text is returned unchanged."""
         monkeypatch.setattr(osutils.os, "sep", "/")
         assert osutils.to_terminal_sep("[OK] sub/b.bin") == "[OK] sub/b.bin"
+
+
+class FakeStream:
+    """A TerminalStream double: a TTY or not, with an optionally exploding isatty."""
+
+    def __init__(self, *, tty: bool = True, isatty_raises: bool = False):
+        self._tty = tty
+        self._isatty_raises = isatty_raises
+
+    def isatty(self) -> bool:
+        if self._isatty_raises:
+            raise ValueError("I/O operation on closed file")
+        return self._tty
+
+    def fileno(self) -> int:
+        return 1
+
+
+class TestSupportsColor:
+    """
+    supports_color decides whether ANSI codes reach a stream. It is the suite's
+    single answer to that question, so a piped run stays free of escape
+    sequences and the operator's NO_COLOR / FORCE_COLOR is honoured everywhere.
+    """
+
+    @pytest.mark.parametrize(
+        ("env", "tty", "expected"),
+        [
+            ({}, True, True),
+            ({}, False, False),
+            ({"NO_COLOR": "1"}, True, False),
+            ({"FORCE_COLOR": "1"}, False, True),
+            ({"NO_COLOR": "1", "FORCE_COLOR": "1"}, True, False),  # NO_COLOR wins
+            ({"NO_COLOR": ""}, True, True),  # the convention: only a non-empty value counts
+        ],
+    )
+    def test_follows_no_color_and_force_color(self, monkeypatch, env, tty, expected):
+        """
+        no-color.org: NO_COLOR disables, FORCE_COLOR forces, otherwise the TTY
+        decides.
+        """
+        for var in ("NO_COLOR", "FORCE_COLOR"):
+            monkeypatch.delenv(var, raising=False)
+        for var, value in env.items():
+            monkeypatch.setenv(var, value)
+        monkeypatch.setattr(osutils, "_enable_ansi", lambda stream: True)
+        assert osutils.supports_color(FakeStream(tty=tty)) is expected
+
+    def test_false_when_ansi_cannot_be_enabled(self, monkeypatch):
+        """
+        A TTY that will not take VT processing (an old Windows console) stays
+        monochrome.
+        """
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+        monkeypatch.setattr(osutils, "_enable_ansi", lambda stream: False)
+        assert osutils.supports_color(FakeStream(tty=True)) is False
+
+    def test_false_when_isatty_raises(self, monkeypatch):
+        """A closed or replaced stream must not take the caller down with it."""
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+        assert osutils.supports_color(FakeStream(isatty_raises=True)) is False
 
 
 class TestResolveOnDisk:
@@ -201,15 +271,19 @@ class TestResolveOnDisk:
         assert osutils.resolve_on_disk(self._BASE, "ghost.txt", {}) is None
 
     def test_unreadable_directory_returns_none(self, monkeypatch):
-        """When an intermediate component is not a scannable directory, scandir
-        raises OSError and resolution returns None (treated as missing)."""
+        """
+        When an intermediate component is not a scannable directory, scandir
+        raises OSError and resolution returns None (treated as missing).
+        """
         # 'sub' exists as a leaf (file), so scandir(base/sub) raises OSError.
         self._patch(monkeypatch, {self._BASE, os.path.join(self._BASE, "sub")})
         assert osutils.resolve_on_disk(self._BASE, os.path.join("sub", "child.txt"), {}) is None
 
     def test_empty_and_curdir_components_are_skipped(self, monkeypatch):
-        """Leading './' and doubled separators yield empty / os.curdir path
-        components, which must be skipped without affecting resolution."""
+        """
+        Leading './' and doubled separators yield empty / os.curdir path
+        components, which must be skipped without affecting resolution.
+        """
         leaf = os.path.join(self._BASE, "text.txt")
         self._patch(monkeypatch, {self._BASE, leaf})
         # rel_path like "./text.txt" → split gives [os.curdir, "text.txt"].
@@ -217,8 +291,10 @@ class TestResolveOnDisk:
         assert osutils.resolve_on_disk(self._BASE, rel, {}) == leaf
 
     def test_dir_index_caches_scandir_per_directory(self, monkeypatch):
-        """Two files in the same NFD directory, addressed via NFC, must scan
-        that directory only once (cached in dir_index across resolutions)."""
+        """
+        Two files in the same NFD directory, addressed via NFC, must scan that
+        directory only once (cached in dir_index across resolutions).
+        """
         f1 = os.path.join(self._BASE, self._NFD, "a.txt")
         f2 = os.path.join(self._BASE, self._NFD, "b.txt")
         existing = {self._BASE, os.path.join(self._BASE, self._NFD), f1, f2}
