@@ -74,6 +74,9 @@ build.targets.sdist.include = [ "/src/mhl_suite/", "/tests/" ]
 build.targets.sdist.exclude = [ "/.github/" ]
 
 [tool.uv]
+# ascmhl (dev-only) pins Click~=8.1.7, vulnerable to CVE-2026-7246, so we
+# override.
+override-dependencies = [ "click>=8.3.3" ]
 managed = true
 
 [tool.ruff]
