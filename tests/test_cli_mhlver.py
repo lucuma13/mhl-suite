@@ -900,6 +900,7 @@ class TestAscMhlAppendOnVerify:
         assert len(self._generations(root)) == outer_before + 1
         assert len(self._generations(root / "pkg")) == inner_before + 1
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
     def test_unwritable_history_reports_but_never_exits_zero(self, tmp_path):
         pkg = make_package(tmp_path / "pkg", {"a.mov": b"x" * 100})
         emitted = []

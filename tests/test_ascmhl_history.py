@@ -21,6 +21,7 @@ covering spec-conformant XML no generator here can produce):
 
 import glob
 import re
+import sys
 import types
 from pathlib import Path
 
@@ -278,6 +279,7 @@ class TestVerifyPackage:
         assert report.code == 0
         assert statuses(report)["renamed.txt"] == "ok"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
     def test_unreadable_directory_is_reported_not_silenced(self, package):
         """
         A directory that cannot be scanned during new-file detection surfaces

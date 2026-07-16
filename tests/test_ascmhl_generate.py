@@ -8,6 +8,7 @@ library read and extend packages we generated.
 """
 
 import re
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -341,6 +342,7 @@ class TestSealAppend:
         with pytest.raises(ascmhl_history.NoChainError):
             generate_ascmhl(root, GenerateOptions())
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
     def test_read_only_history_reports_write_failure_not_crash(self, tmp_path):
         root = tmp_path / "card"
         make_tree(root, {"a.txt": b"x"})

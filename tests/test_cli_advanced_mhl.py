@@ -52,7 +52,9 @@ class TestGenerate:
         make_tree(root, {"Clips/a.mov": b"aa"})
         rc, out, _ = ascmhl_cli(["generate", "-v", root])
         assert rc == 0
-        assert "[NEW] Clips/a.mov" in out
+        # The CLI renders recorded (POSIX-slash) paths with the platform
+        # separator for the terminal (to_terminal_sep).
+        assert f"[NEW] {os.path.join('Clips', 'a.mov')}" in out
         assert "Created new generation:" in out
 
     def test_algorithm_selection_and_rejection(self, ascmhl_cli, tmp_path):
