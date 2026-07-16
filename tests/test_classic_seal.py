@@ -647,8 +647,8 @@ class TestSealUnicodeCollisionGuard:
     def test_seal_passes_distinct_accented_names(self, mhl_cli, tmp_path):
         """The guard keys on canonical identity, not on accents: two genuinely
         different accented names seal fine."""
-        (tmp_path / self._NFD).write_bytes(b"one")
-        (tmp_path / "ros\u00e9.txt").write_bytes(b"two")
+        (tmp_path / self._NFD).write_bytes(b"one")  # e + combining acute (NFD)
+        (tmp_path / "ros\u00e8.txt").write_bytes(b"two")  # precomposed e-grave: a different canonical name
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
         assert len(list(tmp_path.glob("*.mhl"))) == 1

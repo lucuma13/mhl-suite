@@ -202,6 +202,10 @@ def seal_context(path: str) -> dict[str, str]:
 def _volume_filesystem(path: str) -> "tuple[str | None, str | None]":
     """(filesystem type, mount point) of the volume holding `path`, best effort."""
     try:
+        # A path that doesn't exist has no volume: report nothing rather than
+        # guess. (Linux's mount-table prefix match would otherwise answer for
+        # any string — "/" matches everything.)
+        os.stat(path)
         if sys.platform == "darwin":
             return _statfs_typename_darwin(path)
         if os.name == "nt":

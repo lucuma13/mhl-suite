@@ -353,8 +353,10 @@ class TestGenerateUnicodeCollisionGuard:
 
         class _Listing(list):
             """
-            os.scandir result double: iterable and a context manager, so it
-            serves both `list(os.scandir(d))` and os.walk's `with` form.
+            os.scandir result double: iterable, iterator, and a context
+            manager, so it serves `list(os.scandir(d))`, os.walk's `with`
+            form, and the bare next() calls os.walk makes on Python <= 3.11
+            (3.12+ iterates with a for loop instead).
             """
 
             def __enter__(self):
@@ -362,6 +364,11 @@ class TestGenerateUnicodeCollisionGuard:
 
             def __exit__(self, *exc):
                 return False
+
+            def __next__(self):
+                if not hasattr(self, "_it"):
+                    self._it = iter(list(self))
+                return next(self._it)
 
         def twin_scandir(d):
             entries = _Listing(real_scandir(d))
