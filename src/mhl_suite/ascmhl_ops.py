@@ -56,7 +56,7 @@ from mhl_suite.ascmhl_history import (
     resolve_hashes,
     walk_disk_files,
 )
-from mhl_suite.osutils import resolve_on_disk
+from mhl_suite.osutils import resolve_on_disk, seal_context
 from mhl_suite.sorting import sort_key
 from mhl_suite.verify import HashComparison, Status, VerifyEntry, VerifyReport
 
@@ -299,6 +299,7 @@ def rename_ascmhl(old_path: "str | Path", new_path: "str | Path") -> "tuple[Path
         ignore_patterns=list(dict.fromkeys([*history.latest_ignore_patterns(), *DEFAULT_IGNORE_PATTERNS])),
         files=files,
         directories=directories,
+        seal_context=seal_context(os.fspath(history_root)),
     )
     manifest_path = _append_generation(history, manifest, op_start)
     code = ExitCode.HASH_MISMATCH if any(e.status == Status.MISMATCH for e in entries) else ExitCode.OK
@@ -437,6 +438,9 @@ def flatten_ascmhl(root_path: "str | Path", destination: "str | Path") -> "tuple
         process="flatten",
         ignore_patterns=list(dict.fromkeys([*history.latest_ignore_patterns(), *DEFAULT_IGNORE_PATTERNS])),
         files=sorted(files, key=lambda f: f.path),
+        # Context of the *source* history's volume — the packing list's paths
+        # were read there, not at the destination it is written to.
+        seal_context=seal_context(os.fspath(history.root)),
     )
     write_manifest(packinglist, manifest)
 

@@ -24,7 +24,12 @@ from lxml import etree
 from mhl_suite import __version__, hashing
 from mhl_suite.algorithms import NULL_TAG, classic_seal_algorithm, classic_seal_tag
 from mhl_suite.ignorelist import is_os_junk
-from mhl_suite.osutils import colliding_identity_groups, friendly_hostname, normalization_variant_on_disk
+from mhl_suite.osutils import (
+    colliding_identity_groups,
+    friendly_hostname,
+    normalization_variant_on_disk,
+    seal_context,
+)
 from mhl_suite.sorting import sort_key
 
 
@@ -265,8 +270,12 @@ def _serialize(element: "etree._Element", indent: str = "  ") -> bytes:
     return "".join(f"{indent}{line}\n" for line in text.splitlines()).encode("utf-8")
 
 
-def _creatorinfo_element(tool: str, iso_now: str) -> "etree._Element":
-    """The <creatorinfo> block; finishdate carries the fixed-width placeholder."""
+def _creatorinfo_element(tool: str, iso_now: str, log: str = "") -> "etree._Element":
+    """
+    The <creatorinfo> block; finishdate carries the fixed-width placeholder.
+    `log` fills the schema's optional free-string <log> element (last in the
+    sequence) — the classic dialect's only sanctioned slot for seal context.
+    """
     info = etree.Element("creatorinfo")
     for tag, value in [
         ("username", getpass.getuser()),
@@ -276,17 +285,19 @@ def _creatorinfo_element(tool: str, iso_now: str) -> "etree._Element":
         ("finishdate", _FINISHDATE_PLACEHOLDER),
     ]:
         etree.SubElement(info, tag).text = value
+    if log:
+        etree.SubElement(info, "log").text = log
     return info
 
 
-def _write_header(fh: BinaryIO, iso_now: str) -> int:
+def _write_header(fh: BinaryIO, iso_now: str, log: str = "") -> int:
     """
     Write the manifest prologue (declaration, <hashlist>, creatorinfo) and
     return the byte offset of the finishdate placeholder so the caller can
     patch it once hashing completes.
     """
     fh.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<hashlist version="1.1">\n')
-    info_bytes = _serialize(_creatorinfo_element(f"simple-mhl {__version__}", iso_now))
+    info_bytes = _serialize(_creatorinfo_element(f"simple-mhl {__version__}", iso_now, log))
     placeholder_at = fh.tell() + info_bytes.index(_FINISHDATE_PLACEHOLDER.encode("ascii"))
     fh.write(info_bytes)
     return placeholder_at
@@ -431,10 +442,15 @@ def seal_classic(root: str, algorithms: "list[str]", verbose: bool = False, outp
     else:
         digests = _hash_files(paths, [st.st_size for _, st in entries], algorithms)
 
+    # Seal context (OS, kernel, source filesystem/driver) into the schema's
+    # free-string <log>: the recorded byte form of a name is only as
+    # meaningful as the filesystem that reported it.
+    context_log = "; ".join(f"{key}={value}" for key, value in seal_context(root).items())
+
     # Stream the manifest through the fd we already hold from the O_EXCL open
     # (never re-opening by path, which would be another race window).
     with os.fdopen(fd, "r+b") as fh:
-        finishdate_at = _write_header(fh, iso_now)
+        finishdate_at = _write_header(fh, iso_now, context_log)
 
         for (filepath, stat_result), (file_digests, hashdate) in zip(entries, digests, strict=True):
             # Paths are relative to the manifest's own directory (output_dir) so

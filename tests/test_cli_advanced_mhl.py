@@ -193,6 +193,32 @@ class TestSchemaCheck:
         assert err
 
 
+class TestSealContextMetadata:
+    """
+    Every generation records where its byte-verbatim paths came from — OS,
+    kernel, source volume filesystem — as a namespaced mhls:sealcontext
+    element inside the hashlist-level <metadata> slot (the schema's anyType
+    wildcard, so the manifest stays valid against the official XSD and other
+    readers skip it as unknown vendor metadata).
+    """
+
+    def test_generation_records_namespaced_sealcontext(self, ascmhl_cli, tmp_path):
+        root = generated_tree(ascmhl_cli, tmp_path, {"a.txt": b"x"})
+        manifest = next((root / "ascmhl").glob("*.mhl"))
+        text = manifest.read_text(encoding="utf-8")
+        assert 'xmlns:mhls="urn:mhl-suite:sealcontext:1"' in text
+        assert "mhls:sealcontext" in text
+        assert 'os="' in text
+        assert 'kernel="' in text
+        # And the manifest still validates against the official ASC XSD.
+        assert ascmhl_cli(["xsd-schema-check", manifest])[0] == 0
+
+    def test_own_reader_ignores_the_metadata(self, ascmhl_cli, tmp_path):
+        root = generated_tree(ascmhl_cli, tmp_path, {"a.txt": b"x"})
+        rc, out, err = ascmhl_cli(["check", root])
+        assert (rc, out, err) == (0, "", "")
+
+
 class TestSmartDispatch:
     def test_bare_directory_without_history_generates(self, ascmhl_cli, tmp_path):
         root = tmp_path / "card"

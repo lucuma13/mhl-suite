@@ -343,6 +343,46 @@ class TestResolveOnDisk:
         assert osutils.resolve_on_disk(self._BASE, rel, {}) == nfd_file
 
 
+class TestSealContext:
+    """
+    seal_context gathers the OS/volume facts a seal records for name-form
+    provenance. Platform probes are best effort — assertions here stay to
+    what must hold on any supported host, plus unit tests of the macOS
+    mount-table parse against canned output.
+    """
+
+    def test_host_facts_present_and_lowercase_filesystem(self, tmp_path):
+        context = osutils.seal_context(str(tmp_path))
+        assert context.get("os")
+        assert context.get("kernel")
+        # The filesystem probe works on every platform we ship for; the field
+        # is normalized to lowercase (statfs and Windows disagree on casing).
+        assert context.get("filesystem")
+        assert context["filesystem"] == context["filesystem"].lower()
+
+    def test_unresolvable_path_still_reports_host(self):
+        context = osutils.seal_context(os.path.join(os.sep, "definitely", "not", "a", "path"))
+        assert context.get("os")
+        assert context.get("kernel")
+        assert "filesystem" not in context
+
+    def test_fskit_mount_detected_from_mount_table(self, monkeypatch):
+        table = (
+            "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)\n"
+            "/dev/disk6s1 on /Volumes/CARD (exfat, local, nodev, nosuid, noatime, fskit, mounted by tash)\n"
+        )
+        monkeypatch.setattr(osutils, "_mount_table", lambda: table)
+        assert osutils._is_fskit_mount("/Volumes/CARD") is True
+        assert osutils._is_fskit_mount("/System/Volumes/Data") is False
+        assert osutils._is_fskit_mount("/Volumes/ELSEWHERE") is False
+
+    def test_fskit_flag_requires_exact_option_not_substring(self, monkeypatch):
+        """A volume named like the flag must not trip the option match."""
+        table = "/dev/disk9s1 on /Volumes/X (exfat, local, fskitten, mounted by tash)\n"
+        monkeypatch.setattr(osutils, "_mount_table", lambda: table)
+        assert osutils._is_fskit_mount("/Volumes/X") is False
+
+
 class TestCollidingIdentityGroups:
     """
     colliding_identity_groups — the seal-time guard's core: names one NFC

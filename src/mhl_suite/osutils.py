@@ -6,8 +6,10 @@ Portable wrappers over platform-specific quirks, shared by both simple_mhl
 drift. Not part of the public API — the public surface of mhl-suite is the
 simple-mhl and mhlver CLIs.
 
-Two concerns live here:
+The concerns that live here:
   * Host identity — friendly_hostname(): the human-facing machine name.
+  * Seal context — seal_context(): the OS and source-volume facts a seal
+    records into its manifest (name-form provenance).
   * Unicode path resolution — resolve_on_disk() /
     normalization_variant_on_disk() / colliding_identity_groups(): reconciling
     NFC/NFD filenames across normalization-sensitive filesystems.
@@ -16,6 +18,7 @@ Two concerns live here:
     should be written to a given stream.
 """
 
+import functools
 import os
 import platform
 import subprocess
@@ -144,6 +147,175 @@ def friendly_hostname() -> str:
         except (OSError, subprocess.SubprocessError):
             pass
     return platform.node() or "unknown"
+
+
+# -----------------------------------------------------------------------------
+# Seal context
+#
+# OS and source-volume facts a seal records alongside its hashes. The recorded
+# byte form of a filename is only as meaningful as the filesystem that reported
+# it — e.g. the macOS 26 FSKit exFAT driver reports composable names (é-class)
+# in its own decomposed dialect whichever form is on disk, though singleton
+# codepoints such as U+212B pass through verbatim, while ext4 reports literal
+# disk bytes — so the manifest carries where its paths came from. Best effort
+# throughout: a field that cannot be determined is omitted, and nothing here
+# may abort a seal.
+# -----------------------------------------------------------------------------
+
+
+def seal_context(path: str) -> dict[str, str]:
+    """
+    The seal-context fields for the volume holding `path`, in recording order:
+    'os' (marketing name and version), 'kernel' (uname system + release),
+    'filesystem' (the volume's filesystem type as mounted, lowercase — the
+    protocol name for network/shared mounts, e.g. "smbfs"), and on macOS
+    'driver' ("fskit" when the volume is mounted through an FSKit module —
+    the driver generation is part of name provenance, since each ships its
+    own Unicode handling).
+
+    Classic seals flatten this into the creatorinfo <log> line; ASC-MHL seals
+    record it as a namespaced element in the hashlist <metadata> slot.
+    """
+    context: dict[str, str] = {}
+    system = platform.system()
+    if system == "Darwin":
+        context["os"] = f"macOS {platform.mac_ver()[0]}".strip()
+    elif system == "Windows":
+        context["os"] = f"Windows {platform.release()}".strip()
+    elif system == "Linux":
+        try:
+            context["os"] = platform.freedesktop_os_release().get("PRETTY_NAME") or "Linux"
+        except OSError:
+            context["os"] = "Linux"
+    elif system:
+        context["os"] = system
+    if system:
+        context["kernel"] = f"{system} {platform.release()}".strip()
+    filesystem, mount_point = _volume_filesystem(path)
+    if filesystem:
+        context["filesystem"] = filesystem.lower()
+    if sys.platform == "darwin" and mount_point and _is_fskit_mount(mount_point):
+        context["driver"] = "fskit"
+    return context
+
+
+def _volume_filesystem(path: str) -> "tuple[str | None, str | None]":
+    """(filesystem type, mount point) of the volume holding `path`, best effort."""
+    try:
+        if sys.platform == "darwin":
+            return _statfs_typename_darwin(path)
+        if os.name == "nt":
+            return _volume_info_windows(path)
+        if sys.platform.startswith("linux"):
+            return _proc_mounts_linux(path)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None, None
+
+
+def _statfs_typename_darwin(path: str) -> "tuple[str | None, str | None]":
+    """f_fstypename and f_mntonname from statfs(2) — the API `mount` itself uses."""
+    import ctypes  # noqa: PLC0415 — platform-specific, imported only on the branch that needs it
+
+    class Statfs(ctypes.Structure):
+        # struct statfs, sys/mount.h (64-bit inode layout, the only one on
+        # current macOS; MFSTYPENAMELEN=16, MAXPATHLEN=1024).
+        _fields_ = [
+            ("f_bsize", ctypes.c_uint32),
+            ("f_iosize", ctypes.c_int32),
+            ("f_blocks", ctypes.c_uint64),
+            ("f_bfree", ctypes.c_uint64),
+            ("f_bavail", ctypes.c_uint64),
+            ("f_files", ctypes.c_uint64),
+            ("f_ffree", ctypes.c_uint64),
+            ("f_fsid", ctypes.c_int32 * 2),
+            ("f_owner", ctypes.c_uint32),
+            ("f_type", ctypes.c_uint32),
+            ("f_flags", ctypes.c_uint32),
+            ("f_fssubtype", ctypes.c_uint32),
+            ("f_fstypename", ctypes.c_char * 16),
+            ("f_mntonname", ctypes.c_char * 1024),
+            ("f_mntfromname", ctypes.c_char * 1024),
+            ("f_flags_ext", ctypes.c_uint32),
+            ("f_reserved", ctypes.c_uint32 * 7),
+        ]
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    # x86_64 exposes the 64-bit-inode variant under a decorated symbol;
+    # arm64 has only the plain name.
+    statfs = getattr(libc, "statfs$INODE64", None) or libc.statfs
+    buf = Statfs()
+    if statfs(os.fsencode(os.path.abspath(path)), ctypes.byref(buf)) != 0:
+        return None, None
+    return buf.f_fstypename.decode("ascii", "replace") or None, os.fsdecode(buf.f_mntonname) or None
+
+
+def _proc_mounts_linux(path: str) -> "tuple[str | None, str | None]":
+    """Filesystem type from /proc/self/mounts, by longest mount-point prefix."""
+    real = os.path.realpath(path)
+    best_mount, best_type = "", None
+    with open("/proc/self/mounts", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                _device, mount, fstype = line.split()[:3]
+            except ValueError:
+                continue
+            # The kernel octal-escapes whitespace and backslashes in mount points.
+            mount = mount.replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\")
+            if (real == mount or real.startswith(mount.rstrip("/") + "/")) and len(mount) > len(best_mount):
+                best_mount, best_type = mount, fstype
+    return best_type, best_mount or None
+
+
+def _volume_info_windows(path: str) -> "tuple[str | None, str | None]":
+    """Filesystem name from GetVolumeInformationW on the path's volume root."""
+    if os.name != "nt":  # caller-checked; repeated here so windll narrows
+        return None, None
+    import ctypes  # noqa: PLC0415 — platform-specific, imported only on the branch that needs it
+
+    kernel32 = ctypes.windll.kernel32  # windll is Windows-only
+    root = ctypes.create_unicode_buffer(261)
+    if not kernel32.GetVolumePathNameW(os.path.abspath(path), root, 261):
+        return None, None
+    name = ctypes.create_unicode_buffer(64)
+    if not kernel32.GetVolumeInformationW(root, None, 0, None, None, None, name, 64):
+        return None, root.value or None
+    return name.value or None, root.value or None
+
+
+def _is_fskit_mount(mount_point: str) -> bool:
+    """
+    True when the macOS mount table lists the volume with the `fskit` option —
+    e.g. `/dev/disk6s1 on /Volumes/CARD (exfat, local, ..., fskit, mounted by
+    tash)`. The distinction matters for name provenance: the FSKit and kext
+    generations of the same filesystem driver render Unicode names differently.
+    """
+    marker = f" on {mount_point} ("
+    for line in _mount_table().splitlines():
+        if marker in line:
+            options = line.rsplit("(", 1)[-1].rstrip(")")
+            return "fskit" in {opt.strip() for opt in options.split(",")}
+    return False
+
+
+def _mount_table() -> str:
+    """The `mount` listing, fetched once per process (see _cached_mount_table)."""
+    return _cached_mount_table()
+
+
+@functools.lru_cache(maxsize=1)
+def _cached_mount_table() -> str:
+    try:
+        return subprocess.run(
+            ["/sbin/mount"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 # -----------------------------------------------------------------------------

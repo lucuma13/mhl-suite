@@ -569,6 +569,41 @@ class TestSealConcurrency:
         assert probed == [1], "the default must probe the disk to decide"
 
 
+class TestSealContextLog:
+    """
+    Each seal records where its byte-verbatim paths came from — OS, kernel, and
+    the source volume's filesystem — in creatorinfo's optional <log> element, as
+    `key=value;` pairs. The recorded byte form of a name is only as meaningful
+    as the filesystem that reported it.
+    """
+
+    def test_seal_records_context_in_log(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"a.bin": b"data"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        assert rc == 0
+
+        text = next(tmp_path.glob("*.mhl")).read_text(encoding="utf-8")
+        log = re.search(r"<log>(.*?)</log>", text)
+        assert log is not None
+        assert "os=" in log.group(1)
+        assert "kernel=" in log.group(1)
+
+    def test_manifest_with_log_is_xsd_valid(self, mhl_cli, tmp_path):
+        make_tree(tmp_path, {"a.bin": b"data"})
+        mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        rc, _, err = mhl_cli(["xsd-schema-check", str(next(tmp_path.glob("*.mhl")))])
+        assert rc == 0, err
+
+    def test_context_failure_never_aborts_a_seal(self, mhl_cli, tmp_path, monkeypatch):
+        """Context is best effort: if nothing can be gathered, the seal
+        proceeds and simply omits <log>."""
+        monkeypatch.setattr(core_seal, "seal_context", lambda path: {})
+        make_tree(tmp_path, {"a.bin": b"data"})
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        assert rc == 0
+        assert "<log>" not in next(tmp_path.glob("*.mhl")).read_text(encoding="utf-8")
+
+
 class TestSealUnicodeCollisionGuard:
     """
     Two walked names sharing one NFC identity abort the seal before hashing: the

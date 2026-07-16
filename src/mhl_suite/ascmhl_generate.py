@@ -55,7 +55,12 @@ from mhl_suite.ascmhl_history import (
     load_history,
     parse_chain,
 )
-from mhl_suite.osutils import colliding_identity_groups, friendly_hostname, normalization_variant_on_disk
+from mhl_suite.osutils import (
+    colliding_identity_groups,
+    friendly_hostname,
+    normalization_variant_on_disk,
+    seal_context,
+)
 from mhl_suite.sorting import sort_key
 from mhl_suite.verify import ErrorKind, HashComparison, Status, VerifyEntry, VerifyReport
 
@@ -126,6 +131,10 @@ class ManifestOut:
     files: "list[FileEntryOut]" = field(default_factory=list)
     directories: "list[DirEntryOut]" = field(default_factory=list)
     references: "list[tuple[str, str]]" = field(default_factory=list)  # (rel path, c4)
+    # osutils.seal_context of the source history's volume — recorded into the
+    # hashlist <metadata> slot so the manifest carries where its byte-verbatim
+    # paths came from (empty → the element is omitted).
+    seal_context: "dict[str, str]" = field(default_factory=dict)
 
 
 # -----------------------------------------------------------------------------
@@ -190,6 +199,22 @@ def _creatorinfo_element(creation_date: str) -> "etree._Element":
     return info
 
 
+# Our namespace for the hashlist-level <metadata> slot (MetadataType is an
+# anyType wildcard — the schema's sanctioned extension point). Namespaced so it
+# can never collide with another vendor's metadata, and validates where bare
+# foreign elements (e.g. ShotPut's preIngestPath inside <hash>) do not.
+_SEALCONTEXT_NS = "urn:mhl-suite:sealcontext:1"
+
+
+def _metadata_element(context: "dict[str, str]") -> "etree._Element":
+    """The <metadata> block: one mhls:sealcontext element, fields as attributes."""
+    metadata = etree.Element("metadata")
+    seal = etree.SubElement(metadata, f"{{{_SEALCONTEXT_NS}}}sealcontext", nsmap={"mhls": _SEALCONTEXT_NS})
+    for key, value in context.items():
+        seal.set(key, value)
+    return metadata
+
+
 def _processinfo_element(manifest: ManifestOut) -> "etree._Element":
     info = etree.Element("processinfo")
     etree.SubElement(info, "process").text = manifest.process
@@ -241,6 +266,8 @@ def write_manifest(file_path: "str | Path", manifest: ManifestOut) -> None:
         fh.write(_serialize(_creatorinfo_element(manifest.creation_date)))
         fh.write(_serialize(_processinfo_element(manifest)))
         _write_hashes(fh, manifest)
+        if manifest.seal_context:
+            fh.write(_serialize(_metadata_element(manifest.seal_context)))
         if manifest.references:
             fh.write(b"  <references>\n")
             for rel_path, c4_digest in manifest.references:
@@ -829,6 +856,7 @@ def _assemble_level(
         files=files,
         directories=dir_records,
         references=references,
+        seal_context=seal_context(os.fspath(level.history.root)),
     )
     _write_generation(level, manifest, op_start, result)
     return dir_failed
