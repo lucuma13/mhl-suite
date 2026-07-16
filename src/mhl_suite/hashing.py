@@ -391,6 +391,39 @@ def _probe_slots(paths: list[str], sizes: list[int], stream_count: int) -> "list
     return slots
 
 
+class _StabilityWatch:
+    """
+    Decides, from a series of (now, total bytes read) samples, whether an
+    aggregate has stopped ramping.
+
+    Samples are folded into consecutive sub-windows of
+    _AUTO_PROBE_WINDOW_SECONDS (anything arriving sooner is ignored — a shorter
+    window measures scheduling noise, not throughput). Two adjacent windows
+    whose rates agree within _AUTO_PROBE_STABLE_TOLERANCE mean the streams have
+    plateaued and the sample is already representative. A ramp (each window
+    faster than the last) or a noisy aggregate never agrees.
+    """
+
+    def __init__(self) -> None:
+        self._prev_rate = 0.0
+        self._win_t = 0.0
+        self._win_bytes = 0
+
+    def stable(self, now: float, nbytes: int) -> bool:
+        if not self._win_t:
+            self._win_t, self._win_bytes = now, nbytes
+            return False
+        if now - self._win_t < _AUTO_PROBE_WINDOW_SECONDS:
+            return False
+        rate = (nbytes - self._win_bytes) / (now - self._win_t)
+        agreed = bool(self._prev_rate) and abs(rate - self._prev_rate) <= _AUTO_PROBE_STABLE_TOLERANCE * max(
+            rate, self._prev_rate
+        )
+        self._prev_rate = rate
+        self._win_t, self._win_bytes = now, nbytes
+        return agreed
+
+
 def _probe_read_bw_multi(slots: "list[tuple[str, int]]", stream_count: int) -> float:
     """
     Aggregate read bandwidth (bytes/sec) reading `stream_count` slots — (path,
@@ -440,31 +473,20 @@ def _probe_read_bw_multi(slots: "list[tuple[str, int]]", stream_count: int) -> f
         futs = [ex.submit(_one, slot) for slot in slots[:n]]
         # Stability watch: the wall floor exists only to outlast a NAS's
         # multi-second TCP/SMB ramp on fresh streams. Once the byte floor is
-        # met, sample the aggregate in consecutive sub-windows; two adjacent
-        # windows agreeing within tolerance mean the streams are not ramping
-        # and the sample is already representative → signal the streams to
-        # stop. A ramping (later window faster) or noisy aggregate never
-        # agrees and reads on to the floors/deadline exactly as before.
-        prev_rate = 0.0
-        win_t = 0.0
-        win_bytes = 0
+        # met, feed the aggregate to the watch; the moment it reports a
+        # plateau the sample is already representative → signal the streams to
+        # stop. A ramping or noisy aggregate never reports one and reads on to
+        # the floors/deadline exactly as before.
+        watch = _StabilityWatch()
         while not all(fut.done() for fut in futs):
             time.sleep(0.01)
             now = time.perf_counter()
             nbytes = progress.bytes
             if now >= deadline or nbytes < _AUTO_PROBE_MIN_BYTES:
                 continue  # streams enforce the deadline themselves
-            if not win_t:
-                win_t, win_bytes = now, nbytes
-                continue
-            if now - win_t < _AUTO_PROBE_WINDOW_SECONDS:
-                continue
-            rate = (nbytes - win_bytes) / (now - win_t)
-            if prev_rate and abs(rate - prev_rate) <= _AUTO_PROBE_STABLE_TOLERANCE * max(rate, prev_rate):
+            if watch.stable(now, nbytes):
                 stop.set()
                 break
-            prev_rate = rate
-            win_t, win_bytes = now, nbytes
     # Leaving the with-block joins the streams; each exits within one chunk of
     # the stop signal, and those bytes are counted, so the rate stays honest.
     elapsed = time.perf_counter() - start

@@ -12,6 +12,7 @@ import hashlib
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -280,18 +281,100 @@ class TestAdaptiveHashing:
     # --- probe stability early exit -------------------------------------------
     #
     # The probe's 1 s wall floor exists only to outlast a NAS's multi-second
-    # TCP/SMB ramp; on a stable volume it may return at the byte floor. These
-    # tests pace fake streams (module-level `open` shadowed) so ramp vs stable
-    # is deterministic regardless of the machine's real disk.
+    # TCP/SMB ramp; on a stable volume it may return at the byte floor instead.
+    # The ramp-vs-plateau decision is _StabilityWatch's, so it is tested here on
+    # synthetic samples rather than by pacing real threads against the wall
+    # clock (which measures the machine's scheduler, not the code). The probe's
+    # own tests below then pin that it acts on the verdict.
 
-    class _PacedFile:
-        """Endless file-like stream delivering `chunk` bytes per read, paced by delay_fn(elapsed)."""
+    @staticmethod
+    def _watch_verdicts(samples):
+        """
+        Feed (elapsed, total bytes) samples to a fresh watch; return its
+        verdicts.
+        """
+        watch = core_hashing._StabilityWatch()
+        return [watch.stable(t, nbytes) for t, nbytes in samples]
 
-        CHUNK = 65536
+    # Samples sit a comfortable margin past the module's window rather than
+    # exactly on it, so no test turns on float rounding at the boundary.
+    WINDOW = core_hashing._AUTO_PROBE_WINDOW_SECONDS * 2
 
-        def __init__(self, t0, delay_fn):
-            self._t0 = t0
-            self._delay_fn = delay_fn
+    @classmethod
+    def _ramp_samples(cls, rate_at, *, count=8):
+        """
+        Samples one window apart, where rate_at(window index) is the bytes/sec
+        over that window.
+        """
+        samples, nbytes = [], 0
+        for i in range(count):
+            nbytes += int(rate_at(i) * cls.WINDOW)
+            samples.append(((i + 1) * cls.WINDOW, nbytes))
+        return samples
+
+    def test_stability_watch_reports_plateau_after_two_agreeing_windows(self):
+        """
+        A steady aggregate is decided on the first pair of adjacent windows —
+        one to establish the rate, one to agree with it — so a quiet SSD is
+        characterised in ~2 windows instead of padding to the wall floor.
+        """
+        verdicts = self._watch_verdicts(self._ramp_samples(lambda i: 500 * 1024**2))
+        assert verdicts[:3] == [False, False, True]
+
+    def test_stability_watch_never_reports_plateau_while_ramping(self):
+        """
+        An aggregate still ramping (each window measurably faster than the last,
+        the NAS signature the wall floor exists for) never agrees, so the probe
+        falls through to the floors untouched.
+        """
+        # Each window 20% faster than the last — twice the tolerance, sustained.
+        verdicts = self._watch_verdicts(self._ramp_samples(lambda i: 50 * 1024**2 * 1.2**i))
+        assert not any(verdicts)
+
+    def test_stability_watch_reports_plateau_once_a_ramp_flattens(self):
+        """
+        The NAS case end to end: ramp, then plateau. The watch holds out through
+        the ramp and fires on the first agreeing pair after it settles.
+        """
+        rates = [50, 60, 72, 86, 100, 100, 100]  # MB/s: ramps, then flat
+        verdicts = self._watch_verdicts(self._ramp_samples(lambda i: rates[i] * 1024**2, count=len(rates)))
+        assert not any(verdicts[:5])
+        assert verdicts[6]
+
+    def test_stability_watch_reports_plateau_at_a_collapsed_rate(self):
+        """
+        A collapsed-but-stable aggregate (seek-bound signature) is decisive too:
+        the watch is judging steadiness, not speed, so the probe exits early and
+        reports the low rate that fires the seek-collapse gate upstream.
+        """
+        verdicts = self._watch_verdicts(self._ramp_samples(lambda i: 8 * 1024**2))
+        assert verdicts[:3] == [False, False, True]
+
+    def test_stability_watch_ignores_noise(self):
+        """
+        A noisy aggregate never agrees within tolerance, so noise can never end
+        the probe on an unrepresentative sample.
+        """
+        rates = [100, 40, 130, 55, 120, 45, 140, 60]  # MB/s
+        verdicts = self._watch_verdicts(self._ramp_samples(lambda i: rates[i] * 1024**2, count=len(rates)))
+        assert not any(verdicts)
+
+    def test_stability_watch_ignores_samples_shorter_than_a_window(self):
+        """
+        Sub-window samples measure scheduling noise, not throughput: they are
+        folded on rather than decided, so the watch's rates stay meaningful
+        however often the probe loop happens to poll.
+        """
+        rate = 500 * 1024**2
+        sub = core_hashing._AUTO_PROBE_WINDOW_SECONDS / 10
+        dense = [(sub * i, int(rate * sub * i)) for i in range(1, 11)]
+        assert not any(self._watch_verdicts(dense))
+        # ...and full windows following them are still decided normally.
+        settled = [(self.WINDOW * i, int(rate * self.WINDOW * i)) for i in (2, 3)]
+        assert self._watch_verdicts([*dense, *settled]) == [*[False] * len(dense), False, True]
+
+    class _EndlessFile:
+        """File-like stream handing back full chunks as fast as it is asked."""
 
         def __enter__(self):
             return self
@@ -303,59 +386,42 @@ class TestAdaptiveHashing:
             pass
 
         def readinto(self, buf):
-            time.sleep(self._delay_fn(time.perf_counter() - self._t0))
-            return self.CHUNK
+            return len(buf)
 
-    def _pace_probe(self, monkeypatch, delay_fn, *, floor_s=2.0, cap_s=4.0):
+    def _probe_with_watch(self, monkeypatch, verdict, *, floor_s):
         """
-        Shadow `open` inside the hashing module with paced fake streams and
-        shrink the byte floor so window sampling starts quickly. Returns
-        (aggregate_bw, elapsed) of a 4-stream probe.
+        Run a 4-stream probe over endless fake streams (module-level `open`
+        shadowed) with a _StabilityWatch stubbed to always/never see a plateau.
+        Returns (aggregate_bw, elapsed).
         """
-        t0 = time.perf_counter()
-        monkeypatch.setattr(core_hashing, "open", lambda path, mode: self._PacedFile(t0, delay_fn), raising=False)
+        monkeypatch.setattr(core_hashing, "open", lambda path, mode: self._EndlessFile(), raising=False)
         monkeypatch.setattr(core_hashing, "_AUTO_PROBE_MIN_BYTES", 2 * 1024 * 1024)
         monkeypatch.setattr(core_hashing, "_AUTO_PROBE_SECONDS", floor_s)
-        monkeypatch.setattr(core_hashing, "_AUTO_PROBE_MAX_SECONDS", cap_s)
-        monkeypatch.setattr(core_hashing, "_AUTO_PROBE_WINDOW_SECONDS", 0.1)
-        slots = [(f"/fake/{i}", 0) for i in range(4)]
+        monkeypatch.setattr(core_hashing, "_AUTO_PROBE_MAX_SECONDS", floor_s * 4)
+        watch = SimpleNamespace(stable=lambda now, nbytes: verdict)
+        monkeypatch.setattr(core_hashing, "_StabilityWatch", lambda: watch)
         start = time.perf_counter()
-        bw = core_hashing._probe_read_bw_multi(slots, 4)
+        bw = core_hashing._probe_read_bw_multi([(f"/fake/{i}", 0) for i in range(4)], 4)
         return bw, time.perf_counter() - start
 
-    def test_probe_multi_stable_stream_exits_before_wall_floor(self, monkeypatch):
+    def test_probe_multi_stops_streams_on_plateau(self, monkeypatch):
         """
-        A fast, non-ramping aggregate ends the probe at the byte floor + two
-        agreeing sub-windows — far before the wall floor — so disk-bound runs
-        on quiet SSDs stop paying ~1 s of padding.
+        A plateau ends the probe at the byte floor rather than the wall floor —
+        the early exit the watch exists for — and the bytes read up to the stop
+        still count, so the rate stays honest.
         """
-        bw, elapsed = self._pace_probe(monkeypatch, lambda t: 0.002)  # steady ~32 MB/s per stream
+        bw, elapsed = self._probe_with_watch(monkeypatch, True, floor_s=2.0)
         assert bw > 0
-        assert elapsed < 1.0, f"stable stream should exit early, took {elapsed:.2f}s"
+        assert elapsed < 2.0, f"plateau must not read to the {2.0}s wall floor, took {elapsed:.2f}s"
 
-    def test_probe_multi_ramping_stream_reads_to_wall_floor(self, monkeypatch):
+    def test_probe_multi_reads_to_wall_floor_without_a_plateau(self, monkeypatch):
         """
-        An aggregate still ramping (each sub-window measurably faster than the
-        last, the NAS signature the wall floor exists for) never satisfies the
-        stability check and reads to the full floor.
+        With no plateau in sight (a ramping NAS), the probe reads to the full
+        wall floor exactly as it did before the early exit existed.
         """
-        # Rate grows linearly 5x/s: adjacent 0.1 s windows differ by >10%
-        # throughout the floor, so no two ever agree.
-        bw, elapsed = self._pace_probe(monkeypatch, lambda t: 0.002 / (1 + 5 * t), floor_s=0.8, cap_s=2.0)
+        bw, elapsed = self._probe_with_watch(monkeypatch, False, floor_s=0.3)
         assert bw > 0
-        assert elapsed >= 0.8, f"ramping stream must read to the wall floor, exited at {elapsed:.2f}s"
-
-    def test_probe_multi_slow_stable_stream_exits_early_with_low_rate(self, monkeypatch):
-        """
-        A collapsed-but-stable aggregate (seek-bound signature) may also exit
-        early — the sample is decisive either way — and must report the low
-        rate faithfully so the seek-collapse gate upstream still fires.
-        """
-        bw, elapsed = self._pace_probe(monkeypatch, lambda t: 0.008)  # steady ~8 MB/s per stream
-        assert elapsed < 1.0, f"stable stream should exit early, took {elapsed:.2f}s"
-        # ~4 streams * 64 KiB / 8 ms ≈ 32 MB/s aggregate; generous bounds, but
-        # far below any rate a warm cache or accounting bug would produce.
-        assert 8 * 1024**2 < bw < 48 * 1024**2
+        assert elapsed >= 0.3, f"must read to the wall floor, exited at {elapsed:.2f}s"
 
     def test_probe_slots_prefers_distinct_tail_files(self):
         """
