@@ -66,7 +66,7 @@ COLLECTION_FILENAME = "ascmhl_collection.xml"
 
 
 def _iso(moment: datetime) -> str:
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return moment.astimezone().isoformat(timespec="seconds")
 
 
 # -----------------------------------------------------------------------------

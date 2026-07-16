@@ -216,7 +216,7 @@ def _hash_files(paths: list[str], sizes: list[int], algorithms: "list[str]") -> 
         (
             lambda mon, p=p: (
                 hashing.get_hashes(p, factories, on_progress=mon),
-                datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                _iso(datetime.now(UTC)),
             )
         )
         for p in paths
@@ -230,8 +230,13 @@ def _hash_files(paths: list[str], sizes: list[int], algorithms: "list[str]") -> 
 
 # finishdate is written into the header before hashing starts, then patched in
 # place once the walk completes — the placeholder is the same byte length as
-# every real ISO-8601 UTC stamp, so the patch never shifts the file.
-_FINISHDATE_PLACEHOLDER = "0000-00-00T00:00:00Z"
+# every real ISO-8601 stamp, so the patch never shifts the file.
+_FINISHDATE_PLACEHOLDER = "0000-00-00T00:00:00+00:00"
+
+
+def _iso(moment: datetime) -> str:
+    """ISO-8601 in local time with a ±HH:MM offset, e.g. 2026-07-16T11:45:00+01:00."""
+    return moment.astimezone().isoformat(timespec="seconds")
 
 
 def _serialize(element: "etree._Element", indent: str = "  ") -> bytes:
@@ -275,7 +280,7 @@ def _hash_element(
     etree.SubElement(h, "file").text = rel_path_posix
     etree.SubElement(h, "size").text = str(stat_result.st_size)
     mtime = datetime.fromtimestamp(stat_result.st_mtime, UTC)
-    etree.SubElement(h, "lastmodificationdate").text = mtime.strftime("%Y-%m-%dT%H:%M:%SZ")
+    etree.SubElement(h, "lastmodificationdate").text = _iso(mtime)
     for xml_tag, digest in zip(xml_tags, digests, strict=True):
         etree.SubElement(h, xml_tag).text = digest
     etree.SubElement(h, "hashdate").text = hashdate
@@ -343,7 +348,7 @@ def seal_classic(root: str, algorithms: "list[str]", verbose: bool = False, outp
     # Each file's <hashdate> is captured separately as that file is hashed.
     now_dt = datetime.now(UTC)
     timestamp_for_filename = now_dt.strftime("%Y-%m-%d_%H%M%S")
-    iso_now = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    iso_now = _iso(now_dt)
 
     # Find a non-colliding manifest filename and claim it atomically.
     # O_CREAT | O_EXCL makes the existence check and creation a single syscall,
@@ -430,7 +435,7 @@ def seal_classic(root: str, algorithms: "list[str]", verbose: bool = False, outp
         # Patch the real completion instant over the fixed-width placeholder —
         # useful for auditing how long the seal took.
         fh.seek(finishdate_at)
-        fh.write(datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ").encode("ascii"))
+        fh.write(_iso(datetime.now(UTC)).encode("ascii"))
 
     if verbose:
         print(f"Created MHL: {mhl_path}")

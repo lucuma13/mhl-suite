@@ -11,7 +11,7 @@ the verify engine's integration is covered in the verify tests.
 import hashlib
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -227,14 +227,14 @@ class TestAdaptiveHashing:
 
     def test_carries_well_formed_per_file_hashdate(self, tmp_path):
         """
-        Each file comes back paired with a UTC ISO-8601 hashdate captured by the
+        Each file comes back paired with an ISO-8601 hashdate captured by the
         hashing worker (precise even in parallel windows), not stamped at emit.
         """
         paths, sizes, ref = self._make_files(tmp_path, 3)
         out = list(seal_hash_files(paths, sizes, ["md5"]))
         assert [d for d, _ in out] == [[r] for r in ref]
         for _digests, hashdate in out:
-            datetime.strptime(hashdate, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+            assert datetime.fromisoformat(hashdate).tzinfo is not None
 
     def test_probe_read_bw_multi_reads_concurrently(self, tmp_path):
         """

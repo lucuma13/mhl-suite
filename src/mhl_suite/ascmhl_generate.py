@@ -138,7 +138,7 @@ def manifest_filename(number: int, folder_name: str, op_start: datetime) -> str:
 
 
 def _iso(moment: datetime) -> str:
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return moment.astimezone().isoformat(timespec="seconds")
 
 
 def _serialize(element: "etree._Element", indent: str = "  ") -> bytes:
