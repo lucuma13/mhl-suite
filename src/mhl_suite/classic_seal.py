@@ -15,7 +15,6 @@ failures travel as exceptions.
 import getpass
 import os
 import sys
-import unicodedata
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import BinaryIO
@@ -25,7 +24,7 @@ from lxml import etree
 from mhl_suite import __version__, hashing
 from mhl_suite.algorithms import NULL_TAG, classic_seal_algorithm, classic_seal_tag
 from mhl_suite.ignorelist import is_os_junk
-from mhl_suite.osutils import friendly_hostname, normalization_variant_on_disk
+from mhl_suite.osutils import colliding_identity_groups, friendly_hostname, normalization_variant_on_disk
 from mhl_suite.sorting import sort_key
 
 
@@ -191,6 +190,27 @@ def _reject_empty_files(entries: "list[tuple[str, os.stat_result]]", root: str, 
 
     lines = [f"[ERROR] cannot seal empty file: {_relative_posix(fp, root)}" for fp in empty]
     lines.append("  Remove or exclude any empty files and retry.")
+    raise SealError("\n".join(lines))
+
+
+def _reject_name_collisions(entries: "list[tuple[str, os.stat_result]]", root: str, fd: int, mhl_path: str) -> None:
+    """
+    Abort the seal (SealError) if any walked names are Unicode-equivalent or
+    byte-identical (see colliding_identity_groups). Runs before any hashing;
+    on abort it closes + unlinks the O_EXCL manifest the caller already
+    claimed.
+    """
+    groups = colliding_identity_groups([_relative_posix(fp, root) for fp, _ in entries])
+    if not groups:
+        return
+    os.close(fd)
+    os.unlink(mhl_path)
+
+    lines = []
+    for group in groups:
+        lines.append(f"[ERROR] cannot seal: {len(group)} names are Unicode-equivalent forms of the same name:")
+        lines.extend(f"    {rel}  ({rel.encode('utf-8')!r})" for rel in group)
+    lines.append("  Rename the files so no two names are equivalent, and retry.")
     raise SealError("\n".join(lines))
 
 
@@ -396,8 +416,9 @@ def seal_classic(root: str, algorithms: "list[str]", verbose: bool = False, outp
     # in the same order too.
     entries.sort(key=lambda e: sort_key(_relative_posix(e[0], root)))
 
-    # Refuse zero-byte files before any hashing; on abort this releases the
-    # O_EXCL manifest fd claimed above.
+    # Refuse ambiguous names, then zero-byte files, before any hashing; on abort
+    # these release the O_EXCL manifest fd claimed above.
+    _reject_name_collisions(entries, root, fd, mhl_path)
     _reject_empty_files(entries, root, fd, mhl_path)
 
     xml_tags = [classic_seal_tag(a) for a in algorithms]
@@ -416,11 +437,14 @@ def seal_classic(root: str, algorithms: "list[str]", verbose: bool = False, outp
         finishdate_at = _write_header(fh, iso_now)
 
         for (filepath, stat_result), (file_digests, hashdate) in zip(entries, digests, strict=True):
-            # Paths are relative to the manifest's own directory (output_dir)
-            # so verify resolves them correctly; forward slashes per the MHL
-            # spec, NFC-normalised so accented filenames round-trip across
-            # macOS (NFD on disk) and Linux/Windows (NFC) alike.
-            rel_path_posix = unicodedata.normalize("NFC", _relative_posix(filepath, output_dir))
+            # Paths are relative to the manifest's own directory (output_dir) so
+            # verify resolves them correctly; forward slashes per the MHL spec.
+            # The bytes are the walk's, verbatim: byte-exact verifiers match
+            # manifest paths against readdir output literally, so any rewriting
+            # here breaks them, while normalising verifiers accept either form.
+            # Our own verify falls back to NFC-equivalent matching, so a name
+            # whose form drifts in a later round-trip still resolves.
+            rel_path_posix = _relative_posix(filepath, output_dir)
 
             fh.write(_serialize(_hash_element(rel_path_posix, stat_result, xml_tags, file_digests, hashdate)))
             if verbose:

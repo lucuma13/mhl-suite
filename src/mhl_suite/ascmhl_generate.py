@@ -30,6 +30,7 @@ history-integrity problems raise ascmhl_history.HistoryError with its pinned
 import getpass
 import os
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,7 +55,7 @@ from mhl_suite.ascmhl_history import (
     load_history,
     parse_chain,
 )
-from mhl_suite.osutils import friendly_hostname, normalization_variant_on_disk
+from mhl_suite.osutils import colliding_identity_groups, friendly_hostname, normalization_variant_on_disk
 from mhl_suite.sorting import sort_key
 from mhl_suite.verify import ErrorKind, HashComparison, Status, VerifyEntry, VerifyReport
 
@@ -329,7 +330,7 @@ class _FileItem:
     """One on-disk file of a level's scope."""
 
     abs_path: str
-    rel: str  # level-relative posix, NFC
+    rel: str
     stat: os.stat_result
     recorded: "Recorded | None" = None
     formats: "list[str]" = field(default_factory=list)
@@ -418,6 +419,33 @@ def _level_view(history: History, merged_ignores: "list[str]") -> History:
     return History(root=history.root, generations=[*history.generations, pending])
 
 
+def _reject_walked_collisions(prefix: str, tree: "_DirItem", files: "list[_FileItem]") -> None:
+    """
+    Abort the generate (AscmhlGenerateError) if any walked names — file or
+    directory — share one NFC identity: such pairs cannot be told apart by
+    verify's equivalence fallback or by normalizing tools, and they merge on
+    the first copy to APFS/HFS+ (see colliding_identity_groups). Runs before
+    any hashing.
+    """
+    walked_rels = [item.rel for item in files]
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        stack.extend(node.subdirs)
+        if node.rel:
+            walked_rels.append(node.rel)
+    collisions = colliding_identity_groups(walked_rels)
+    if not collisions:
+        return
+    lines = []
+    for group in sorted(collisions, key=lambda g: sort_key(g[0])):
+        scoped = [_scope_path(prefix, r) for r in group]
+        lines.append(f"Error: {len(group)} names are Unicode-equivalent forms of the same name:")
+        lines.extend(f"    {r}  ({r.encode('utf-8')!r})" for r in scoped)
+    lines.append("Rename the files so no two names are equivalent, and retry.")
+    raise AscmhlGenerateError("\n".join(lines))
+
+
 def _scan_level(prefix: str, history: History, options: GenerateOptions) -> _Level:
     """Walk one level's scope (stopping at nested history roots) and collect its recorded set."""
     merged = list(
@@ -441,7 +469,7 @@ def _scan_level(prefix: str, history: History, options: GenerateOptions) -> _Lev
             unreadable.append((rel or ".", exc.strerror or str(exc)))
             return node
         for entry in entries:
-            entry_rel = _scope_path(rel, unicodedata.normalize("NFC", entry.name))
+            entry_rel = _scope_path(rel, entry.name)
             try:
                 is_dir = entry.is_dir(follow_symlinks=False)
                 if is_dir:
@@ -464,9 +492,23 @@ def _scan_level(prefix: str, history: History, options: GenerateOptions) -> _Lev
     files.sort(key=lambda item: sort_key(item.rel))
     unreadable.sort(key=lambda u: sort_key(u[0]))
 
+    _reject_walked_collisions(prefix, tree, files)
+
     recorded_by_path = {r.path: r for r in recorded}
+    # Equivalence fallback for records whose byte form differs from the walk
+    # (another tool's form, or a name whose form drifted in a round-trip): match
+    # on NFC identity, but only while exactly one record carries that identity —
+    # two records sharing it map to None and the file gets a fresh original
+    # instead of a guessed lineage. The walked side is collision-free per the
+    # guard above.
+    recorded_by_identity: dict[str, Recorded | None] = {}
+    for r in recorded:
+        identity = unicodedata.normalize("NFC", r.path)
+        recorded_by_identity[identity] = None if identity in recorded_by_identity else r
     for item in files:
         item.recorded = recorded_by_path.get(item.rel)
+        if item.recorded is None:
+            item.recorded = recorded_by_identity.get(unicodedata.normalize("NFC", item.rel))
         extra = () if item.recorded is None or item.recorded.original is None else (item.recorded.original[0],)
         item.formats = list(dict.fromkeys([*options.algorithms, *extra]))
 
@@ -618,8 +660,17 @@ def _completeness(level: _Level, entries: "list[VerifyEntry]") -> None:
             collect_dirs(sub)
 
     collect_dirs(level.tree)
+    # NFC-equivalence fallback, gated like _scan_level's record matching: a
+    # record whose byte form drifted still counts as present while exactly one
+    # record carries its identity (the walked side is collision-free per the
+    # seal guard). Two records sharing an identity stay byte-exact facts.
+    file_identities = {unicodedata.normalize("NFC", rel) for rel in present_files}
+    dir_identities = {unicodedata.normalize("NFC", rel) for rel in present_dirs}
+    recorded_identities = Counter(unicodedata.normalize("NFC", r.path) for r in level.recorded)
     for r in level.recorded:
-        present = r.path in (present_dirs if r.record.is_directory else present_files)
+        pool, identities = (present_dirs, dir_identities) if r.record.is_directory else (present_files, file_identities)
+        identity = unicodedata.normalize("NFC", r.path)
+        present = r.path in pool or (recorded_identities[identity] == 1 and identity in identities)
         if not present:
             entries.append(VerifyEntry(path=_scope_path(level.prefix, r.path), status=Status.MISSING))
     for rel_dir, error_text in level.unreadable:

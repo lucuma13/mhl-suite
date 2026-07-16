@@ -35,6 +35,7 @@ hand-written histories, interop on histories written by the reference library
 import os
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -602,11 +603,13 @@ class _DiskScan:
     Lookups mirror resolve_on_disk: literal bytes first, then the NFC form —
     and a miss here is not final, callers fall back to resolve_on_disk (which
     also matches case-insensitive-filesystem spellings the walk can't know).
+    Like resolve_on_disk, the NFC fallback refuses to guess: an identity
+    carried by two walked names maps to None and never matches.
     """
 
     def __init__(self, root: Path, ignore: IgnoreMatcher) -> None:
         self.files: dict[str, tuple[str, int]] = {}  # rel as on disk → (abs path, size)
-        self._nfc: dict[str, tuple[str, int]] = {}
+        self._nfc: dict[str, tuple[str, int] | None] = {}
         self.unreadable: list[VerifyEntry] = []
 
         def on_unreadable(rel_dir: str, exc: OSError) -> None:
@@ -622,12 +625,25 @@ class _DiskScan:
         for rel, abs_path, stat_result in scan_disk_files(root, ignore, on_unreadable):
             info = (abs_path, stat_result.st_size)
             self.files[rel] = info
-            self._nfc.setdefault(unicodedata.normalize("NFC", rel), info)
+            identity = unicodedata.normalize("NFC", rel)
+            self._nfc[identity] = None if identity in self._nfc else info
 
-    def resolve(self, rel: str) -> "tuple[str, int] | None":
-        """The real path and size recorded for `rel`, or None on a walk miss."""
+    def resolve(self, rel: str, allow_fallback: bool = True) -> "tuple[str, int] | None":
+        """
+        The real path and size recorded for `rel`, or None on a walk miss.
+        `allow_fallback=False` restricts the lookup to literal bytes — callers
+        pass it when `rel`'s identity is ambiguous on the *record* side (two
+        manifest records sharing one NFC identity), where any equivalence match
+        would be a guess.
+        """
         hit = self.files.get(rel)
-        return hit if hit is not None else self._nfc.get(unicodedata.normalize("NFC", rel))
+        if hit is not None or not allow_fallback:
+            return hit
+        return self._nfc.get(unicodedata.normalize("NFC", rel))
+
+    def identity_is_unique(self, rel: str) -> bool:
+        """True when `rel` is the only walked name carrying its NFC identity."""
+        return self._nfc.get(unicodedata.normalize("NFC", rel)) is not None
 
 
 def _completeness_entries(
@@ -647,13 +663,23 @@ def _completeness_entries(
     """
     entries: list[VerifyEntry] = []
     recorded_paths = {r.path for r in recorded}
-    dir_index: dict[str, dict[str, str]] = {}
+    # NFC-equivalence matching is gated on unambiguity (see _DiskScan): a record
+    # falls back only while no other record shares its identity, and a disk file
+    # counts as recorded beyond an exact hit only while it and exactly one
+    # record are the sole carriers of that identity. Ambiguity on either side
+    # degrades to the plain byte-level facts: missing + unknown.
+    recorded_identities = Counter(unicodedata.normalize("NFC", p) for p in recorded_paths)
+    dir_index: dict[str, dict[str, str | None]] = {}
     for r in recorded:
         if r.path in verifiable_paths:
             continue
+        allow_fallback = recorded_identities[unicodedata.normalize("NFC", r.path)] == 1
         # Directories never appear in the file scan, and a differently-cased
         # recorded spelling can miss it — resolve_on_disk settles both.
-        if disk.resolve(r.path) is None and resolve_on_disk(str(root), r.path.replace("/", os.sep), dir_index) is None:
+        if (
+            disk.resolve(r.path, allow_fallback) is None
+            and resolve_on_disk(str(root), r.path.replace("/", os.sep), dir_index, allow_fallback) is None
+        ):
             entries.append(VerifyEntry(path=r.path, status=Status.MISSING))
         elif not r.record.is_directory:
             entries.append(
@@ -665,8 +691,13 @@ def _completeness_entries(
                 )
             )
 
+    def _has_record(rel: str) -> bool:
+        if rel in recorded_paths:
+            return True
+        return disk.identity_is_unique(rel) and recorded_identities.get(unicodedata.normalize("NFC", rel)) == 1
+
     entries.extend(disk.unreadable)
-    entries.extend(VerifyEntry(path=rel, status=Status.NEW) for rel in disk.files if rel not in recorded_paths)
+    entries.extend(VerifyEntry(path=rel, status=Status.NEW) for rel in disk.files if not _has_record(rel))
     return entries
 
 

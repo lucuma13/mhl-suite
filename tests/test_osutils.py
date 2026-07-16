@@ -303,9 +303,84 @@ class TestResolveOnDisk:
         monkeypatch.setattr(os.path, "lexists", lexists)
         monkeypatch.setattr(os, "scandir", lambda d: calls.append(d) or real_scandir(d))
 
-        index: dict[str, dict[str, str]] = {}
+        index: dict[str, dict[str, str | None]] = {}
         r1 = osutils.resolve_on_disk(self._BASE, os.path.join(self._NFC, "a.txt"), index)
         r2 = osutils.resolve_on_disk(self._BASE, os.path.join(self._NFC, "b.txt"), index)
         assert r1 == f1
         assert r2 == f2
         assert calls == [self._BASE]  # scanned once; leaves hit the literal fast path
+
+    def test_ambiguous_coexisting_equivalents_refuse_fallback(self, monkeypatch):
+        """
+        Two coexisting entries share one NFC identity — A+overring (U+00C5) and
+        the Angstrom sign (U+212B), both NFC-normalizing to U+00C5. A third
+        spelling of that identity must resolve to None: either pick would be a
+        guess, and reporting the queried byte form as missing is a plain fact.
+        Each coexisting form still resolves to itself via the literal path.
+        """
+        nfd_name = "A\u030a.txt"  # A + combining ring
+        angstrom_name = "\u212b.txt"  # angstrom singleton
+        nfc_query = "\u00c5.txt"  # precomposed Å — on disk in no form
+        nfd_file = os.path.join(self._BASE, nfd_name)
+        angstrom_file = os.path.join(self._BASE, angstrom_name)
+        self._patch(monkeypatch, {self._BASE, nfd_file, angstrom_file})
+
+        assert osutils.resolve_on_disk(self._BASE, nfc_query, {}) is None
+        assert osutils.resolve_on_disk(self._BASE, nfd_name, {}) == nfd_file
+        assert osutils.resolve_on_disk(self._BASE, angstrom_name, {}) == angstrom_file
+
+    def test_allow_fallback_false_restricts_to_literal_bytes(self, monkeypatch):
+        """
+        allow_fallback=False (the record side of the lookup is ambiguous — two
+        manifest records sharing one identity) must skip the equivalence scan
+        entirely and miss, while the default still resolves the same query.
+        """
+        nfd_file = os.path.join(self._BASE, self._NFD, "text.txt")
+        self._patch(monkeypatch, {self._BASE, os.path.join(self._BASE, self._NFD), nfd_file})
+        rel = os.path.join(self._NFC, "text.txt")
+
+        assert osutils.resolve_on_disk(self._BASE, rel, {}, allow_fallback=False) is None
+        assert osutils.resolve_on_disk(self._BASE, rel, {}) == nfd_file
+
+
+class TestCollidingIdentityGroups:
+    """
+    colliding_identity_groups — the seal-time guard's core: names one NFC
+    identity cannot tell apart must group together; everything else must not.
+    Names are built from explicit escapes: a source-file literal's byte form is
+    whatever the editor emitted, which is exactly the bug class under test.
+    """
+
+    _NFC = "ros\u00e9.txt"
+    _NFD = "rose\u0301.txt"
+
+    def test_equivalent_forms_group(self):
+        groups = osutils.colliding_identity_groups([self._NFC, "plain.txt", self._NFD])
+        assert groups == [[self._NFC, self._NFD]]
+
+    def test_three_equivalent_spellings_one_group(self):
+        """
+        Precomposed Å, decomposed A+ring, and the U+212B singleton all share the
+        identity U+00C5 — one group of three.
+        """
+        forms = ["\u00c5.txt", "A\u030a.txt", "\u212b.txt"]
+        assert osutils.colliding_identity_groups(forms) == [forms]
+
+    def test_byte_identical_duplicates_group(self):
+        """
+        A damaged exFAT directory can list one name twice — the same bytes twice
+        is a collision too (one entry's data is unreachable).
+        """
+        assert osutils.colliding_identity_groups(["x.txt", "x.txt"]) == [["x.txt", "x.txt"]]
+
+    def test_distinct_names_no_groups(self):
+        assert osutils.colliding_identity_groups(["a.txt", "b.txt", self._NFC]) == []
+
+    def test_collision_in_directory_component_groups_full_paths(self):
+        """
+        The identity is the whole relative path — equivalent directory spellings
+        with the same leaf collide as full paths.
+        """
+        p1 = "ros\u00e9/clip.mov"
+        p2 = "rose\u0301/clip.mov"
+        assert osutils.colliding_identity_groups([p1, p2, "ros\u00e9/other.mov"]) == [[p1, p2]]

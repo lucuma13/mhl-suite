@@ -188,21 +188,24 @@ class TestAlgorithmHelpHint:
 
 class TestUnicodeNormalization:
     """
-    NFC normalization of accented filenames at seal and verify time.
+    Unicode normalization of accented filenames at seal and verify time.
 
-    macOS HFS+/APFS returns filenames in NFD (decomposed) form — e.g. the single
+    macOS HFS+ returns filenames in a frozen modified NFD form — e.g. the single
     codepoint é (U+00E9) is decomposed to e (U+0065) + combining acute (U+0301).
     Linux ext4 does byte-exact filename matching, so an NFD path from the
     manifest would silently fail os.path.exists() against an NFC file on disk.
 
-    simple_mhl reconciles normalization forms at two points:
-      1. seal   — rel_path_posix is normalized to NFC before writing the <file>
-                  element, so manifests are written in canonical NFC.
+    simple_mhl handles normalization forms at two points:
+      1. seal   — <file> records the walk's bytes verbatim. Byte-exact
+                  verifiers match manifest paths against readdir output
+                  literally, so any rewriting at seal time breaks them;
+                  normalizing verifiers accept either form.
       2. verify — osutils.resolve_on_disk() matches the manifest path against
                   real directory entries across normalization forms (literal
                   bytes first, NFC-keyed index as fallback) so it finds the file
                   whatever form it is stored in, without assuming the filesystem
-                  normalizes for us.
+                  normalizes for us — refusing the fallback when several
+                  coexisting entries share one NFC identity.
 
     These tests construct NFD filenames explicitly so the behaviour is
     deterministic regardless of what the host OS normalizes at mkdir/write time.
@@ -214,20 +217,21 @@ class TestUnicodeNormalization:
     _NFC_NAME = "R\u00e9.txt"  # R + precomposed é
     _NFD_NAME = "Re\u0301.txt"  # R + e + combining acute
 
-    def test_seal_writes_nfc_for_nfd_filesystem_path(self, mhl_cli, tmp_path, monkeypatch):
+    def test_seal_writes_walked_nfd_path_verbatim(self, mhl_cli, tmp_path, monkeypatch):
         """
-        seal() must write NFC <file> entries even when the filesystem returns
-        NFD paths.
+        seal() must write the walk's bytes verbatim: an NFD path from the
+        filesystem lands in <file> as NFD.
+
+        Byte-exact verifiers (ascmhl reference implementation, SealVerify,
+        MediaVerify) match manifest paths against readdir output literally —
+        rewriting the form at seal time makes every accented name fail in those
+        tools, while normalizing verifiers (ours, Offshoot, TrueCheck) accept
+        either form.
 
         We write the file under its NFD name (so get_hash can open it on any OS,
         since the path we hand to seal must actually exist on disk) and patch
-        _iter_files_for_seal to yield that NFD path — simulating what macOS
-        HFS+/APFS returns from rglob.  The manifest must contain the NFC form.
-
-        On macOS, HFS+/APFS treats NFC and NFD as the same file, so both names
-        resolve to the same inode.  On Linux ext4, filenames are byte-exact, so
-        we must create the file with the NFD name to allow get_hash to open it.
-        Either way, the assertion is the same: the manifest entry must be NFC.
+        _iter_files_for_seal to yield that NFD path — simulating what macOS HFS+
+        returns.  The manifest must contain the NFD form, untouched.
         """
 
         # Create the file with the NFD name — openable on all platforms.
@@ -238,11 +242,9 @@ class TestUnicodeNormalization:
 
         def nfd_iter(root, mhl_path, on_skip=None):
             for p, stat_result in real_iter(root, mhl_path, on_skip=on_skip):
-                # Yield the path as-is; real_iter already found the NFD file.
-                # Normalize to NFD explicitly in case the OS returned NFC (e.g.
-                # on a case-insensitive macOS volume that normalizes on
-                # readback), ensuring the test exercises the NFC fix on all
-                # OSes.
+                # Force the NFD spelling in case the OS returned NFC (e.g. on a
+                # normalization-insensitive macOS volume), so the test exercises
+                # the verbatim contract on all OSes.
                 nfd_str = unicodedata.normalize("NFD", str(p))
                 yield Path(nfd_str), stat_result
 
@@ -253,32 +255,37 @@ class TestUnicodeNormalization:
 
         mhl = next(tmp_path.glob("*.mhl"))
         text = mhl.read_text(encoding="utf-8")
-        # The <file> element must contain the NFC form regardless of what was on
-        # disk or what the iterator yielded.
-        assert self._NFC_NAME in text, (
-            f"Expected NFC name {self._NFC_NAME!r} in manifest. "
+        # The <file> element must carry the walked NFD bytes, not a rewrite.
+        assert self._NFD_NAME in text, (
+            f"Expected walked NFD name {self._NFD_NAME!r} in manifest. "
             f"Manifest snippet: {text[text.find('<file>') : text.find('</file>') + 7]!r}"
         )
-        # The NFD byte sequence must not appear in the raw manifest bytes.
-        assert self._NFD_NAME.encode("utf-8") not in mhl.read_bytes(), (
-            "NFD byte sequence found in manifest — NFC normalization did not fire"
+        # The NFC byte sequence must not appear in the raw manifest bytes.
+        assert self._NFC_NAME.encode("utf-8") not in mhl.read_bytes(), (
+            "NFC byte sequence found in manifest — seal rewrote the walked form"
         )
 
-    def test_seal_nfc_is_idempotent_for_already_nfc_paths(self, mhl_cli, tmp_path):
+    def test_seal_writes_walked_nfc_path_verbatim(self, mhl_cli, tmp_path, monkeypatch):
         """
-        NFC normalization of an already-NFC path must produce the same result.
-
-        Regression guard: applying NFC to a path that is already NFC must not
-        corrupt the filename or produce a different string.
+        An NFC name walks through seal untouched — verbatim in both directions.
         """
         nfc_path = tmp_path / self._NFC_NAME
         nfc_path.write_bytes(b"data")
 
+        real_iter = core_seal._iter_files_for_seal
+
+        def nfc_iter(root, mhl_path, on_skip=None):
+            for p, stat_result in real_iter(root, mhl_path, on_skip=on_skip):
+                yield Path(unicodedata.normalize("NFC", str(p))), stat_result
+
+        monkeypatch.setattr(core_seal, "_iter_files_for_seal", nfc_iter)
+
         rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
         assert rc == 0
 
-        text = next(tmp_path.glob("*.mhl")).read_text(encoding="utf-8")
-        assert self._NFC_NAME in text
+        mhl = next(tmp_path.glob("*.mhl"))
+        assert self._NFC_NAME in mhl.read_text(encoding="utf-8")
+        assert self._NFD_NAME.encode("utf-8") not in mhl.read_bytes()
 
     def test_verify_nfc_manifest_finds_nfc_file(self, mhl_cli, tmp_path):
         """
@@ -814,3 +821,29 @@ class TestParseAlgorithms:
     def test_empty_raises(self):
         with pytest.raises(argparse.ArgumentTypeError):
             simple_mhl.parse_algorithms(" , ")
+
+
+class TestVerifyAfterFormDrift:
+    """
+    A sealed name whose normalization form drifts on disk (HFS+ round-trip,
+    normalizing copy tool) still verifies via the gated NFC-equivalence fallback
+    — simulated with an in-place rename to the equivalent byte form. Names are
+    explicit escapes: a source literal's byte form is host-dependent.
+    """
+
+    _NFC = "ros\u00e9.txt"
+    _NFD = "rose\u0301.txt"
+
+    def test_verify_passes_after_normalization_drift(self, mhl_cli, tmp_path):
+        (tmp_path / self._NFC).write_bytes(b"payload")
+        (tmp_path / "plain.txt").write_bytes(b"control")
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        assert rc == 0
+
+        os.rename(tmp_path / self._NFC, tmp_path / self._NFD)
+        if self._NFD not in os.listdir(tmp_path):
+            pytest.skip("host filesystem does not preserve the renamed normalization form")
+
+        mhl = next(tmp_path.glob("*.mhl"))
+        rc, _, err = mhl_cli(["verify", str(mhl)])
+        assert (rc, err) == (0, "")

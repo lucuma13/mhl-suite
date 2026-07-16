@@ -31,6 +31,8 @@ errors belong to the dialect parsers.
 """
 
 import os
+import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -277,7 +279,7 @@ def verify_records(  # noqa: C901 — flat per-record classification ladder, not
     size_only: bool = False,
     missing_size_is_error: bool = True,
     on_progress: "Callable[[int], None] | None" = None,
-    resolved: "Callable[[str], tuple[str, int] | None] | None" = None,
+    resolved: "Callable[[str, bool], tuple[str, int] | None] | None" = None,
 ) -> list[VerifyEntry]:
     """
     Verify `records` against the tree rooted at `base_dir` and return one
@@ -287,19 +289,25 @@ def verify_records(  # noqa: C901 — flat per-record classification ladder, not
     callers validate CLI names into canonical tags before reaching here.
     `size_only` skips hashing and checks recorded sizes with one stat() per
     entry; `missing_size_is_error` is the one dialect policy knob — classic
-    MHL's schema makes <size> mandatory, so its absence in a size-only run is
-    an error, while ASC-MHL's size attribute is optional and its absence means
-    the file is existence-checked only.
+    MHL's schema makes <size> mandatory, so its absence in a size-only run is an
+    error, while ASC-MHL's size attribute is optional and its absence means the
+    file is existence-checked only.
 
-    `on_progress`, if given, is called with each chunk's byte count as files
-    are hashed (per-chunk, not per-file); it may fire from a worker thread
-    under the adaptive controller, so it must be thread-safe.
+    `on_progress`, if given, is called with each chunk's byte count as files are
+    hashed (per-chunk, not per-file); it may fire from a worker thread under the
+    adaptive controller, so it must be thread-safe.
 
-    `resolved`, if given, maps a record's path to its already-known real
-    on-disk path and size (a caller that walked the tree, e.g. ASC-MHL's disk
-    scan) — a hit skips this function's per-record resolve and stat; a None
-    falls back to them, so lookups the walk can't answer (case-insensitive
-    spellings) still resolve.
+    `resolved`, if given, maps (record path, allow_fallback) to its
+    already-known real on-disk path and size (a caller that walked the tree,
+    e.g. ASC-MHL's disk scan) — a hit skips this function's per-record resolve
+    and stat; a None falls back to them, so lookups the walk can't answer
+    (case-insensitive spellings) still resolve.
+
+    Path matching is byte-exact first, with an NFC-equivalence fallback that
+    only fires when it cannot guess wrong: a record whose identity is shared by
+    another record resolves by literal bytes alone (any equivalence match
+    between the two would be a coin toss), and the disk side likewise refuses
+    identities carried by two coexisting names (see resolve_on_disk).
 
     Every recorded size that is present is compared before hashing, for both
     dialects: a size difference already proves modification, reads zero bytes,
@@ -321,7 +329,11 @@ def verify_records(  # noqa: C901 — flat per-record classification ladder, not
 
     # Per-call cache of directory listings ({dir: {NFC(name): real_name}}),
     # populated lazily by resolve_on_disk when a literal path lookup misses.
-    dir_index: dict[str, dict[str, str]] = {}
+    dir_index: dict[str, dict[str, str | None]] = {}
+
+    # Record-side ambiguity: identities carried by more than one record never
+    # use the equivalence fallback — literal bytes only.
+    identity_counts = Counter(unicodedata.normalize("NFC", record.path) for record in records)
 
     for record in records:
         if record.defect is not None:
@@ -340,11 +352,12 @@ def verify_records(  # noqa: C901 — flat per-record classification ladder, not
 
         # --- Resolve to the real on-disk path ------------------------------
         actual_size: int | None
-        known = resolved(record.path) if resolved is not None else None
+        allow_fallback = identity_counts[unicodedata.normalize("NFC", record.path)] == 1
+        known = resolved(record.path, allow_fallback) if resolved is not None else None
         if known is not None:
             candidate, actual_size = known
         else:
-            candidate = resolve_on_disk(base, os.path.relpath(jailed, base), dir_index)
+            candidate = resolve_on_disk(base, os.path.relpath(jailed, base), dir_index, allow_fallback)
             if candidate is None:
                 results.append(VerifyEntry(path=record.path, status=Status.MISSING))
                 continue

@@ -21,6 +21,7 @@ covering spec-conformant XML no generator here can produce):
 
 import glob
 import re
+import types
 from pathlib import Path
 
 import pytest
@@ -718,3 +719,46 @@ class TestSizeOnlyRecordedSet:
 
         monkeypatch.setattr("mhl_suite.verify.os.path.getsize", _raise)
         assert size_entries(package)["top.txt"].status == Status.MISSING
+
+
+class TestDiskScanIdentityAmbiguity:
+    """
+    _DiskScan's NFC-equivalence fallback refuses to guess: an identity carried
+    by two coexisting walked names (possible only on a normalization-sensitive
+    filesystem, so the scan is stubbed) matches nothing, and allow_fallback
+    False restricts a lookup to literal bytes. Names are explicit escapes —
+    a source literal's byte form is host-dependent.
+    """
+
+    def _scan(self, monkeypatch, rows):
+        stubbed = [(rel, "/vol/" + rel, types.SimpleNamespace(st_size=size)) for rel, size in rows]
+        monkeypatch.setattr(verify, "scan_disk_files", lambda root, ignore, cb=None: iter(stubbed))
+        # A real (empty) matcher — the stub above never consults it.
+        ignore = verify.IgnoreMatcher(verify.History(root=Path("/vol"), generations=[]))
+        return verify._DiskScan(Path("/vol"), ignore=ignore)
+
+    def test_coexisting_equivalents_tombstone_the_fallback(self, monkeypatch):
+        nfd = "A\u030a.txt"  # A + combining ring
+        angstrom = "\u212b.txt"  # angstrom singleton, same NFC identity
+        scan = self._scan(monkeypatch, [(nfd, 5), (angstrom, 7)])
+
+        # Literal bytes still resolve each coexisting form to itself.
+        assert scan.resolve(nfd) == ("/vol/" + nfd, 5)
+        assert scan.resolve(angstrom) == ("/vol/" + angstrom, 7)
+        # The shared identity is ambiguous: a third spelling matches nothing.
+        assert scan.resolve("\u00c5.txt") is None
+        assert scan.identity_is_unique(nfd) is False
+
+    def test_unique_identity_falls_back_and_reports_unique(self, monkeypatch):
+        nfd = "rose\u0301.txt"
+        scan = self._scan(monkeypatch, [(nfd, 3), ("plain.txt", 1)])
+
+        assert scan.resolve("ros\u00e9.txt") == ("/vol/" + nfd, 3)
+        assert scan.identity_is_unique(nfd) is True
+
+    def test_allow_fallback_false_restricts_to_literal_bytes(self, monkeypatch):
+        nfd = "rose\u0301.txt"
+        scan = self._scan(monkeypatch, [(nfd, 3)])
+
+        assert scan.resolve("ros\u00e9.txt", allow_fallback=False) is None
+        assert scan.resolve(nfd, allow_fallback=False) == ("/vol/" + nfd, 3)

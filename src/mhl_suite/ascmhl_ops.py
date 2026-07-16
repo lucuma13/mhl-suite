@@ -20,6 +20,7 @@ them into its report, matching verify_ascmhl).
 
 import os
 import unicodedata
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -94,15 +95,36 @@ def diff_ascmhl(root_path: "str | Path") -> VerifyReport:
     recorded = collect_recorded(history, ignore)
     recorded_paths = {r.path for r in recorded}
 
-    dir_index: dict[str, dict[str, str]] = {}
+    # Byte-exact matching first, NFC-equivalence fallback only where it cannot
+    # guess wrong: a record falls back only while no other record shares its
+    # identity (resolve_on_disk refuses disk-side ambiguity itself), and a
+    # disk file is "known" beyond an exact hit only while it and exactly one
+    # record are the sole carriers of that identity. Ambiguity on either side
+    # degrades to the plain byte-level facts: missing + new.
+    recorded_identities = Counter(unicodedata.normalize("NFC", p) for p in recorded_paths)
+    disk_rels = list(walk_disk_files(root, ignore))
+    disk_identities = Counter(unicodedata.normalize("NFC", rel) for rel in disk_rels)
+
+    dir_index: dict[str, dict[str, str | None]] = {}
     entries: list[VerifyEntry] = [
         VerifyEntry(path=r.path, status=Status.MISSING)
         for r in recorded
-        if resolve_on_disk(str(root), r.path.replace("/", os.sep), dir_index) is None
+        if resolve_on_disk(
+            str(root),
+            r.path.replace("/", os.sep),
+            dir_index,
+            allow_fallback=recorded_identities[unicodedata.normalize("NFC", r.path)] == 1,
+        )
+        is None
     ]
-    entries.extend(
-        VerifyEntry(path=rel, status=Status.NEW) for rel in walk_disk_files(root, ignore) if rel not in recorded_paths
-    )
+
+    def _has_record(rel: str) -> bool:
+        if rel in recorded_paths:
+            return True
+        identity = unicodedata.normalize("NFC", rel)
+        return disk_identities[identity] == 1 and recorded_identities.get(identity) == 1
+
+    entries.extend(VerifyEntry(path=rel, status=Status.NEW) for rel in disk_rels if not _has_record(rel))
     entries.sort(key=lambda e: sort_key(e.path))
 
     if any(e.status == Status.NEW for e in entries):
@@ -128,7 +150,8 @@ def _enclosing_history_root(path: Path) -> "Path | None":
 
 
 def _rel_posix(path: Path, root: Path) -> str:
-    return unicodedata.normalize("NFC", path.relative_to(root).as_posix())
+    # Verbatim bytes, matching what generate records from the walk.
+    return path.relative_to(root).as_posix()
 
 
 def _validate_rename(old: Path, new: Path) -> Path:

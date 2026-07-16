@@ -3,6 +3,11 @@ The advanced-mhl CLI: argument handling, smart dispatch, rendering, and the
 exit-code contract (generate semantics vs verify semantics, pinned ASC codes).
 """
 
+import os
+import unicodedata
+
+import pytest
+
 from mhl_suite.ascmhl_history import load_history
 
 from .helpers import make_tree
@@ -211,3 +216,139 @@ class TestSmartDispatch:
         rc, out, _ = ascmhl_cli(["--version"])
         assert rc == 0
         assert out.strip()
+
+
+class TestUnicodeForms:
+    """
+    The verbatim-path contract and its verify-side counterpart, end to end.
+
+    Seal records the walk's bytes untouched (byte-exact verifiers match <path>
+    against readdir literally). Verify then reconciles a name whose
+    normalization form drifted in a later round-trip (here simulated with an
+    in-place rename to the equivalent byte form) via the gated NFC-equivalence
+    fallback: check and diff stay clean, and a follow-up generate appends
+    `verified`, not a fresh original. Names are explicit escapes — a source
+    literal's byte form is host-dependent.
+    """
+
+    _NFC = "ros\u00e9.txt"
+    _NFD = "rose\u0301.txt"
+
+    def _card(self, ascmhl_cli, tmp_path, name):
+        root = tmp_path / "card"
+        root.mkdir()
+        (root / name).write_bytes(b"payload")
+        (root / "plain.txt").write_bytes(b"control")
+        rc, _, _ = ascmhl_cli(["generate", root])
+        assert rc == 0
+        return root
+
+    def _drift(self, root, old, new):
+        """
+        Rename old -> new (equivalent byte forms); skip when the host filesystem
+        does not let the byte form change (it would make the drift assertions
+        vacuous).
+        """
+        os.rename(root / old, root / new)
+        if new not in os.listdir(root):
+            pytest.skip("host filesystem does not preserve the renamed normalization form")
+
+    def test_generate_records_walked_bytes_verbatim(self, ascmhl_cli, tmp_path):
+        root = self._card(ascmhl_cli, tmp_path, self._NFD)
+        walked = next(n for n in os.listdir(root) if unicodedata.normalize("NFC", n) == self._NFC)
+        manifest = next((root / "ascmhl").glob("0001*.mhl")).read_bytes()
+        other = self._NFC if walked == self._NFD else self._NFD
+        assert walked.encode("utf-8") in manifest
+        assert other.encode("utf-8") not in manifest
+
+    def test_check_and_diff_stay_clean_after_form_drift(self, ascmhl_cli, tmp_path):
+        """
+        The nfd-fixture regression: a drifted name must neither read as an
+        unknown file nor leave its record missing.
+        """
+        root = self._card(ascmhl_cli, tmp_path, self._NFC)
+        self._drift(root, self._NFC, self._NFD)
+
+        rc, out, err = ascmhl_cli(["check", root])
+        assert (rc, out, err) == (0, "", "")
+        rc, out, err = ascmhl_cli(["diff", root])
+        assert (rc, out, err) == (0, "", "")
+
+    def test_generate_appends_verified_after_form_drift(self, ascmhl_cli, tmp_path):
+        """
+        A drifted name matches its record by identity: the new generation
+        verifies it rather than restarting its lineage as an original.
+        """
+        root = self._card(ascmhl_cli, tmp_path, self._NFC)
+        self._drift(root, self._NFC, self._NFD)
+
+        rc, _, _ = ascmhl_cli(["generate", root])
+        assert rc == 0
+        gen2 = next((root / "ascmhl").glob("0002*.mhl")).read_bytes()
+        assert b'action="verified"' in gen2
+        assert b'action="original"' not in gen2
+
+
+class TestGenerateUnicodeCollisionGuard:
+    """
+    Two walked names sharing one NFC identity abort generate before hashing
+    (mirrors the classic seal guard). The pair coexists only on a
+    normalization-sensitive filesystem, so scandir is wrapped to surface one
+    real file under both spellings.
+    """
+
+    _NFC = "ros\u00e9.txt"
+    _NFD = "rose\u0301.txt"
+
+    class _TwinEntry:
+        """A DirEntry double presenting a real entry under another name."""
+
+        def __init__(self, real, name, path):
+            self._real = real
+            self.name = name
+            self.path = path
+
+        def is_dir(self, follow_symlinks=True):
+            return self._real.is_dir(follow_symlinks=follow_symlinks)
+
+        def is_file(self, follow_symlinks=True):
+            return self._real.is_file(follow_symlinks=follow_symlinks)
+
+        def stat(self, follow_symlinks=True):
+            return self._real.stat(follow_symlinks=follow_symlinks)
+
+    def test_generate_aborts_on_equivalent_names(self, ascmhl_cli, tmp_path, monkeypatch):
+        root = tmp_path / "card"
+        root.mkdir()
+        (root / self._NFD).write_bytes(b"payload")
+        (root / "plain.txt").write_bytes(b"control")
+
+        real_scandir = os.scandir
+
+        class _Listing(list):
+            """
+            os.scandir result double: iterable and a context manager, so it
+            serves both `list(os.scandir(d))` and os.walk's `with` form.
+            """
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def twin_scandir(d):
+            entries = _Listing(real_scandir(d))
+            if os.path.abspath(os.fspath(d)) == str(root):
+                for e in list(entries):
+                    if unicodedata.normalize("NFC", e.name) == self._NFC:
+                        twin = self._NFC if e.name != self._NFC else self._NFD
+                        entries.append(self._TwinEntry(e, twin, os.path.join(os.fspath(d), twin)))
+            return entries
+
+        monkeypatch.setattr(os, "scandir", twin_scandir)
+
+        rc, _, err = ascmhl_cli(["generate", root])
+        assert rc == 2
+        assert "Unicode-equivalent" in err
+        assert not (root / "ascmhl").exists(), "aborted generate must write no history"

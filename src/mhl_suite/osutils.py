@@ -9,8 +9,8 @@ simple-mhl and mhlver CLIs.
 Two concerns live here:
   * Host identity — friendly_hostname(): the human-facing machine name.
   * Unicode path resolution — resolve_on_disk() /
-    normalization_variant_on_disk(): reconciling NFC/NFD filenames across
-    normalization-sensitive filesystems.
+    normalization_variant_on_disk() / colliding_identity_groups(): reconciling
+    NFC/NFD filenames across normalization-sensitive filesystems.
   * Terminal display — to_terminal_sep(): the one place manifest paths are
     rendered with the platform separator; supports_color(): whether ANSI colour
     should be written to a given stream.
@@ -21,7 +21,10 @@ import platform
 import subprocess
 import sys
 import unicodedata
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 # -----------------------------------------------------------------------------
 # Terminal display
@@ -151,11 +154,35 @@ def friendly_hostname() -> str:
 # but byte-preserving; exFAT/ext4 (default)/NTFS are normalization-*sensitive*,
 # so "rosé"-NFC and "rosé"-NFD are distinct entries. A path that visually
 # matches may therefore fail a byte-exact lookup. These helpers match on NFC
-# while only ever opening names that actually exist on disk.
+# while only ever opening names that actually exist on disk — and only when the
+# match is unambiguous: if several coexisting entries share one NFC identity, no
+# fallback is attempted, because any pick would be a guess.
 # -----------------------------------------------------------------------------
 
 
-def resolve_on_disk(base: str, rel_path: str, dir_index: dict[str, dict[str, str]]) -> str | None:
+def colliding_identity_groups(rel_paths: "Iterable[str]") -> "list[list[str]]":
+    """
+    Groups of paths that share one NFC canonical identity — names that a
+    normalization-insensitive filesystem (or any normalizing tool) cannot tell
+    apart. Such pairs coexist only on normalization-sensitive volumes; sealing
+    them would record entries that verify cannot unambiguously match back to
+    disk, and that silently merge or overwrite on the first copy to APFS/HFS+. A
+    group can also be two byte-identical paths: a damaged exFAT directory can
+    list one name twice, in which case one of the two entries' data is
+    unreachable. Sealers abort when any group has more than one member.
+    """
+    by_identity: dict[str, list[str]] = {}
+    for rel in rel_paths:
+        by_identity.setdefault(unicodedata.normalize("NFC", rel), []).append(rel)
+    return [group for group in by_identity.values() if len(group) > 1]
+
+
+def resolve_on_disk(
+    base: str,
+    rel_path: str,
+    dir_index: "dict[str, dict[str, str | None]]",
+    allow_fallback: bool = True,
+) -> str | None:
     """
     Resolve a manifest-relative path to its real on-disk path, matching across
     Unicode normalization forms.
@@ -170,10 +197,19 @@ def resolve_on_disk(base: str, rel_path: str, dir_index: dict[str, dict[str, str
     up from an NFC manifest) still resolves. Returns the real absolute path, or
     ``None`` if any component is genuinely absent.
 
+    The fallback fires only when it cannot guess wrong. If two real entries in
+    one directory share an NFC identity, that identity maps to ``None`` in the
+    index and never matches — reporting the byte form as missing is a plain
+    fact, silently picking one of two equivalent entries is not. Callers pass
+    ``allow_fallback=False`` when the *looked-up* side is equally ambiguous
+    (two manifest records sharing one identity), which restricts resolution to
+    literal bytes for every component.
+
     ``dir_index`` caches each scanned directory as ``{ NFC(name): real_name }``
-    so a manifest with many files in one folder scans that folder only once. It
-    is passed in (not module-global) so each ``verify()`` call sees a fresh view
-    of the filesystem rather than a stale listing from a previous run.
+    (``None`` marking ambiguous identities) so a manifest with many files in
+    one folder scans that folder only once. It is passed in (not module-global)
+    so each ``verify()`` call sees a fresh view of the filesystem rather than a
+    stale listing from a previous run.
     """
     current = base
     for comp in rel_path.split(os.sep):
@@ -183,16 +219,21 @@ def resolve_on_disk(base: str, rel_path: str, dir_index: dict[str, dict[str, str
         if os.path.lexists(literal):
             current = literal  # fast path: exact bytes exist on disk
             continue
+        if not allow_fallback:
+            return None  # byte-exact resolution only
         index = dir_index.get(current)
         if index is None:
+            index = {}
             try:
-                index = {unicodedata.normalize("NFC", entry.name): entry.name for entry in os.scandir(current)}
+                for entry in os.scandir(current):
+                    key = unicodedata.normalize("NFC", entry.name)
+                    index[key] = None if key in index else entry.name
             except OSError:
                 return None  # current dir unreadable/absent → file is missing
             dir_index[current] = index
         real = index.get(unicodedata.normalize("NFC", comp))
         if real is None:
-            return None  # no entry matches in any normalization form
+            return None  # absent, or ambiguous across coexisting forms
         current = os.path.join(current, real)
     return current
 

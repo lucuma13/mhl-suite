@@ -2,14 +2,18 @@
 
 import builtins
 import hashlib
+import os
 import re
+import unicodedata
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import xxhash
 from lxml import etree
 
+from mhl_suite import classic_seal as core_seal
 from mhl_suite import hashing as core_hashing
 from mhl_suite.classic_seal import SealError
 from mhl_suite.cli import simple_mhl
@@ -563,3 +567,53 @@ class TestSealConcurrency:
         monkeypatch.setattr(core_hashing, "_probe_read_bw_multi", lambda slots, n: probed.append(1) or 100.0)
         simple_mhl.seal_classic(str(tmp_path), ["md5"], verbose=False)
         assert probed == [1], "the default must probe the disk to decide"
+
+
+class TestSealUnicodeCollisionGuard:
+    """
+    Two walked names sharing one NFC identity abort the seal before hashing: the
+    manifest would hold entries no verifier can unambiguously match back to
+    disk, and the pair merges on the first copy to APFS/HFS+. Such pairs coexist
+    only on normalization-sensitive filesystems, so the walk is patched to
+    return both spellings of one real file (explicit escapes — a source
+    literal's byte form is host-dependent, the very bug under test).
+    """
+
+    _NFC = "ros\u00e9.txt"
+    _NFD = "rose\u0301.txt"
+
+    def test_seal_aborts_when_walk_yields_equivalent_names(self, mhl_cli, tmp_path, monkeypatch):
+        (tmp_path / self._NFD).write_bytes(b"data")
+        (tmp_path / "plain.txt").write_bytes(b"control")
+
+        real_iter = core_seal._iter_files_for_seal
+
+        def twin_iter(root, mhl_path, on_skip=None):
+            for p, st in real_iter(root, mhl_path, on_skip=on_skip):
+                name = os.path.basename(str(p))
+                if unicodedata.normalize("NFC", name) == self._NFC:
+                    parent = os.path.dirname(str(p))
+                    yield Path(os.path.join(parent, self._NFD)), st
+                    yield Path(os.path.join(parent, self._NFC)), st
+                else:
+                    yield p, st
+
+        monkeypatch.setattr(core_seal, "_iter_files_for_seal", twin_iter)
+
+        rc, _, err = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        assert rc == 2
+        assert "Unicode-equivalent" in err
+        # Both byte spellings are named — visually identical, so the message
+        # carries their byte reprs to tell the operator which is which.
+        assert self._NFC in err
+        assert self._NFD in err
+        assert list(tmp_path.glob("*.mhl")) == [], "aborted seal must leave no manifest behind"
+
+    def test_seal_passes_distinct_accented_names(self, mhl_cli, tmp_path):
+        """The guard keys on canonical identity, not on accents: two genuinely
+        different accented names seal fine."""
+        (tmp_path / self._NFD).write_bytes(b"one")
+        (tmp_path / "ros\u00e9.txt").write_bytes(b"two")
+        rc, _, _ = mhl_cli(["seal", str(tmp_path), "-a", "md5"])
+        assert rc == 0
+        assert len(list(tmp_path.glob("*.mhl"))) == 1
