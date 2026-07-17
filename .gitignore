@@ -33,6 +33,14 @@ lost+found
 ]
 
 ###-------------------------------------------------------------
+### Editors
+###-------------------------------------------------------------
+# Visual Studio Code (VSCode)
+.vscode/
+*.vsix
+*.code-workspace
+
+###-------------------------------------------------------------
 ### Claude
 ###-------------------------------------------------------------
 .claude
@@ -148,11 +156,6 @@ venv.bak/
 .mypy_cache/
 .dmypy.json
 dmypy.json
-
-# Visual Studio Code (VSCode)
-.vscode/
-*.vsix
-*.code-workspace
 
 # Ruff stuff:
 .ruff_cache/
