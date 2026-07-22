@@ -291,7 +291,7 @@ def _is_fskit_mount(mount_point: str) -> bool:
     """
     True when the macOS mount table lists the volume with the `fskit` option —
     e.g. `/dev/disk6s1 on /Volumes/CARD (exfat, local, ..., fskit, mounted by
-    tash)`. The distinction matters for name provenance: the FSKit and kext
+    user)`. The distinction matters for name provenance: the FSKit and kext
     generations of the same filesystem driver render Unicode names differently.
     """
     marker = f" on {mount_point} ("

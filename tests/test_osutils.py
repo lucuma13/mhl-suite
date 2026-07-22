@@ -369,7 +369,7 @@ class TestSealContext:
     def test_fskit_mount_detected_from_mount_table(self, monkeypatch):
         table = (
             "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)\n"
-            "/dev/disk6s1 on /Volumes/CARD (exfat, local, nodev, nosuid, noatime, fskit, mounted by tash)\n"
+            "/dev/disk6s1 on /Volumes/CARD (exfat, local, nodev, nosuid, noatime, fskit, mounted by user)\n"
         )
         monkeypatch.setattr(osutils, "_mount_table", lambda: table)
         assert osutils._is_fskit_mount("/Volumes/CARD") is True
@@ -378,7 +378,7 @@ class TestSealContext:
 
     def test_fskit_flag_requires_exact_option_not_substring(self, monkeypatch):
         """A volume named like the flag must not trip the option match."""
-        table = "/dev/disk9s1 on /Volumes/X (exfat, local, fskitten, mounted by tash)\n"
+        table = "/dev/disk9s1 on /Volumes/X (exfat, local, fskitten, mounted by user)\n"
         monkeypatch.setattr(osutils, "_mount_table", lambda: table)
         assert osutils._is_fskit_mount("/Volumes/X") is False
 
