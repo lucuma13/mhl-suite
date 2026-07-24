@@ -861,7 +861,7 @@ class TestAscMhlAppendOnVerify:
         assert mr is not None
         assert mr.manifest_status == "failed"
         # The failure is recorded in the appended generation (spec 5.6.5).
-        latest = sorted((pkg / "ascmhl").glob("*.mhl"))[-1]
+        latest = max((pkg / "ascmhl").glob("*.mhl"))
         assert len(self._generations(pkg)) == 2
         assert 'action="failed"' in latest.read_text()
 
@@ -870,7 +870,7 @@ class TestAscMhlAppendOnVerify:
         (pkg / "extra.mov").write_bytes(b"new")
         rc, _mr = discovery.verify_item(self._item(pkg), verbose=False, schema=False)
         assert rc == 21
-        latest = sorted((pkg / "ascmhl").glob("*.mhl"))[-1]
+        latest = max((pkg / "ascmhl").glob("*.mhl"))
         assert "extra.mov" in latest.read_text()
 
     def test_read_only_and_hash_free_modes_write_nothing(self, tmp_path):

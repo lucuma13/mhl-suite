@@ -112,6 +112,7 @@ lint.ignore = [
   "PLR0912", # too many branches — independent dispatch arms, not nested complexity
   "PLR0913", # too many arguments — internal pipeline functions, dataclass would add noise
   "PLR0915", # too many statements — procedural orchestration, not real complexity
+  "PLR0917", # too many positional arguments — same internal pipeline functions as PLR0913
   "PTH",     # os.scandir has benchmarked performance improvements over pathlib
   "S603",    # subprocess of a path-resolved backend binary, never shell=True
 ]

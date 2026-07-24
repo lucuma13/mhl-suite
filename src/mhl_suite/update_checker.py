@@ -280,7 +280,7 @@ class UpdateNotifier:
         """
         try:
             url = f"https://pypi.org/pypi/{urllib.parse.quote(self.package, safe='')}/json"
-            request = urllib.request.Request(  # noqa: S310 — fixed https URL
+            request = urllib.request.Request(
                 url,
                 headers={
                     "Accept": "application/json",
