@@ -1,14 +1,24 @@
 .DEFAULT_GOAL := help
-.PHONY: upgrade pre-commit test install uninstall reinstall clean help
+.PHONY: setup-dev upgrade pre-commit test install uninstall reinstall clean help
 
-# Package/tool name, derived from the repo folder (your $1).
 NAME := $(notdir $(CURDIR))
+
+setup-dev: ## Install uv, sync dependencies, and enable the pre-commit hooks
+ifeq ($(OS),Windows_NT)
+	winget install -e --silent --accept-package-agreements --accept-source-agreements astral-sh.uv
+else ifeq ($(shell uname -s),Darwin)
+	brew install uv
+else
+	curl -LsSf https://astral.sh/uv/install.sh | sh
+endif
+	uv sync --all-extras
+	uv run pre-commit install
 
 upgrade: ## Upgrade dependencies
 	uv sync --upgrade --all-extras
 
 pre-commit: ## Run all pre-commit hooks over the whole tree
-	pre-commit run --all-files
+	uv run pre-commit run --all-files
 
 test: ## Run the test suite with coverage
 	uv run pytest
